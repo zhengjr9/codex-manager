@@ -1,0 +1,114 @@
+import { useState } from 'react'
+import { Modal, Input, Form, message } from 'antd'
+import { useAccountStore } from '../../stores/useAccountStore'
+import { accountService } from '../../services/accountService'
+
+interface Props {
+  open: boolean
+  onClose: () => void
+}
+
+export default function AddAccountDialog({ open, onClose }: Props) {
+  const [form] = Form.useForm()
+  const [loading, setLoading] = useState(false)
+  const [step, setStep] = useState<'choice' | 'label'>('choice')
+  const importCurrent = useAccountStore(s => s.importCurrent)
+
+  async function handleLogin() {
+    setLoading(true)
+    try {
+      const res = await accountService.login()
+      message.info(res.message, 6)
+      setStep('label')
+    } catch (e) {
+      message.error(String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleImport() {
+    setLoading(true)
+    try {
+      const values = form.getFieldsValue()
+      await importCurrent(values.label)
+      message.success('账号导入成功')
+      form.resetFields()
+      setStep('choice')
+      onClose()
+    } catch (e) {
+      message.error(String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  function handleCancel() {
+    form.resetFields()
+    setStep('choice')
+    onClose()
+  }
+
+  return (
+    <Modal
+      title="添加 Codex 账号"
+      open={open}
+      onCancel={handleCancel}
+      footer={null}
+      width={480}
+    >
+      {step === 'choice' ? (
+        <div className="space-y-4 py-2">
+          <p className="text-gray-600 text-sm">
+            选择添加方式：
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <button
+              onClick={handleLogin}
+              disabled={loading}
+              className="flex flex-col items-center gap-2 p-4 border-2 border-dashed border-indigo-300 rounded-lg hover:border-indigo-500 hover:bg-indigo-50 transition-colors cursor-pointer disabled:opacity-50"
+            >
+              <span className="text-2xl">🔐</span>
+              <span className="font-medium text-sm">运行 codex login</span>
+              <span className="text-xs text-gray-500 text-center">在终端完成登录后导入</span>
+            </button>
+            <button
+              onClick={() => setStep('label')}
+              className="flex flex-col items-center gap-2 p-4 border-2 border-dashed border-green-300 rounded-lg hover:border-green-500 hover:bg-green-50 transition-colors cursor-pointer"
+            >
+              <span className="text-2xl">📥</span>
+              <span className="font-medium text-sm">导入当前账号</span>
+              <span className="text-xs text-gray-500 text-center">直接导入 ~/.codex/auth.json</span>
+            </button>
+          </div>
+        </div>
+      ) : (
+        <Form form={form} layout="vertical" className="py-2">
+          <p className="text-gray-600 text-sm mb-4">
+            将当前 <code>~/.codex/auth.json</code> 中的账号保存到管理器。
+          </p>
+          <Form.Item name="label" label="账号备注（可选）">
+            <Input placeholder="例如：工作账号、个人账号..." />
+          </Form.Item>
+          <div className="flex gap-2 justify-end">
+            <button
+              type="button"
+              onClick={() => setStep('choice')}
+              className="px-4 py-2 text-sm border border-gray-300 rounded-lg hover:bg-gray-50"
+            >
+              返回
+            </button>
+            <button
+              type="button"
+              onClick={handleImport}
+              disabled={loading}
+              className="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+            >
+              {loading ? '导入中...' : '确认导入'}
+            </button>
+          </div>
+        </Form>
+      )}
+    </Modal>
+  )
+}
