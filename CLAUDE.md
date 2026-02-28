@@ -4,61 +4,63 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`codex-manager` is a full-stack TypeScript web application for managing multiple OpenAI Codex CLI accounts locally. It lets users store, switch between, and label multiple Codex/ChatGPT accounts. The UI is in Chinese (Simplified).
+`codex-manager` is a native macOS desktop app for managing multiple OpenAI Codex CLI accounts locally. It lets users store, switch between, and label multiple Codex/ChatGPT accounts. The UI is in Chinese (Simplified).
+
+Built with **Tauri v2** — React frontend + Rust backend. No Express server; all filesystem I/O is handled by Tauri commands in `src-tauri/src/lib.rs`.
 
 ## Commands
 
 ```bash
-npm run dev        # Start both server and client concurrently (primary dev command)
-npm run client     # Vite dev server only (port 5174)
-npm run server     # Express API server only via tsx watch (port 3741)
-npm run build      # tsc -b type check + vite build
-npm run preview    # Preview production build
+npm run client        # Vite dev server only (port 5174)
+npm run build         # tsc -b type check + vite build
+npm run preview       # Preview production build
+npm run tauri:dev     # Start Tauri desktop app in dev mode (runs Vite + Rust)
+npm run tauri:build   # Build production .app + .dmg
 ```
 
 No lint or test scripts are configured.
 
 ## Architecture
 
-**Frontend SPA (React/Vite on :5174) + local REST API (Express on :3741)**
+**Tauri v2: React/Vite frontend + Rust backend (no network server)**
 
-Vite proxies all `/api/*` requests to the Express server. The server reads/writes directly to the filesystem under `~/.codex/`:
+The frontend calls Tauri commands via `invoke()` from `@tauri-apps/api/core`. The Rust backend reads/writes directly to the filesystem under `~/.codex/`:
 
 - `~/.codex/auth.json` — active account credentials
 - `~/.codex/accounts/<id>/auth.json` — per-account stored credentials
 - `~/.codex/accounts_meta.json` — user labels and timestamps
 - `~/.codex/config.toml` — Codex CLI config (read-only)
 
-**Account switching** is a file copy: the chosen account's `auth.json` is copied to `~/.codex/auth.json`, which the Codex CLI reads at runtime.
+**Account switching** is a file copy: the chosen account's `auth.json` is copied to `~/.codex/auth.json`.
 
-**JWT decoding** is done server-side without any external library — `decodeJwt()` base64-decodes the JWT payload to extract `email`, `plan`, `user_id`, and expiry from stored tokens.
+**JWT decoding** is done in Rust using `base64` crate — base64url-decodes the JWT payload to extract `email`, `plan`, `user_id`, and expiry from stored tokens.
 
-**Login flow** spawns the external `codex` CLI binary (`spawn('codex', ['login'], ...)`), so `codex` must be installed and on `$PATH`.
+**Login flow** spawns the external `codex` CLI binary via `std::process::Command`, so `codex` must be installed and on `$PATH`.
 
 ## Data Flow
 
 ```
-accountService.ts  →  fetch('/api/*')  →  Express server  →  ~/.codex/ filesystem
+accountService.ts  →  invoke('command_name')  →  src-tauri/src/lib.rs  →  ~/.codex/ filesystem
 useAccountStore.ts (Zustand)  →  accountService  →  AccountsPage.tsx  →  components
 ```
 
-- `src/services/accountService.ts` — typed HTTP client for all API calls
+- `src/services/accountService.ts` — typed `invoke()` wrappers for all Tauri commands
 - `src/stores/useAccountStore.ts` — Zustand store; holds `accounts[]`, `currentAccount`, `loading`, `error`; exposes async actions
 - `src/pages/AccountsPage.tsx` — main page consuming the store; renders stats cards + Ant Design table with per-row actions
-- `src/components/accounts/` — `AddAccountDialog` (two-step: codex login or import current), `AccountLabelEditor` (inline modal edit), `PlanBadge` (plan tier display)
+- `src/components/accounts/` — `AddAccountDialog`, `AccountLabelEditor`, `PlanBadge`
 
-## Server API Endpoints
+## Tauri Commands (src-tauri/src/lib.rs)
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/api/accounts` | List all managed accounts |
-| GET | `/api/accounts/current` | Get active account |
-| POST | `/api/accounts/switch` | Switch active account (file copy) |
-| DELETE | `/api/accounts/:id` | Remove account |
-| PATCH | `/api/accounts/:id/label` | Update label in metadata |
-| POST | `/api/accounts/import-current` | Import current `auth.json` as new account |
-| POST | `/api/login` | Spawn `codex login` subprocess |
-| GET | `/api/config` | Read `~/.codex/config.toml` |
+| Command | Purpose |
+|---------|---------|
+| `list_accounts` | List all managed accounts from `~/.codex/accounts/` |
+| `get_current_account` | Read and parse `~/.codex/auth.json` |
+| `switch_account(id)` | Copy `accounts/{id}/auth.json` → `auth.json` |
+| `delete_account(id)` | Remove account dir + update meta |
+| `update_label(id, label)` | Update `accounts_meta.json` |
+| `import_current(label)` | Copy `auth.json` → `accounts/{id}/auth.json` |
+| `launch_codex_login` | Spawn `codex login` subprocess |
+| `get_config` | Read `~/.codex/config.toml` |
 
 ## Key Type
 
@@ -80,4 +82,12 @@ interface CodexAccount {
 
 ## Stack
 
-TypeScript (strict) · React 19 · Express 4 · Ant Design 5 · Zustand 5 · React Router 7 · Tailwind CSS 3 · Vite 7 · `tsx` for server watch mode
+TypeScript (strict) · React 19 · Tauri 2 · Rust · Ant Design 5 · Zustand 5 · React Router 7 (hash mode) · Tailwind CSS 3 · Vite 7
+
+## GitHub Actions
+
+`.github/workflows/release.yml` — triggers on `v*` tags, builds on `macos-14` (Apple Silicon), produces `aarch64-apple-darwin` .dmg, uploads to GitHub Release.
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0  # trigger a release build
+```
