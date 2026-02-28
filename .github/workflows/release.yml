@@ -33,15 +33,27 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Ad-hoc sign the .app (bypass Gatekeeper without Apple cert)
+        run: |
+          APP=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -name "*.app" | head -1)
+          codesign --force --deep --sign - "$APP"
+
+      - name: Re-package signed .app into DMG
+        run: |
+          APP=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -name "*.app" | head -1)
+          APP_NAME=$(basename "$APP" .app)
+          DMG_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/${APP_NAME}-signed.dmg"
+          hdiutil create -volname "$APP_NAME" -srcfolder "$APP" -ov -format UDZO "$DMG_PATH"
+
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
           name: codex-manager-arm64.dmg
-          path: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          path: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*-signed.dmg
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          files: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*-signed.dmg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
