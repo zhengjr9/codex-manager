@@ -1,35 +1,14 @@
 import type { CodexAccount } from '../types/account'
-
-const BASE = '/api'
-
-async function req<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, options)
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || res.statusText)
-  }
-  return res.json()
-}
+import { invoke } from '@tauri-apps/api/core'
 
 export const accountService = {
-  list: () => req<CodexAccount[]>('/accounts'),
-  current: () => req<CodexAccount | null>('/accounts/current'),
-  switch: (id: string) => req<{ success: boolean }>('/accounts/switch', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id }),
-  }),
-  delete: (id: string) => req<{ success: boolean }>(`/accounts/${id}`, { method: 'DELETE' }),
-  updateLabel: (id: string, label: string) => req<{ success: boolean }>(`/accounts/${id}/label`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ label }),
-  }),
-  importCurrent: (label?: string) => req<{ success: boolean; id: string; email: string }>('/accounts/import-current', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ label }),
-  }),
-  login: () => req<{ success: boolean; message: string }>('/login', { method: 'POST' }),
-  getConfig: () => req<{ raw: string }>('/config'),
+  list: () => invoke<CodexAccount[]>('list_accounts'),
+  current: () => invoke<CodexAccount | null>('get_current_account'),
+  switch: (id: string) => invoke<boolean>('switch_account', { id }),
+  delete: (id: string) => invoke<boolean>('delete_account', { id }),
+  updateLabel: (id: string, label: string) => invoke<boolean>('update_label', { id, label }),
+  importCurrent: (label?: string) =>
+    invoke<{ success: boolean; id: string; email: string }>('import_current', { label: label ?? null }),
+  login: () => invoke<{ success: boolean; message: string }>('launch_codex_login'),
+  getConfig: () => invoke<{ raw: string }>('get_config'),
 }
