@@ -1027,7 +1027,7 @@ pub fn run() {
             update_label,
             import_current,
             get_config,
-            oauth_login,
+            old_oauth_login,
             refresh_account_token,
             start_api_proxy,
             stop_api_proxy,
