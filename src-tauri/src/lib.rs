@@ -561,10 +561,22 @@ fn get_config() -> Result<Value, String> {
 
 // ─── Tauri commands: OAuth PKCE login ────────────────────────────────────────
 
+#[tauri::command]
+fn launch_codex_login() -> Result<Value, String> {
+    std::process::Command::new("codex")
+        .arg("login")
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "success": true,
+        "message": "codex login started. Complete login in your terminal, then click \"Import Current Account\"."
+    }))
+}
+
 /// Start in-app OAuth login flow. Opens browser, waits for callback,
 /// exchanges code, saves auth.json, returns the new account.
 #[tauri::command]
-async fn old_oauth_login(label: Option<String>) -> Result<Value, String> {
+async fn oauth_login(label: Option<String>) -> Result<Value, String> {
     let port = find_free_port().ok_or("Could not find free port")?;
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     let verifier = pkce_verifier();
@@ -1027,7 +1039,8 @@ pub fn run() {
             update_label,
             import_current,
             get_config,
-            old_oauth_login,
+            launch_codex_login,
+            oauth_login,
             refresh_account_token,
             start_api_proxy,
             stop_api_proxy,
