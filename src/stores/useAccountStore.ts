@@ -2,11 +2,18 @@ import { create } from 'zustand'
 import type { CodexAccount } from '../types/account'
 import { accountService } from '../services/accountService'
 
+interface ProxyStatus {
+  running: boolean
+  port: number | null
+  active_email: string | null
+}
+
 interface AccountState {
   accounts: CodexAccount[]
   currentAccount: CodexAccount | null
   loading: boolean
   error: string | null
+  proxyStatus: ProxyStatus
 
   fetchAccounts: () => Promise<void>
   fetchCurrent: () => Promise<void>
@@ -15,6 +22,13 @@ interface AccountState {
   updateLabel: (id: string, label: string) => Promise<void>
   importCurrent: (label?: string) => Promise<void>
   refresh: () => Promise<void>
+
+  // New features
+  oauthLogin: (label?: string) => Promise<void>
+  refreshAccountToken: (id: string) => Promise<void>
+  fetchProxyStatus: () => Promise<void>
+  startProxy: (port?: number) => Promise<void>
+  stopProxy: () => Promise<void>
 }
 
 export const useAccountStore = create<AccountState>((set, get) => ({
@@ -22,6 +36,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
   currentAccount: null,
   loading: false,
   error: null,
+  proxyStatus: { running: false, port: null, active_email: null },
 
   fetchAccounts: async () => {
     set({ loading: true, error: null })
@@ -45,6 +60,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
   switchAccount: async (id) => {
     await accountService.switch(id)
     await get().fetchCurrent()
+    await get().fetchProxyStatus() // Proxy active email might change
   },
 
   deleteAccount: async (id) => {
@@ -68,6 +84,37 @@ export const useAccountStore = create<AccountState>((set, get) => ({
   },
 
   refresh: async () => {
-    await Promise.all([get().fetchAccounts(), get().fetchCurrent()])
+    await Promise.all([get().fetchAccounts(), get().fetchCurrent(), get().fetchProxyStatus()])
   },
+
+  oauthLogin: async (label) => {
+    await accountService.oauthLogin(label)
+    await get().fetchAccounts()
+    await get().fetchCurrent()
+  },
+
+  refreshAccountToken: async (id) => {
+    await accountService.refreshToken(id)
+    await get().fetchAccounts()
+    await get().fetchCurrent()
+  },
+
+  fetchProxyStatus: async () => {
+    try {
+      const proxyStatus = await accountService.getProxyStatus()
+      set({ proxyStatus })
+    } catch (e) {
+      console.error(e)
+    }
+  },
+
+  startProxy: async (port) => {
+    await accountService.startProxy(port)
+    await get().fetchProxyStatus()
+  },
+
+  stopProxy: async () => {
+    await accountService.stopProxy()
+    await get().fetchProxyStatus()
+  }
 }))

@@ -17,6 +17,18 @@ serde_json = "1"
 base64 = "0.22"
 tokio = { version = "1", features = ["full"] }
 
+# OAuth PKCE
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+rand = "0.8"
+sha2 = "0.10"
+open = "5"
+percent-encoding = "2"
+chrono = { version = "0.4", features = ["serde"] }
+
+# API reverse proxy
+axum = "0.7"
+futures-util = "0.3"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
