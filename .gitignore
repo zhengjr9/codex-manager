@@ -1,0 +1,12 @@
+node_modules/
+dist/
+app-icon.png
+
+# Rust build artifacts
+src-tauri/target/
+
+# Tauri generated files (rebuilt at dev time)
+src-tauri/gen/
+
+# OS
+.DS_Store
