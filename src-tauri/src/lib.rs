@@ -564,7 +564,7 @@ fn get_config() -> Result<Value, String> {
 /// Start in-app OAuth login flow. Opens browser, waits for callback,
 /// exchanges code, saves auth.json, returns the new account.
 #[tauri::command]
-async fn oauth_login(label: Option<String>) -> Result<Value, String> {
+async fn old_oauth_login(label: Option<String>) -> Result<Value, String> {
     let port = find_free_port().ok_or("Could not find free port")?;
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     let verifier = pkce_verifier();

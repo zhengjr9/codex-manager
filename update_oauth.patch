@@ -1,0 +1,190 @@
+--- src-tauri/src/lib.rs
++++ src-tauri/src/lib.rs
+@@ -560,94 +560,82 @@
+-#[tauri::command]
+-async fn oauth_login(label: Option<String>) -> Result<Value, String> {
+-    let port = find_free_port().ok_or("Could not find free port")?;
+-    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+-    let verifier = pkce_verifier();
+-    let challenge = pkce_challenge(&verifier);
+-    let state: String = {
+-        let mut b = [0u8; 16];
+-        rand::thread_rng().fill_bytes(&mut b);
+-        URL_SAFE_NO_PAD.encode(b)
+-    };
+-
+-    let auth_url = build_auth_url(&redirect_uri, &challenge, &state);
+-
+-    // Open browser
+-    open::that(&auth_url).map_err(|e| format!("Cannot open browser: {e}"))?;
+-
+-    // Local HTTP server to catch callback
+-    let listener =
+-        tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+-            .await
+-            .map_err(|e| e.to_string())?;
+-
+-    // We only need one request; use a channel to get the query string
+-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+-    let tx = Arc::new(Mutex::new(Some(tx)));
+-
+-    let server = {
+-        let tx = tx.clone();
+-        let state_check = state.clone();
+-        tokio::spawn(async move {
+-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+-            while let Ok((mut stream, _)) = listener.accept().await {
+-                let mut buf = vec![0u8; 4096];
+-                let n = stream.read(&mut buf).await.unwrap_or(0);
+-                let req = String::from_utf8_lossy(&buf[..n]);
+-                // Parse GET /callback?code=...&state=...
+-                if let Some(line) = req.lines().next() {
+-                    if let Some(qs_start) = line.find('?') {
+-                        let qs = &line[qs_start + 1..];
+-                        let qs = qs.split_whitespace().next().unwrap_or(qs);
+-                        let params: HashMap<_, _> = qs
+-                            .split('&')
+-                            .filter_map(|p| {
+-                                let mut kv = p.splitn(2, '=');
+-                                Some((kv.next()?, kv.next()?))
+-                            })
+-                            .collect();
+-
+-                        let ok_state = params.get("state").map_or(false, |s| *s == state_check);
+-                        let has_code = params.contains_key("code");
+-
+-                        let html = if ok_state && has_code {
+-                            "<html><body><h2>✅ 登录成功，可关闭此页面返回应用。</h2></body></html>"
+-                        } else {
+-                            "<html><body><h2>❌ 登录失败，请重试。</h2></body></html>"
+-                        };
+-
+-                        let response = format!(
+-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+-                            html.len(),
+-                            html
+-                        );
+-                        let _ = stream.write_all(response.as_bytes()).await;
+-                        let _ = stream.shutdown().await;
+-
+-                        if ok_state && has_code {
+-                            if let Some(sender) = tx.lock().unwrap().take() {
+-                                let _ = sender.send(qs.to_string());
+-                            }
+-                            break;
+-                        }
+-                    }
+-                }
+-            }
+-        })
+-    };
+-
+-    // Wait for callback (max 3 minutes)
+-    let qs = tokio::time::timeout(std::time::Duration::from_secs(180), rx)
+-        .await
+-        .map_err(|_| "Login timed out (3 min). Please try again.")?
+-        .map_err(|_| "Login cancelled")?;
+-
+-    server.abort();
+-
+-    // Parse code from query string
+-    let params: HashMap<_, _> = qs
+-        .split('&')
+-        .filter_map(|p| {
+-            let mut kv = p.splitn(2, '=');
+-            Some((kv.next()?.to_string(), kv.next()?.to_string()))
+-        })
+-        .collect();
+-    let code = params.get("code").ok_or("No code in callback")?;
+-
+-    // Exchange code for tokens
+-    let token_resp = exchange_code(code, &redirect_uri, &verifier).await?;
+-
+-    // Save auth.json
+-    let account = save_oauth_tokens(&token_resp)?;
+-
+-    // Import into managed accounts
+-    let import_result = import_current(label)?;
+-
+-    Ok(serde_json::json!({
+-        "success": true,
+-        "email": account.email,
+-        "plan": account.plan,
+-        "id": import_result["id"]
+-    }))
+-}
++#[derive(Serialize)]
++struct OauthInitResult {
++    auth_url: String,
++    redirect_uri: String,
++    verifier: String,
++    state: String,
++}
++
++/// Generate OAuth authorization URL and session params
++#[tauri::command]
++async fn start_oauth_flow() -> Result<Value, String> {
++    // Fixed static loopback or dynamically obtained
++    let port = find_free_port().unwrap_or(8080);
++    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
++    
++    let verifier = pkce_verifier();
++    let challenge = pkce_challenge(&verifier);
++    
++    let state: String = {
++        let mut b = [0u8; 16];
++        rand::thread_rng().fill_bytes(&mut b);
++        URL_SAFE_NO_PAD.encode(b)
++    };
++
++    let auth_url = build_auth_url(&redirect_uri, &challenge, &state);
++
++    Ok(serde_json::json!(OauthInitResult {
++        auth_url,
++        redirect_uri,
++        verifier,
++        state
++    }))
++}
++
++/// Exchange obtained OAuth code (either from manual paste or local auto-catch) into Token
++#[tauri::command]
++async fn complete_oauth(
++    callback_url: String,
++    redirect_uri: String,
++    verifier: String,
++    label: Option<String>,
++) -> Result<Value, String> {
++    // Parse query string or URL
++    let qs = if callback_url.contains('?') {
++        callback_url.split('?').nth(1).unwrap_or("")
++    } else {
++        &callback_url
++    };
++
++    let params: HashMap<_, _> = qs
++        .split('&')
++        .filter_map(|p| {
++            let mut kv = p.splitn(2, '=');
++            Some((kv.next()?.to_string(), kv.next()?.to_string()))
++        })
++        .collect();
++        
++    let code = params.get("code").ok_or("The provided callback URL does not contain an authorization code. Did you cancel the login?")?;
++
++    // Force rust TLS to pick up OS-level proxy variables for proxy environment users
++    let token_resp = exchange_code(code, &redirect_uri, &verifier).await?;
++
++    // Save to ~/.codex/auth.json
++    let account = save_oauth_tokens(&token_resp)?;
++
++    // Import as managed codex account
++    let import_result = import_current(label)?;
++
++    Ok(serde_json::json!({
++        "success": true,
++        "email": account.email,
++        "plan": account.plan,
++        "id": import_result["id"]
++    }))
++}
