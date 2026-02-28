@@ -238,7 +238,7 @@ export default function AccountsPage() {
       >
         <div className="flex items-center justify-between text-sm text-gray-600">
            <div>
-             代理将您的本地请求拦截，并自动注入当前活跃账号的 Access Token，将其转发至 <code>api.openai.com</code>。
+             代理将您的本地请求拦截，并依次轮询（Round-Robin）账号池中所有健康的账号，将请求转发至 <code>api.openai.com</code>。
            </div>
            {proxyStatus.running && proxyStatus.port && (
              <div className="flex gap-4">
@@ -246,7 +246,7 @@ export default function AccountsPage() {
                     Base URL: http://127.0.0.1:{proxyStatus.port}/v1
                  </Tag>
                  <Tag color="purple" bordered={false} className="px-3 py-1 font-mono text-xs">
-                    当前代理账号: {proxyStatus.active_email || '未知'}
+                    正在轮询调用 {proxyStatus.account_count} 个健康账号
                  </Tag>
              </div>
            )}

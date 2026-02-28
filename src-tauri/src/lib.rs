@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex, RwLock};
 use tokio::sync::oneshot;
 
 // ─── paths ───────────────────────────────────────────────────────────────────
@@ -55,7 +55,30 @@ pub struct CodexAccount {
 struct ProxyStatus {
     running: bool,
     port: Option<u16>,
-    active_email: Option<String>,
+    account_count: usize,
+}
+
+// ─── Global State for Proxy Gateway ──────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+enum AccountHealth {
+    Active,
+    RateLimited, // Received 429
+    Blocked,     // Received 401/403 (needs refresh/re-login)
+}
+
+#[derive(Clone)]
+struct ProxyAccount {
+    id: String,
+    email: String,
+    access_token: String,
+    health: AccountHealth,
+}
+
+struct ProxyState {
+    client: reqwest::Client,
+    accounts: Arc<RwLock<Vec<ProxyAccount>>>,
+    req_counter: AtomicUsize,
 }
 
 // Global proxy shutdown sender
@@ -737,10 +760,51 @@ async fn refresh_account_token(id: String) -> Result<Value, String> {
     }))
 }
 
-// ─── Tauri commands: API reverse proxy ───────────────────────────────────────
+// ─── Tauri commands: API reverse proxy (Round Robin) ─────────────────────────
+
+/// Load all valid accounts from disk into memory pool
+fn load_proxy_accounts() -> Result<Vec<ProxyAccount>, String> {
+    let mut pool = Vec::new();
+    let accounts_path = accounts_dir();
+
+    if !accounts_path.exists() {
+        return Err("No accounts directory found. Please login at least one account.".into());
+    }
+
+    let entries = fs::read_dir(&accounts_path).map_err(|e| e.to_string())?;
+    for entry in entries.flatten() {
+        let auth_path = entry.path().join("auth.json");
+        if !auth_path.exists() {
+            continue;
+        }
+
+        if let Ok(content) = fs::read_to_string(&auth_path) {
+            if let Ok(auth_data) = serde_json::from_str::<Value>(&content) {
+                let empty = Value::Object(Default::default());
+                let tokens = auth_data.get("tokens").unwrap_or(&empty);
+                if let Some(access_token) = tokens.get("access_token").and_then(|v| v.as_str()) {
+                    let account_id = entry.file_name().to_string_lossy().to_string();
+                    let parsed = parse_auth_data(&auth_data, &account_id);
+                    pool.push(ProxyAccount {
+                        id: account_id,
+                        email: parsed.email,
+                        access_token: access_token.to_string(),
+                        health: AccountHealth::Active,
+                    });
+                }
+            }
+        }
+    }
+
+    if pool.is_empty() {
+        Err("No valid access tokens found. Please login at least one account.".into())
+    } else {
+        Ok(pool)
+    }
+}
 
 /// Start a local HTTP server that proxies requests to api.openai.com
-/// using the currently active account's access token.
+/// using round-robin token selection from all available accounts.
 #[tauri::command]
 async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
     // Stop existing proxy if any
@@ -752,26 +816,8 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
     }
 
     let proxy_port = port.unwrap_or(8080);
-
-    // Read active account's access token
-    let auth_path = auth_file();
-    if !auth_path.exists() {
-        return Err("No active account. Please login first.".into());
-    }
-    let content = fs::read_to_string(&auth_path).map_err(|e| e.to_string())?;
-    let auth_data: Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
-
-    let empty = Value::Object(Default::default());
-    let tokens = auth_data.get("tokens").unwrap_or(&empty);
-    let access_token = tokens
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .ok_or("No access token found")?
-        .to_string();
-    let active_email = {
-        let account = parse_auth_data(&auth_data, "proxy");
-        account.email.clone()
-    };
+    let accounts = load_proxy_accounts()?;
+    let account_count = accounts.len();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     {
@@ -787,20 +833,20 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
     use axum::{
         body::Body,
         extract::State,
-        http::{Method, Request, StatusCode},
+        http::{Request, StatusCode},
         response::Response,
         routing::any,
         Router,
     };
 
-    #[derive(Clone)]
-    struct ProxyState {
-        token: String,
-        client: reqwest::Client,
-    }
+    let proxy_state = Arc::new(ProxyState {
+        client: reqwest::Client::new(),
+        accounts: Arc::new(RwLock::new(accounts)),
+        req_counter: AtomicUsize::new(0),
+    });
 
     async fn proxy_handler(
-        State(state): State<ProxyState>,
+        State(state): State<Arc<ProxyState>>,
         req: Request<Body>,
     ) -> Result<Response<Body>, StatusCode> {
         let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
@@ -809,14 +855,49 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
             .unwrap_or(reqwest::Method::GET);
 
+        // We only buffer body if it's small (to support streaming from client eventually),
+        // but for now 10MB limit as before
         let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
             .await
             .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-        let mut upstream = state
+        // Find a healthy account using Round-Robin
+        let mut chosen_token = None;
+        let mut chosen_idx = 0;
+        let pool_size;
+
+        {
+            let accounts_lock = state.accounts.read().unwrap();
+            pool_size = accounts_lock.len();
+
+            if pool_size == 0 {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+
+            // Try up to `pool_size` times to find an active account
+            let start_count = state.req_counter.fetch_add(1, Ordering::SeqCst);
+            for i in 0..pool_size {
+                let idx = (start_count + i) % pool_size;
+                if accounts_lock[idx].health == AccountHealth::Active {
+                    chosen_token = Some(accounts_lock[idx].access_token.clone());
+                    chosen_idx = idx;
+                    break;
+                }
+            }
+        }
+
+        let token = match chosen_token {
+            Some(t) => t,
+            None => {
+                // All accounts are blocked / rate limited
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+        };
+
+        let upstream = state
             .client
             .request(method, &target)
-            .header("Authorization", format!("Bearer {}", state.token))
+            .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json")
             .body(body_bytes);
 
@@ -825,7 +906,26 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             .await
             .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
-        let status = axum::http::StatusCode::from_u16(upstream_resp.status().as_u16())
+        let upstream_status = upstream_resp.status();
+
+        // Interpret upstream errors (401/403 -> Blocked, 429 -> RateLimited)
+        if upstream_status == reqwest::StatusCode::UNAUTHORIZED || upstream_status == reqwest::StatusCode::FORBIDDEN {
+            // Mark account as Blocked
+            if let Ok(mut accounts_lock) = state.accounts.write() {
+                if let Some(acc) = accounts_lock.get_mut(chosen_idx) {
+                    acc.health = AccountHealth::Blocked;
+                }
+            }
+        } else if upstream_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Mark account as RateLimited
+            if let Ok(mut accounts_lock) = state.accounts.write() {
+                if let Some(acc) = accounts_lock.get_mut(chosen_idx) {
+                    acc.health = AccountHealth::RateLimited;
+                }
+            }
+        }
+
+        let status = axum::http::StatusCode::from_u16(upstream_status.as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         let mut builder = Response::builder().status(status);
@@ -839,16 +939,15 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         // CORS
         builder = builder.header("Access-Control-Allow-Origin", "*");
 
-        let body_bytes = upstream_resp.bytes().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+        // For SSE Streams, we ideally want to stream it back byte-for-byte here
+        let stream = upstream_resp.bytes_stream();
+        let body = axum::body::Body::from_stream(stream);
+
         Ok(builder
-            .body(Body::from(body_bytes))
+            .body(body)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
     }
 
-    let proxy_state = ProxyState {
-        token: access_token,
-        client: reqwest::Client::new(),
-    };
     let app = Router::new()
         .route("/{*path}", any(proxy_handler))
         .route("/", any(proxy_handler))
@@ -873,8 +972,8 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
     Ok(serde_json::json!({
         "success": true,
         "port": proxy_port,
-        "active_email": active_email,
-        "base_url": format!("http://127.0.0.1:{proxy_port}")
+        "base_url": format!("http://127.0.0.1:{proxy_port}"),
+        "account_count": account_count
     }))
 }
 
@@ -894,24 +993,24 @@ fn get_proxy_status() -> Result<ProxyStatus, String> {
     let port = *PROXY_PORT.lock().unwrap();
     let running = port.is_some();
 
-    let active_email = if running {
-        auth_file()
-            .exists()
-            .then(|| {
-                fs::read_to_string(auth_file())
-                    .ok()
-                    .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-                    .map(|v| parse_auth_data(&v, "proxy").email)
+    // Quick count of accounts loaded (if we wanted true dynamic status we'd need to store state globally,
+    // but a filesystem count matches the initialization phase for now)
+    let account_count = if running {
+        fs::read_dir(accounts_dir())
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                 .filter(|e| e.path().join("auth.json").exists())
+                 .count()
             })
-            .flatten()
+            .unwrap_or(0)
     } else {
-        None
+        0
     };
 
     Ok(ProxyStatus {
         running,
         port,
-        active_email,
+        account_count,
     })
 }
 

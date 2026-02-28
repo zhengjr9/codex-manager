@@ -10,3 +10,4 @@ src-tauri/gen/
 
 # OS
 .DS_Store
+.local/
