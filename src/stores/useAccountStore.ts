@@ -5,7 +5,7 @@ import { accountService } from '../services/accountService'
 interface ProxyStatus {
   running: boolean
   port: number | null
-  active_email: string | null
+  account_count: number
 }
 
 interface AccountState {
@@ -36,7 +36,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
   currentAccount: null,
   loading: false,
   error: null,
-  proxyStatus: { running: false, port: null, active_email: null },
+  proxyStatus: { running: false, port: null, account_count: 0 },
 
   fetchAccounts: async () => {
     set({ loading: true, error: null })
@@ -60,7 +60,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
   switchAccount: async (id) => {
     await accountService.switch(id)
     await get().fetchCurrent()
-    await get().fetchProxyStatus() // Proxy active email might change
+    await get().fetchProxyStatus()
   },
 
   deleteAccount: async (id) => {
@@ -68,6 +68,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     const { accounts, currentAccount } = get()
     set({ accounts: accounts.filter(a => a.id !== id) })
     if (currentAccount?.id === id) set({ currentAccount: null })
+    await get().fetchProxyStatus()
   },
 
   updateLabel: async (id, label) => {
@@ -81,6 +82,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     await accountService.importCurrent(label)
     await get().fetchAccounts()
     await get().fetchCurrent()
+    await get().fetchProxyStatus()
   },
 
   refresh: async () => {
@@ -91,6 +93,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     await accountService.oauthLogin(label)
     await get().fetchAccounts()
     await get().fetchCurrent()
+    await get().fetchProxyStatus()
   },
 
   refreshAccountToken: async (id) => {

@@ -19,7 +19,7 @@ export const accountService = {
     invoke<{ success: boolean; email: string; expires_at: number }>('refresh_account_token', { id }),
 
   // Proxy server
-  startProxy: (port?: number) => invoke<{ success: boolean; port: number; active_email: string; base_url: string }>('start_api_proxy', { port: port ?? 8080 }),
+  startProxy: (port?: number) => invoke<{ success: boolean; port: number; account_count: number; base_url: string }>('start_api_proxy', { port: port ?? 8080 }),
   stopProxy: () => invoke<{ success: boolean; message: string }>('stop_api_proxy'),
-  getProxyStatus: () => invoke<{ running: boolean; port: number | null; active_email: string | null }>('get_proxy_status'),
+  getProxyStatus: () => invoke<{ running: boolean; port: number | null; account_count: number }>('get_proxy_status'),
 }
