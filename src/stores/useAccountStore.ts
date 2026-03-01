@@ -1,12 +1,6 @@
 import { create } from 'zustand'
 import type { CodexAccount } from '../types/account'
-import { accountService } from '../services/accountService'
-
-interface ProxyStatus {
-  running: boolean
-  port: number | null
-  account_count: number
-}
+import { accountService, type AccountUsage, type ProxyStatus } from '../services/accountService'
 
 interface AccountState {
   accounts: CodexAccount[]
@@ -14,6 +8,8 @@ interface AccountState {
   loading: boolean
   error: string | null
   proxyStatus: ProxyStatus
+  usageMap: Record<string, AccountUsage>
+  usageLoading: Record<string, boolean>
 
   fetchAccounts: () => Promise<void>
   fetchCurrent: () => Promise<void>
@@ -23,12 +19,13 @@ interface AccountState {
   importCurrent: (label?: string) => Promise<void>
   refresh: () => Promise<void>
 
-  // New features
   oauthLogin: (label?: string) => Promise<void>
   refreshAccountToken: (id: string) => Promise<void>
+  fetchUsage: (id: string) => Promise<void>
   fetchProxyStatus: () => Promise<void>
   startProxy: (port?: number) => Promise<void>
   stopProxy: () => Promise<void>
+  reloadProxy: () => Promise<void>
 }
 
 export const useAccountStore = create<AccountState>((set, get) => ({
@@ -36,7 +33,9 @@ export const useAccountStore = create<AccountState>((set, get) => ({
   currentAccount: null,
   loading: false,
   error: null,
-  proxyStatus: { running: false, port: null, account_count: 0 },
+  proxyStatus: { running: false, port: null, account_count: 0, active: 0, cooldown: 0, blocked: 0 },
+  usageMap: {},
+  usageLoading: {},
 
   fetchAccounts: async () => {
     set({ loading: true, error: null })
@@ -65,8 +64,10 @@ export const useAccountStore = create<AccountState>((set, get) => ({
 
   deleteAccount: async (id) => {
     await accountService.delete(id)
-    const { accounts, currentAccount } = get()
-    set({ accounts: accounts.filter(a => a.id !== id) })
+    const { accounts, currentAccount, usageMap } = get()
+    const newUsageMap = { ...usageMap }
+    delete newUsageMap[id]
+    set({ accounts: accounts.filter(a => a.id !== id), usageMap: newUsageMap })
     if (currentAccount?.id === id) set({ currentAccount: null })
     await get().fetchProxyStatus()
   },
@@ -102,6 +103,19 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     await get().fetchCurrent()
   },
 
+  fetchUsage: async (id) => {
+    set(state => ({ usageLoading: { ...state.usageLoading, [id]: true } }))
+    try {
+      const usage = await accountService.getUsage(id)
+      set(state => ({
+        usageMap: { ...state.usageMap, [id]: usage },
+        usageLoading: { ...state.usageLoading, [id]: false },
+      }))
+    } catch {
+      set(state => ({ usageLoading: { ...state.usageLoading, [id]: false } }))
+    }
+  },
+
   fetchProxyStatus: async () => {
     try {
       const proxyStatus = await accountService.getProxyStatus()
@@ -118,6 +132,11 @@ export const useAccountStore = create<AccountState>((set, get) => ({
 
   stopProxy: async () => {
     await accountService.stopProxy()
+    await get().fetchProxyStatus()
+  },
+
+  reloadProxy: async () => {
+    await accountService.reloadProxy()
     await get().fetchProxyStatus()
   }
 }))
