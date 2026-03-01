@@ -62,6 +62,7 @@ export default function AddAccountDialog({ open, onClose }: Props) {
   function handleCancel() {
     form.resetFields()
     setStep('choice')
+    setLoading(false)
     onClose()
   }
 
