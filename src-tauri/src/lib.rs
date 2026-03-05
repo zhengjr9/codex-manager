@@ -83,6 +83,17 @@ impl Default for ProxyConfig {
 
 static PROXY_CONFIG: OnceLock<Mutex<ProxyConfig>> = OnceLock::new();
 
+// Pending OAuth session (verifier + state + redirect_uri) for manual callback flow
+struct OAuthPending {
+    verifier: String,
+    state: String,
+    redirect_uri: String,
+}
+static OAUTH_PENDING: OnceLock<Mutex<Option<OAuthPending>>> = OnceLock::new();
+fn oauth_pending() -> &'static Mutex<Option<OAuthPending>> {
+    OAUTH_PENDING.get_or_init(|| Mutex::new(None))
+}
+
 fn load_proxy_config() -> ProxyConfig {
     let path = proxy_config_path();
     if let Ok(content) = fs::read_to_string(&path) {
@@ -886,6 +897,77 @@ fn launch_codex_login() -> Result<Value, String> {
     Ok(serde_json::json!({
         "success": true,
         "message": "codex login started. Complete login in your terminal, then click \"Import Current Account\"."
+    }))
+}
+
+/// Generate an OAuth URL and return it to the frontend without opening a browser.
+/// The frontend can copy the URL and let the user login manually, then paste back the callback URL.
+#[tauri::command]
+fn get_oauth_url() -> Result<Value, String> {
+    let port = OAUTH_CALLBACK_PORT;
+    let redirect_uri = format!("http://localhost:{port}/auth/callback");
+    let verifier = pkce_verifier();
+    let challenge = pkce_challenge(&verifier);
+    let state: String = {
+        let mut b = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut b);
+        URL_SAFE_NO_PAD.encode(b)
+    };
+    let auth_url = build_auth_url(&redirect_uri, &challenge, &state);
+
+    // Store pending session
+    *oauth_pending().lock().unwrap() = Some(OAuthPending {
+        verifier,
+        state,
+        redirect_uri,
+    });
+
+    Ok(serde_json::json!({
+        "auth_url": auth_url,
+    }))
+}
+
+/// Complete OAuth login by parsing a callback URL the user pasted manually.
+/// Extracts code+state, exchanges for tokens, saves and imports the account.
+#[tauri::command]
+async fn complete_oauth_manual(callback_url: String, label: Option<String>) -> Result<Value, String> {
+    let pending = oauth_pending().lock().unwrap().take()
+        .ok_or("No pending OAuth session. Please generate a login URL first.")?;
+
+    // Parse query string from full URL or bare query string
+    let qs = if let Some(pos) = callback_url.find('?') {
+        callback_url[pos + 1..].to_string()
+    } else {
+        callback_url.clone()
+    };
+
+    let params: HashMap<String, String> = qs
+        .split('&')
+        .filter_map(|p| {
+            let mut kv = p.splitn(2, '=');
+            let k = kv.next()?.to_string();
+            let v = percent_encoding::percent_decode_str(kv.next()?)
+                .decode_utf8_lossy()
+                .to_string();
+            Some((k, v))
+        })
+        .collect();
+
+    let returned_state = params.get("state").map(|s| s.as_str()).unwrap_or("");
+    if returned_state != pending.state {
+        return Err("State mismatch — the callback URL does not match this session.".into());
+    }
+    let code = params.get("code").ok_or("No authorization code found in the URL.")?;
+
+    let token_resp = exchange_code(code, &pending.redirect_uri, &pending.verifier).await?;
+    let account = save_oauth_tokens(&token_resp)?;
+    let import_result = import_current(label)?;
+
+    Ok(serde_json::json!({
+        "success": true,
+        "email": account.email,
+        "plan": account.plan,
+        "id": import_result["id"]
     }))
 }
 
@@ -2512,6 +2594,8 @@ pub fn run() {
             get_config,
             launch_codex_login,
             oauth_login,
+            get_oauth_url,
+            complete_oauth_manual,
             refresh_account_token,
             get_account_usage,
             start_api_proxy,
