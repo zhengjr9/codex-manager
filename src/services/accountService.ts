@@ -66,6 +66,10 @@ export const accountService = {
 
   oauthLogin: (label?: string) =>
     invoke<{ success: boolean; email: string; plan: string; id: string }>('oauth_login', { label: label ?? null }),
+  getOAuthUrl: () =>
+    invoke<{ auth_url: string }>('get_oauth_url'),
+  completeOAuthManual: (callbackUrl: string, label?: string) =>
+    invoke<{ success: boolean; email: string; plan: string; id: string }>('complete_oauth_manual', { callbackUrl, label: label ?? null }),
   refreshToken: (id: string) =>
     invoke<{ success: boolean; email: string; expires_at: number }>('refresh_account_token', { id }),
   getUsage: (id: string) => invoke<AccountUsage>('get_account_usage', { id }),
