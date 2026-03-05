@@ -741,11 +741,40 @@ fn get_current_account() -> Result<Option<CodexAccount>, String> {
 
 #[tauri::command]
 fn switch_account(id: String) -> Result<bool, String> {
-    let auth_path = accounts_dir().join(&id).join("auth.json");
-    if !auth_path.exists() {
+    let src_path = accounts_dir().join(&id).join("auth.json");
+    if !src_path.exists() {
         return Err("Account not found".into());
     }
-    fs::copy(&auth_path, auth_file()).map_err(|e| e.to_string())?;
+
+    // Read the target account's auth data
+    let src_content = fs::read_to_string(&src_path).map_err(|e| e.to_string())?;
+    let src_data: Value = serde_json::from_str(&src_content).map_err(|e| e.to_string())?;
+
+    let dst_path = auth_file();
+
+    // Preserve existing non-token fields (e.g. OPENAI_API_KEY, user config) from current auth.json
+    let mut dst_data: Value = if dst_path.exists() {
+        fs::read_to_string(&dst_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    // Only overwrite authentication fields; leave OPENAI_API_KEY and other config intact
+    if let Some(tokens) = src_data.get("tokens") {
+        dst_data["tokens"] = tokens.clone();
+    }
+    if let Some(auth_mode) = src_data.get("auth_mode") {
+        dst_data["auth_mode"] = auth_mode.clone();
+    }
+    if let Some(last_refresh) = src_data.get("last_refresh") {
+        dst_data["last_refresh"] = last_refresh.clone();
+    }
+
+    let out = serde_json::to_string_pretty(&dst_data).map_err(|e| e.to_string())?;
+    fs::write(&dst_path, out).map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -1853,13 +1882,111 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 acc.health = AccountHealth::Blocked;
             }
         } else if upstream_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            // Cooldown for COOLDOWN_SECS seconds
-            let until = std::time::Instant::now()
-                + std::time::Duration::from_secs(COOLDOWN_SECS);
-            let mut accounts_lock = state.accounts.write().unwrap();
-            if let Some(acc) = accounts_lock.get_mut(chosen_idx) {
-                acc.health = AccountHealth::Cooldown(until);
+            // Mark current account as cooldown
+            {
+                let until = std::time::Instant::now()
+                    + std::time::Duration::from_secs(COOLDOWN_SECS);
+                let mut accounts_lock = state.accounts.write().unwrap();
+                if let Some(acc) = accounts_lock.get_mut(chosen_idx) {
+                    acc.health = AccountHealth::Cooldown(until);
+                }
             }
+            log_proxy(&format!("req#{request_id} 429 on {chosen_id}, trying another account"));
+
+            // Pick a different healthy account from the pool and retry immediately
+            let fallback = {
+                let now = std::time::Instant::now();
+                let mut accounts_lock = state.accounts.write().unwrap();
+                for acc in accounts_lock.iter_mut() {
+                    if let AccountHealth::Cooldown(u) = &acc.health {
+                        if now >= *u {
+                            acc.health = AccountHealth::Active;
+                        }
+                    }
+                }
+                let pool_size = accounts_lock.len();
+                let start = state.req_counter.load(Ordering::SeqCst);
+                let mut found = None;
+                for i in 0..pool_size {
+                    let idx = (start + i) % pool_size;
+                    if idx != chosen_idx && accounts_lock[idx].health == AccountHealth::Active {
+                        found = Some((
+                            accounts_lock[idx].access_token.clone(),
+                            accounts_lock[idx].account_id.clone(),
+                        ));
+                        break;
+                    }
+                }
+                found
+            };
+
+            if let Some((fallback_token, fallback_account_id)) = fallback {
+                let mut retry_headers = forward_headers;
+                apply_upstream_headers(
+                    &mut retry_headers,
+                    &fallback_token,
+                    fallback_account_id.as_deref(),
+                    &req_headers,
+                    !body_bytes.is_empty(),
+                    is_stream,
+                );
+                if let Ok(retry_resp) = state.client
+                    .request(method, &target)
+                    .headers(retry_headers)
+                    .body(body_bytes)
+                    .send()
+                    .await
+                {
+                    let retry_status = retry_resp.status();
+                    log_proxy(&format!("req#{request_id} 429-retry status: {}", retry_status.as_u16()));
+                    let resp_hdrs_json = headers_to_json_string(sanitize_reqwest_headers(retry_resp.headers()));
+                    if !is_stream {
+                        let headers = retry_resp.headers().clone();
+                        let bytes = retry_resp.bytes().await.unwrap_or_default();
+                        let response_body_text = if bytes.is_empty() { None } else { Some(truncate_body(&bytes)) };
+                        let (input_tokens, output_tokens) = extract_usage(&bytes);
+                        let entry = ProxyLogEntry {
+                            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                            method: method_label,
+                            path: path.to_string(),
+                            status: retry_status.as_u16(),
+                            duration_ms: started_at.elapsed().as_millis() as u64,
+                            proxy_account_id: chosen_id,
+                            account_id: fallback_account_id,
+                            error: None,
+                            model: request_model,
+                            request_headers: request_headers_json,
+                            response_headers: resp_hdrs_json,
+                            request_body: request_body_text,
+                            response_body: response_body_text,
+                            input_tokens,
+                            output_tokens,
+                        };
+                        let _ = insert_proxy_log(&entry);
+                        return build_proxy_response_from_bytes(retry_status, &headers, bytes);
+                    }
+                    let entry = ProxyLogEntry {
+                        timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                        method: method_label,
+                        path: path.to_string(),
+                        status: retry_resp.status().as_u16(),
+                        duration_ms: started_at.elapsed().as_millis() as u64,
+                        proxy_account_id: chosen_id,
+                        account_id: fallback_account_id,
+                        error: None,
+                        model: request_model,
+                        request_headers: request_headers_json,
+                        response_headers: resp_hdrs_json,
+                        request_body: request_body_text,
+                        response_body: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                    };
+                    let _ = insert_proxy_log(&entry);
+                    return build_proxy_response(retry_resp).await;
+                }
+            }
+            // No fallback available – fall through and return original 429 to client
         }
 
         let response_headers_json = headers_to_json_string(sanitize_reqwest_headers(upstream_resp.headers()));
