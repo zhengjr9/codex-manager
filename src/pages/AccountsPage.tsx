@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import {
   Table, Button, Popconfirm, Tag, Tooltip, message, Spin, Alert,
-  Space, Typography, Card, Statistic, Row, Col, Progress, Switch, InputNumber, Input, Drawer, Divider
+  Space, Typography, Card, Statistic, Row, Col, Progress, Switch, InputNumber, Input
 } from 'antd'
 import {
   PlusOutlined, ReloadOutlined, CheckCircleFilled,
@@ -187,6 +187,9 @@ export default function AccountsPage() {
   const [logDetailOpen, setLogDetailOpen] = useState(false)
   const [logDetail, setLogDetail] = useState<ProxyLogDetail | null>(null)
   const [logDetailLoading, setLogDetailLoading] = useState(false)
+  const [logsCollapsed, setLogsCollapsed] = useState(true)
+  const [expandedRowData, setExpandedRowData] = useState<Record<number, ProxyLogDetail>>({})
+  const [expandedRowLoading, setExpandedRowLoading] = useState<Set<number>>(new Set())
 
   // 初始加载账号
   useEffect(() => {
@@ -326,6 +329,23 @@ export default function AccountsPage() {
       message.error(String(e))
     } finally {
       setLogDetailLoading(false)
+    }
+  }
+
+  async function loadExpandedRow(id: number) {
+    if (expandedRowData[id]) return
+    setExpandedRowLoading(prev => new Set(prev).add(id))
+    try {
+      const detail = await accountService.getProxyLogDetail(id)
+      setExpandedRowData(prev => ({ ...prev, [id]: detail }))
+    } catch (e) {
+      message.error(String(e))
+    } finally {
+      setExpandedRowLoading(prev => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
     }
   }
 
@@ -529,6 +549,91 @@ export default function AccountsPage() {
 
   return (
     <div className="space-y-6 max-w-5xl mx-auto pb-12">
+      {/* Stats */}
+      <Row gutter={16}>
+        <Col span={6}>
+          <Card size="small">
+            <Statistic title="总账号数" value={stats.total} prefix={<UserOutlined />} />
+          </Card>
+        </Col>
+        <Col span={6}>
+          <Card size="small">
+            <Statistic title="付费账号" value={stats.pro} valueStyle={{ color: '#6366f1' }} />
+          </Card>
+        </Col>
+        <Col span={6}>
+          <Card size="small">
+            <Statistic title="免费账号" value={stats.free} />
+          </Card>
+        </Col>
+        <Col span={6}>
+          <Card size="small">
+            <Statistic
+              title="Token 过期"
+              value={stats.expired}
+              valueStyle={{ color: stats.expired > 0 ? '#ff4d4f' : undefined }}
+            />
+          </Card>
+        </Col>
+      </Row>
+
+      {/* Main table */}
+      <Card
+        title={
+          <div className="flex items-center gap-2">
+            <span>账号管理池</span>
+            {currentAccount && (
+              <Tag color="cyan" className="ml-2 font-mono text-xs shadow-sm" style={{ padding: '0 8px', borderRadius: '4px' }}>
+                当前: {currentAccount.label || currentAccount.email} ({currentAccount.plan.toUpperCase()})
+              </Tag>
+            )}
+          </div>
+        }
+        extra={
+          <Space>
+            <Button icon={<ReloadOutlined />} onClick={handleRefreshAll} loading={loading}>
+              刷新
+            </Button>
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => setAddOpen(true)}>
+              添加账号
+            </Button>
+          </Space>
+        }
+      >
+        {error && (
+          <Alert
+            type="error"
+            message={error}
+            className="mb-4"
+            showIcon
+            action={<Button size="small" onClick={refresh}>重试</Button>}
+          />
+        )}
+
+        {accounts.length === 0 && !loading && !error && (
+          <div className="text-center py-12 text-gray-400">
+            <UserOutlined style={{ fontSize: 48, marginBottom: 12, display: 'block' }} />
+            <p className="font-medium">您的管理器中还未绑定任何账号</p>
+            <p className="text-sm mt-1">点击右上角的「添加账号」使用浏览器进行 OAuth 一键授权登录</p>
+          </div>
+        )}
+
+        {(accounts.length > 0 || loading) && (
+          <Spin spinning={loading}>
+            <Table
+              dataSource={accounts}
+              columns={columns}
+              rowKey="id"
+              pagination={{ pageSize: 20, hideOnSinglePage: true }}
+              size="middle"
+              rowClassName={(record) =>
+                isCurrent(record) ? 'bg-indigo-50/40 border-l-2 border-indigo-400' : ''
+              }
+            />
+          </Spin>
+        )}
+      </Card>
+
       {/* Proxy Dashboard */}
       <Card
         size="small"
@@ -659,42 +764,88 @@ export default function AccountsPage() {
             <Popconfirm title="确认清空日志？" onConfirm={handleClearLogs}>
               <Button size="small" danger>清空</Button>
             </Popconfirm>
+            <Button
+              size="small"
+              type="text"
+              onClick={() => setLogsCollapsed(v => !v)}
+            >
+              {logsCollapsed ? '展开' : '收起'}
+            </Button>
           </Space>
         }
       >
-        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-          <Input
-            placeholder="搜索路径/状态/账号"
-            value={logsFilter}
-            onChange={(e) => {
-              setLogsFilter(e.target.value)
-              setLogsPage(1)
-            }}
-            className="md:w-72"
-          />
-          <div className="flex items-center gap-3 text-sm text-gray-600">
-            <span>仅错误</span>
-            <Switch
-              checked={logsErrorsOnly}
-              onChange={(val) => {
-                setLogsErrorsOnly(val)
-                setLogsPage(1)
-              }}
-            />
-            <Text type="secondary" className="text-xs">
-              共 {logsTotal} 条
-            </Text>
-          </div>
-        </div>
-        <Table
+        {!logsCollapsed && (
+          <div>
+            <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between mb-3">
+              <Input
+                placeholder="搜索路径/状态/账号"
+                value={logsFilter}
+                onChange={(e) => {
+                  setLogsFilter(e.target.value)
+                  setLogsPage(1)
+                }}
+                className="md:w-72"
+              />
+              <div className="flex items-center gap-3 text-sm text-gray-600">
+                <span>仅错误</span>
+                <Switch
+                  checked={logsErrorsOnly}
+                  onChange={(val) => {
+                    setLogsErrorsOnly(val)
+                    setLogsPage(1)
+                  }}
+                />
+                <Text type="secondary" className="text-xs">
+                  共 {logsTotal} 条
+                </Text>
+              </div>
+            </div>
+            <Table
           rowKey="id"
           size="small"
           loading={logsLoading}
           columns={logColumns}
           dataSource={logs}
-          onRow={(record) => ({
-            onClick: () => openLogDetail(record.id),
-          })}
+          expandable={{
+            expandedRowRender: (record) => {
+              const detail = expandedRowData[record.id]
+              if (expandedRowLoading.has(record.id)) return <Spin size="small" />
+              if (!detail) return <Text type="secondary" className="text-xs">加载失败</Text>
+              return (
+                <div className="space-y-3 py-2 px-1">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between">
+                        <Text strong className="text-xs">请求体</Text>
+                        <Button size="small" onClick={() => copyText('请求体', detail.request_body)}>复制</Button>
+                      </div>
+                      <pre className="text-xs bg-gray-50 p-2 rounded border border-gray-200 overflow-auto max-h-48 whitespace-pre-wrap break-all">
+                        {detail.request_body || '--'}
+                      </pre>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between">
+                        <Text strong className="text-xs">响应体</Text>
+                        <Button size="small" onClick={() => copyText('响应体', detail.response_body)}>复制</Button>
+                      </div>
+                      <pre className="text-xs bg-gray-50 p-2 rounded border border-gray-200 overflow-auto max-h-48 whitespace-pre-wrap break-all">
+                        {detail.response_body || '--'}
+                      </pre>
+                    </div>
+                  </div>
+                  {detail.error && (
+                    <Text type="danger" className="text-xs">错误: {detail.error}</Text>
+                  )}
+                  <Text type="secondary" className="text-xs">
+                    Tokens: 输入 {detail.input_tokens ?? '--'} · 输出 {detail.output_tokens ?? '--'}
+                  </Text>
+                </div>
+              )
+            },
+            onExpand: (expanded, record) => {
+              if (expanded) loadExpandedRow(record.id)
+            },
+          }}
           pagination={{
             current: logsPage,
             pageSize: logsPageSize,
@@ -705,164 +856,8 @@ export default function AccountsPage() {
               setLogsPageSize(pageSize)
             },
           }}
-          className="mt-3"
-        />
-      </Card>
-
-      <Drawer
-        title="日志详情"
-        open={logDetailOpen}
-        onClose={() => setLogDetailOpen(false)}
-        width={720}
-      >
-        {logDetailLoading ? (
-          <Spin />
-        ) : logDetail ? (
-          <div className="space-y-4">
-            <div className="text-sm text-gray-600">
-              <div>时间: {new Date(logDetail.timestamp).toLocaleString()}</div>
-              <div>路径: {logDetail.method} {logDetail.path}</div>
-              <div>状态: {logDetail.status} · 耗时 {logDetail.duration_ms} ms</div>
-              <div>模型: {logDetail.model ?? '--'}</div>
-              <div>账号: {logDetail.account_id ?? logDetail.proxy_account_id}</div>
-              {logDetail.error && <div className="text-red-500">错误: {logDetail.error}</div>}
-            </div>
-            <Divider />
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Text strong>请求头</Text>
-                <Button size="small" onClick={() => copyText('请求头', logDetail.request_headers)}>
-                  复制
-                </Button>
-              </div>
-              <pre className="text-xs bg-gray-50 p-3 rounded border border-gray-200 overflow-auto">
-                {logDetail.request_headers || '--'}
-              </pre>
-            </div>
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Text strong>响应头</Text>
-                <Button size="small" onClick={() => copyText('响应头', logDetail.response_headers)}>
-                  复制
-                </Button>
-              </div>
-              <pre className="text-xs bg-gray-50 p-3 rounded border border-gray-200 overflow-auto">
-                {logDetail.response_headers || '--'}
-              </pre>
-            </div>
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Text strong>请求体</Text>
-                <Button size="small" onClick={() => copyText('请求体', logDetail.request_body)}>
-                  复制
-                </Button>
-              </div>
-              <pre className="text-xs bg-gray-50 p-3 rounded border border-gray-200 overflow-auto">
-                {logDetail.request_body || '--'}
-              </pre>
-            </div>
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Text strong>响应体</Text>
-                <Button size="small" onClick={() => copyText('响应体', logDetail.response_body)}>
-                  复制
-                </Button>
-              </div>
-              <pre className="text-xs bg-gray-50 p-3 rounded border border-gray-200 overflow-auto">
-                {logDetail.response_body || '--'}
-              </pre>
-            </div>
-            <div className="text-xs text-gray-500">
-              Tokens: 输入 {logDetail.input_tokens ?? '--'} · 输出 {logDetail.output_tokens ?? '--'}
-            </div>
-          </div>
-        ) : (
-          <Text type="secondary">暂无日志详情</Text>
-        )}
-      </Drawer>
-
-      {/* Stats */}
-      <Row gutter={16}>
-        <Col span={6}>
-          <Card size="small">
-            <Statistic title="总账号数" value={stats.total} prefix={<UserOutlined />} />
-          </Card>
-        </Col>
-        <Col span={6}>
-          <Card size="small">
-            <Statistic title="付费账号" value={stats.pro} valueStyle={{ color: '#6366f1' }} />
-          </Card>
-        </Col>
-        <Col span={6}>
-          <Card size="small">
-            <Statistic title="免费账号" value={stats.free} />
-          </Card>
-        </Col>
-        <Col span={6}>
-          <Card size="small">
-            <Statistic
-              title="Token 过期"
-              value={stats.expired}
-              valueStyle={{ color: stats.expired > 0 ? '#ff4d4f' : undefined }}
             />
-          </Card>
-        </Col>
-      </Row>
-
-      {/* Main table */}
-      <Card
-        title={
-          <div className="flex items-center gap-2">
-            <span>账号管理池</span>
-            {currentAccount && (
-              <Tag color="cyan" className="ml-2 font-mono text-xs shadow-sm" style={{ padding: '0 8px', borderRadius: '4px' }}>
-                当前: {currentAccount.label || currentAccount.email} ({currentAccount.plan.toUpperCase()})
-              </Tag>
-            )}
           </div>
-        }
-        extra={
-          <Space>
-            <Button icon={<ReloadOutlined />} onClick={handleRefreshAll} loading={loading}>
-              刷新
-            </Button>
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => setAddOpen(true)}>
-              添加账号
-            </Button>
-          </Space>
-        }
-      >
-        {error && (
-          <Alert
-            type="error"
-            message={error}
-            className="mb-4"
-            showIcon
-            action={<Button size="small" onClick={refresh}>重试</Button>}
-          />
-        )}
-
-        {accounts.length === 0 && !loading && !error && (
-          <div className="text-center py-12 text-gray-400">
-            <UserOutlined style={{ fontSize: 48, marginBottom: 12, display: 'block' }} />
-            <p className="font-medium">您的管理器中还未绑定任何账号</p>
-            <p className="text-sm mt-1">点击右上角的「添加账号」使用浏览器进行 OAuth 一键授权登录</p>
-          </div>
-        )}
-
-        {(accounts.length > 0 || loading) && (
-          <Spin spinning={loading}>
-            <Table
-              dataSource={accounts}
-              columns={columns}
-              rowKey="id"
-              pagination={{ pageSize: 20, hideOnSinglePage: true }}
-              size="middle"
-              rowClassName={(record) =>
-                isCurrent(record) ? 'bg-indigo-50/40 border-l-2 border-indigo-400' : ''
-              }
-            />
-          </Spin>
         )}
       </Card>
 
