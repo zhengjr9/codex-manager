@@ -38,13 +38,21 @@ function formatWindowLabel(minutes: number | null, fallback: string): string {
 
 function formatResetAt(resetAt: number | null): string {
   if (!resetAt) return ''
-  const diff = resetAt * 1000 - Date.now()
-  if (diff <= 0) return '即将重置'
-  const mins = Math.floor(diff / 60000)
-  if (mins < 60) return `${mins}分钟后重置`
-  const hours = Math.floor(mins / 60)
-  if (hours < 24) return `${hours}小时后重置`
-  return `${Math.floor(hours / 24)}天后重置`
+  const resetMs = resetAt * 1000
+  if (resetMs <= Date.now()) return '即将刷新'
+
+  // 转换为北京时间 (UTC+8)
+  const bjOffset = 8 * 3600 * 1000
+  const nowBjDay = Math.floor((Date.now() + bjOffset) / 86400000)
+  const resetBjDay = Math.floor((resetMs + bjOffset) / 86400000)
+
+  const bjHours = Math.floor((resetMs + bjOffset) / 3600000) % 24
+  const bjMinutes = Math.floor((resetMs + bjOffset) / 60000) % 60
+  const timeStr = `${String(bjHours).padStart(2, '0')}:${String(bjMinutes).padStart(2, '0')}`
+
+  if (resetBjDay === nowBjDay) return `${timeStr} 刷新`
+  if (resetBjDay === nowBjDay + 1) return `明天 ${timeStr} 刷新`
+  return `${resetBjDay - nowBjDay}天后 ${timeStr} 刷新`
 }
 
 function formatCapturedAt(ts: number): string {
