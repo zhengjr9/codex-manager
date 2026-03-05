@@ -371,7 +371,6 @@ struct ProxyState {
     client: reqwest::Client,
     accounts: Arc<RwLock<Vec<ProxyAccount>>>,
     req_counter: AtomicUsize,
-    accounts_dir: PathBuf,
 }
 
 // Global proxy shutdown sender and live state
@@ -508,7 +507,6 @@ fn parse_auth_data(auth_data: &Value, account_id: &str) -> CodexAccount {
 const AUTH0_DOMAIN: &str = "auth.openai.com";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const SCOPE: &str = "openid profile email offline_access";
-const AUDIENCE: &str = "https://api.openai.com/v1";
 const OAUTH_CALLBACK_PORT: u16 = 1455;
 
 fn pkce_verifier() -> String {
@@ -1546,7 +1544,6 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         client,
         accounts: Arc::new(RwLock::new(accounts)),
         req_counter: AtomicUsize::new(0),
-        accounts_dir: accounts_dir(),
     });
     log_proxy("proxy state ready");
 
