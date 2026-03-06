@@ -14,6 +14,7 @@ import { accountService, type AccountUsage, type ProxyConfig, type ProxyRequestL
 import PlanBadge from '../components/accounts/PlanBadge'
 import AccountLabelEditor from '../components/accounts/AccountLabelEditor'
 import AddAccountDialog from '../components/accounts/AddAccountDialog'
+import AnthropicProxyCard from '../components/accounts/AnthropicProxyCard'
 
 const { Text } = Typography
 
@@ -707,6 +708,8 @@ export default function AccountsPage() {
           )}
         </div>
       </Card>
+
+      <AnthropicProxyCard />
 
       <Card
         size="small"

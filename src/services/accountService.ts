@@ -53,6 +53,13 @@ export interface ProxyLogDetail extends ProxyRequestLog {
   output_tokens: number | null
 }
 
+export interface AnthropicKeyEntry {
+  id: string
+  label: string | null
+  key: string
+  added_at: number
+}
+
 export const accountService = {
   list: () => invoke<CodexAccount[]>('list_accounts'),
   current: () => invoke<CodexAccount | null>('get_current_account'),
@@ -90,4 +97,17 @@ export const accountService = {
   getProxyLogs: (payload?: { filter?: string; errors_only?: boolean; limit?: number; offset?: number }) =>
     invoke<ProxyRequestLog[]>('get_proxy_logs_filtered', payload ?? {}),
   getProxyLogDetail: (logId: number) => invoke<ProxyLogDetail>('get_proxy_log_detail', { log_id: logId }),
+
+  // Anthropic Proxy
+  listAnthropicKeys: () => invoke<AnthropicKeyEntry[]>('list_anthropic_keys'),
+  addAnthropicKey: (label: string | undefined, key: string) =>
+    invoke<AnthropicKeyEntry>('add_anthropic_key', { label: label ?? null, key }),
+  deleteAnthropicKey: (id: string) => invoke<void>('delete_anthropic_key', { id }),
+  updateAnthropicKeyLabel: (id: string, label: string | undefined) =>
+    invoke<void>('update_anthropic_key_label', { id, label: label ?? null }),
+  startAnthropicProxy: (port?: number) =>
+    invoke<{ success: boolean; port: number; key_count: number }>('start_anthropic_proxy', { port: port ?? null }),
+  stopAnthropicProxy: () => invoke<{ success: boolean }>('stop_anthropic_proxy'),
+  getAnthropicProxyStatus: () =>
+    invoke<{ running: boolean; port: number | null }>('get_anthropic_proxy_status'),
 }
