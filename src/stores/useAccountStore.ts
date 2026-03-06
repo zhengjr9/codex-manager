@@ -16,6 +16,7 @@ interface AccountState {
   switchAccount: (id: string) => Promise<void>
   deleteAccount: (id: string) => Promise<void>
   updateLabel: (id: string, label: string) => Promise<void>
+  updateProxyEnabled: (id: string, enabled: boolean) => Promise<void>
   importCurrent: (label?: string) => Promise<void>
   refresh: () => Promise<void>
 
@@ -77,6 +78,17 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     set(state => ({
       accounts: state.accounts.map(a => a.id === id ? { ...a, label: label || undefined } : a),
     }))
+  },
+
+  updateProxyEnabled: async (id, enabled) => {
+    await accountService.updateProxyEnabled(id, enabled)
+    set(state => ({
+      accounts: state.accounts.map(a => a.id === id ? { ...a, proxy_enabled: enabled } : a),
+    }))
+    if (get().proxyStatus.running) {
+      await accountService.reloadProxy()
+    }
+    await get().fetchProxyStatus()
   },
 
   importCurrent: async (label) => {

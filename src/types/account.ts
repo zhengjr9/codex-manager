@@ -9,4 +9,5 @@ export interface CodexAccount {
   openai_api_key: string | null
   label?: string
   added_at: number
+  proxy_enabled: boolean
 }

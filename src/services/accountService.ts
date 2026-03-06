@@ -67,6 +67,7 @@ export const accountService = {
   switch: (id: string) => invoke<boolean>('switch_account', { id }),
   delete: (id: string) => invoke<boolean>('delete_account', { id }),
   updateLabel: (id: string, label: string) => invoke<boolean>('update_label', { id, label }),
+  updateProxyEnabled: (id: string, enabled: boolean) => invoke<boolean>('update_proxy_enabled', { id, enabled }),
   importCurrent: (label?: string) =>
     invoke<{ success: boolean; id: string; email: string }>('import_current', { label: label ?? null }),
   login: () => invoke<{ success: boolean; message: string }>('launch_codex_login'),
