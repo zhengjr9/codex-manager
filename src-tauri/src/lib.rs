@@ -430,12 +430,6 @@ fn save_anthropic_keys(keys: &[AnthropicKeyEntry]) {
     }
 }
 
-// Determine Anthropic auth header: sk-ant-* keys use x-api-key,
-// OAuth access_tokens (Bearer) use Authorization header
-fn is_oauth_access_token(key: &str) -> bool {
-    !key.starts_with("sk-ant-")
-}
-
 #[tauri::command]
 fn list_anthropic_keys() -> Result<Vec<AnthropicKeyEntry>, String> {
     Ok(load_anthropic_keys())
@@ -793,6 +787,7 @@ fn openai_response_to_anthropic(resp: &Value, request_model: &str) -> Value {
     })
 }
 
+#[derive(Clone)]
 struct AnthStreamToolCall {
     id: String,
     name: String,
@@ -830,26 +825,29 @@ fn stream_finalize(state: &mut AnthStreamState) {
         next_index = 1;
     }
 
-    for (i, call_opt) in state.tool_calls.iter().enumerate() {
-        if let Some(call) = call_opt {
-            let input = serde_json::from_str::<Value>(&call.arguments)
-                .unwrap_or_else(|_| serde_json::json!({ "_raw": call.arguments }));
-            let idx = next_index + i;
-            push_sse_event(state, "content_block_start", &serde_json::json!({
-                "type": "content_block_start",
-                "index": idx,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": call.id,
-                    "name": call.name,
-                    "input": input
-                }
-            }));
-            push_sse_event(state, "content_block_stop", &serde_json::json!({
-                "type": "content_block_stop",
-                "index": idx
-            }));
-        }
+    let tool_calls: Vec<AnthStreamToolCall> = state
+        .tool_calls
+        .iter()
+        .filter_map(|call_opt| call_opt.as_ref().cloned())
+        .collect();
+    for (i, call) in tool_calls.into_iter().enumerate() {
+        let input = serde_json::from_str::<Value>(&call.arguments)
+            .unwrap_or_else(|_| serde_json::json!({ "_raw": call.arguments }));
+        let idx = next_index + i;
+        push_sse_event(state, "content_block_start", &serde_json::json!({
+            "type": "content_block_start",
+            "index": idx,
+            "content_block": {
+                "type": "tool_use",
+                "id": call.id,
+                "name": call.name,
+                "input": input
+            }
+        }));
+        push_sse_event(state, "content_block_stop", &serde_json::json!({
+            "type": "content_block_stop",
+            "index": idx
+        }));
     }
 
     let stop_reason = map_finish_reason(state.finish_reason.as_deref());
@@ -1042,28 +1040,30 @@ async fn anthropic_proxy_handler(
                                 break;
                             }
                             if let Ok(payload) = serde_json::from_str::<Value>(data) {
-                                if !state.started {
-                                    if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
-                                        state.message_id = id.to_string();
-                                    }
-                                    if let Some(model) = payload.get("model").and_then(|v| v.as_str()) {
-                                        state.model = model.to_string();
-                                    }
-                                    push_sse_event(&mut state, "message_start", &serde_json::json!({
-                                        "type": "message_start",
-                                        "message": {
-                                            "id": state.message_id,
-                                            "type": "message",
-                                            "role": "assistant",
-                                            "model": state.model,
-                                            "content": [],
-                                            "stop_reason": null,
-                                            "stop_sequence": null,
-                                            "usage": { "input_tokens": 0, "output_tokens": 0 }
+                                    if !state.started {
+                                        if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
+                                            state.message_id = id.to_string();
                                         }
-                                    }));
-                                    state.started = true;
-                                }
+                                        if let Some(model) = payload.get("model").and_then(|v| v.as_str()) {
+                                            state.model = model.to_string();
+                                        }
+                                        let message_id = state.message_id.clone();
+                                        let model = state.model.clone();
+                                        push_sse_event(&mut state, "message_start", &serde_json::json!({
+                                            "type": "message_start",
+                                            "message": {
+                                                "id": message_id,
+                                                "type": "message",
+                                                "role": "assistant",
+                                                "model": model,
+                                                "content": [],
+                                                "stop_reason": null,
+                                                "stop_sequence": null,
+                                                "usage": { "input_tokens": 0, "output_tokens": 0 }
+                                            }
+                                        }));
+                                        state.started = true;
+                                    }
 
                                 if let Some(choice) = payload.get("choices").and_then(|v| v.as_array()).and_then(|arr| arr.first()) {
                                     if let Some(delta) = choice.get("delta") {
@@ -1131,192 +1131,6 @@ async fn anthropic_proxy_handler(
         .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(Body::empty()).unwrap())
-}
-
-async fn anthropic_proxy_handler(
-    axum::extract::State(state): axum::extract::State<Arc<AnthProxyState>>,
-    req: axum::http::Request<axum::body::Body>,
-) -> axum::response::Response<axum::body::Body> {
-    use axum::{body::Body, http::StatusCode, response::Response};
-
-    let request_id = ANTHROPIC_REQ_ID.fetch_add(1, Ordering::SeqCst);
-    let method = req.method().clone();
-    let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/").to_string();
-    let req_headers = req.headers().clone();
-
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 100 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header("Access-Control-Allow-Origin", "*")
-            .body(Body::from("Failed to read request body")).unwrap(),
-    };
-
-    if method == axum::http::Method::OPTIONS {
-        return Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-            .header("Access-Control-Allow-Headers", "*")
-            .header("Access-Control-Max-Age", "86400")
-            .body(Body::empty()).unwrap();
-    }
-
-    let target = build_anthropic_url(&path);
-    let body_str = std::str::from_utf8(&body_bytes).unwrap_or("");
-    let accept_stream = req_headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_lowercase().contains("text/event-stream"))
-        .unwrap_or(false);
-    let is_stream = accept_stream
-        || body_str.contains("\"stream\":true")
-        || body_str.contains("\"stream\": true");
-
-    let resolved_version = req_headers
-        .get("anthropic-version")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(anthropic_version);
-
-    // Build forwarded headers, injecting auth + anthropic-version
-    let make_headers = |key: &str, is_oauth: bool, version: &str| {
-        let mut h = reqwest::header::HeaderMap::new();
-        for (name, value) in req_headers.iter() {
-            let n = name.as_str().to_lowercase();
-            if matches!(n.as_str(), "host" | "connection" | "content-length"
-                | "authorization" | "x-api-key" | "anthropic-version"
-                | "transfer-encoding" | "keep-alive") { continue; }
-            if let (Ok(k), Ok(v)) = (
-                reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
-                reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
-            ) { h.insert(k, v); }
-        }
-        if is_oauth {
-            if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
-                h.insert(reqwest::header::AUTHORIZATION, v);
-            }
-        } else if let Ok(v) = reqwest::header::HeaderValue::from_str(key) {
-            h.insert(reqwest::header::HeaderName::from_static("x-api-key"), v);
-        }
-        if let Ok(v) = reqwest::header::HeaderValue::from_str(version) {
-            h.insert(reqwest::header::HeaderName::from_static("anthropic-version"), v);
-        }
-        if !body_bytes.is_empty() && !h.contains_key(reqwest::header::CONTENT_TYPE) {
-            h.insert(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"));
-        }
-        h.insert(reqwest::header::ACCEPT, reqwest::header::HeaderValue::from_static(
-            if is_stream { "text/event-stream" } else { "application/json" }
-        ));
-        h
-    };
-
-    // Pick healthy key (round-robin)
-    let chosen = {
-        let now = std::time::Instant::now();
-        let mut lock = state.keys.write().unwrap();
-        for slot in lock.iter_mut() {
-            if let AnthKeyHealth::Cooldown(u) = &slot.health {
-                if now >= *u { slot.health = AnthKeyHealth::Active; }
-            }
-        }
-        let n = lock.len();
-        if n == 0 {
-            return Response::builder().status(StatusCode::SERVICE_UNAVAILABLE)
-                .header("Access-Control-Allow-Origin", "*")
-                .body(Body::from("No Anthropic keys configured.")).unwrap();
-        }
-        let cnt = state.req_counter.fetch_add(1, Ordering::SeqCst);
-        (0..n).map(|i| (cnt + i) % n)
-            .find(|&idx| lock[idx].health == AnthKeyHealth::Active)
-            .map(|idx| (idx, lock[idx].key.clone(), lock[idx].is_oauth, lock[idx].id.clone()))
-    };
-
-    let (chosen_idx, chosen_key, chosen_is_oauth, chosen_id) = match chosen {
-        Some(c) => c,
-        None => return Response::builder().status(StatusCode::SERVICE_UNAVAILABLE)
-            .header("Access-Control-Allow-Origin", "*")
-            .body(Body::from("All Anthropic keys are on cooldown or blocked.")).unwrap(),
-    };
-
-    log_proxy(&format!("anth req#{request_id} {method} {path} key={chosen_id}"));
-
-    let resp = state.client
-        .request(method.clone(), &target)
-        .headers(make_headers(&chosen_key, chosen_is_oauth, &resolved_version))
-        .body(body_bytes.clone())
-        .send().await;
-
-    let resp = match resp {
-        Ok(r) => r,
-        Err(e) => return Response::builder().status(StatusCode::BAD_GATEWAY)
-            .header("Access-Control-Allow-Origin", "*")
-            .body(Body::from(format!("Upstream error: {e}"))).unwrap(),
-    };
-
-    let status = resp.status();
-    log_proxy(&format!("anth req#{request_id} status={}", status.as_u16()));
-
-    // 429: cooldown + retry with another key
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        {
-            let until = std::time::Instant::now() + std::time::Duration::from_secs(ANTHROPIC_COOLDOWN_SECS);
-            let mut lock = state.keys.write().unwrap();
-            if let Some(slot) = lock.get_mut(chosen_idx) { slot.health = AnthKeyHealth::Cooldown(until); }
-        }
-        let fallback = {
-            let now = std::time::Instant::now();
-            let mut lock = state.keys.write().unwrap();
-            for slot in lock.iter_mut() {
-                if let AnthKeyHealth::Cooldown(u) = &slot.health {
-                    if now >= *u { slot.health = AnthKeyHealth::Active; }
-                }
-            }
-            let n = lock.len();
-            let cnt = state.req_counter.load(Ordering::SeqCst);
-            (0..n).map(|i| (cnt + i) % n)
-                .find(|&idx| idx != chosen_idx && lock[idx].health == AnthKeyHealth::Active)
-                .map(|idx| (lock[idx].key.clone(), lock[idx].is_oauth))
-        };
-        if let Some((fb_key, fb_is_oauth)) = fallback {
-            log_proxy(&format!("anth req#{request_id} 429-retry with fallback key"));
-            if let Ok(r) = state.client
-                .request(method, &target)
-                .headers(make_headers(&fb_key, fb_is_oauth, &resolved_version))
-                .body(body_bytes).send().await
-            {
-                return anth_build_proxy_response(r).await;
-            }
-        }
-    } else if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        let mut lock = state.keys.write().unwrap();
-        if let Some(slot) = lock.get_mut(chosen_idx) { slot.health = AnthKeyHealth::Blocked; }
-    }
-
-    anth_build_proxy_response(resp).await
-}
-
-async fn anth_build_proxy_response(resp: reqwest::Response) -> axum::response::Response<axum::body::Body> {
-    use axum::{body::Body, response::Response};
-    let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
-        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-    let mut builder = Response::builder().status(status)
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Access-Control-Allow-Headers", "*");
-    for (k, v) in resp.headers() {
-        if skip_response_header(k.as_str()) { continue; }
-        if let (Ok(name), Ok(val)) = (
-            axum::http::HeaderName::from_bytes(k.as_str().as_bytes()),
-            axum::http::HeaderValue::from_bytes(v.as_bytes()),
-        ) {
-            builder = builder.header(name, val);
-        }
-    }
-    let stream = resp.bytes_stream();
-    builder.body(Body::from_stream(stream)).unwrap_or_else(|_|
-        Response::builder().status(axum::http::StatusCode::INTERNAL_SERVER_ERROR).body(Body::empty()).unwrap()
-    )
 }
 
 // ─── JWT / auth helpers ───────────────────────────────────────────────────────
