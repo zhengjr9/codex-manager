@@ -484,50 +484,653 @@ fn update_anthropic_key_label(id: String, label: Option<String>) -> Result<(), S
 // ─── Anthropic proxy server ───────────────────────────────────────────────────
 
 static ANTHROPIC_REQ_ID: AtomicUsize = AtomicUsize::new(1);
-const ANTHROPIC_DEFAULT_VERSION: &str = "2023-06-01";
-const ANTHROPIC_COOLDOWN_SECS: u64 = 60;
-
-fn anthropic_base_url() -> String {
-    std::env::var("CODEXMANAGER_ANTHROPIC_BASE_URL")
+fn anthropic_openai_base_url() -> Option<String> {
+    if let Ok(val) = std::env::var("CODEXMANAGER_ANTHROPIC_OPENAI_BASE_URL") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    PROXY_PORT
+        .lock()
         .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "https://api.anthropic.com".to_string())
+        .and_then(|port| port.map(|p| format!("http://127.0.0.1:{p}")))
 }
 
-fn anthropic_version() -> String {
-    std::env::var("CODEXMANAGER_ANTHROPIC_VERSION")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| ANTHROPIC_DEFAULT_VERSION.to_string())
-}
-
-fn build_anthropic_url(path_and_query: &str) -> String {
-    let base = anthropic_base_url();
-    let base = base.trim_end_matches('/');
-    format!("{base}{path_and_query}")
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum AnthKeyHealth {
-    Active,
-    Cooldown(std::time::Instant),
-    Blocked,
+fn map_finish_reason(reason: Option<&str>) -> Option<&'static str> {
+    match reason {
+        Some("stop") => Some("end_turn"),
+        Some("length") => Some("max_tokens"),
+        Some("tool_calls") => Some("tool_use"),
+        Some("content_filter") => Some("end_turn"),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
-struct AnthKeySlot {
+struct AnthToolUse {
     id: String,
-    key: String,
-    is_oauth: bool,
-    health: AnthKeyHealth,
+    name: String,
+    input: Value,
 }
 
-struct AnthProxyState {
-    client: reqwest::Client,
-    keys: Arc<RwLock<Vec<AnthKeySlot>>>,
-    req_counter: AtomicUsize,
+#[derive(Debug, Clone)]
+struct AnthToolResult {
+    tool_use_id: String,
+    content: String,
+}
+
+#[derive(Debug, Default)]
+struct AnthContentParsed {
+    text_parts: Vec<String>,
+    image_urls: Vec<String>,
+    tool_uses: Vec<AnthToolUse>,
+    tool_results: Vec<AnthToolResult>,
+}
+
+fn anthropic_text_from_content(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    item.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => "".to_string(),
+    }
+}
+
+fn parse_anthropic_content(value: &Value) -> AnthContentParsed {
+    let mut parsed = AnthContentParsed::default();
+    match value {
+        Value::String(text) => {
+            if !text.is_empty() {
+                parsed.text_parts.push(text.clone());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match kind {
+                    "text" => {
+                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            if !text.is_empty() {
+                                parsed.text_parts.push(text.to_string());
+                            }
+                        }
+                    }
+                    "image" => {
+                        if let Some(source) = item.get("source") {
+                            let src_type = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if src_type == "base64" {
+                                if let (Some(media_type), Some(data)) = (
+                                    source.get("media_type").and_then(|v| v.as_str()),
+                                    source.get("data").and_then(|v| v.as_str()),
+                                ) {
+                                    parsed.image_urls.push(format!("data:{media_type};base64,{data}"));
+                                }
+                            } else if src_type == "url" {
+                                if let Some(url) = source.get("url").and_then(|v| v.as_str()) {
+                                    parsed.image_urls.push(url.to_string());
+                                }
+                            }
+                        }
+                    }
+                    "tool_use" => {
+                        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let input = item.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                        if !id.is_empty() && !name.is_empty() {
+                            parsed.tool_uses.push(AnthToolUse { id, name, input });
+                        }
+                    }
+                    "tool_result" => {
+                        let tool_use_id = item.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let content = item.get("content").map(anthropic_text_from_content).unwrap_or_default();
+                        if !tool_use_id.is_empty() {
+                            parsed.tool_results.push(AnthToolResult { tool_use_id, content });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    parsed
+}
+
+fn anthropic_to_openai_request(body: &Value) -> Result<Value, String> {
+    let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("gpt-4o-mini");
+    let mut messages: Vec<Value> = Vec::new();
+
+    if let Some(system) = body.get("system") {
+        let system_text = anthropic_text_from_content(system);
+        if !system_text.trim().is_empty() {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": system_text
+            }));
+        }
+    }
+
+    if let Some(items) = body.get("messages").and_then(|v| v.as_array()) {
+        for msg in items {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let content_value = msg.get("content").unwrap_or(&Value::Null);
+            let parsed = parse_anthropic_content(content_value);
+
+            if role == "assistant" {
+                let mut entry = serde_json::json!({ "role": "assistant" });
+                let text = parsed.text_parts.join("");
+                if !text.is_empty() {
+                    entry["content"] = Value::String(text);
+                } else {
+                    entry["content"] = Value::Null;
+                }
+                if !parsed.tool_uses.is_empty() {
+                    let tool_calls: Vec<Value> = parsed.tool_uses.iter().map(|u| {
+                        let args = serde_json::to_string(&u.input).unwrap_or_else(|_| "{}".to_string());
+                        serde_json::json!({
+                            "id": u.id,
+                            "type": "function",
+                            "function": {
+                                "name": u.name,
+                                "arguments": args
+                            }
+                        })
+                    }).collect();
+                    entry["tool_calls"] = Value::Array(tool_calls);
+                }
+                messages.push(entry);
+            } else {
+                if !parsed.text_parts.is_empty() || !parsed.image_urls.is_empty() {
+                    let text = parsed.text_parts.join("");
+                    if parsed.image_urls.is_empty() {
+                        messages.push(serde_json::json!({ "role": "user", "content": text }));
+                    } else {
+                        let mut parts: Vec<Value> = Vec::new();
+                        if !text.is_empty() {
+                            parts.push(serde_json::json!({ "type": "text", "text": text }));
+                        }
+                        for url in parsed.image_urls {
+                            parts.push(serde_json::json!({ "type": "image_url", "image_url": { "url": url } }));
+                        }
+                        messages.push(serde_json::json!({ "role": "user", "content": parts }));
+                    }
+                }
+                for tool_result in parsed.tool_results {
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": tool_result.tool_use_id,
+                        "content": tool_result.content
+                    }));
+                }
+            }
+        }
+    }
+
+    let mut openai_body = serde_json::json!({
+        "model": model,
+        "messages": messages
+    });
+
+    if let Some(max_tokens) = body.get("max_tokens").and_then(|v| v.as_u64()) {
+        openai_body["max_tokens"] = serde_json::json!(max_tokens);
+    }
+    if let Some(temperature) = body.get("temperature").and_then(|v| v.as_f64()) {
+        openai_body["temperature"] = serde_json::json!(temperature);
+    }
+    if let Some(top_p) = body.get("top_p").and_then(|v| v.as_f64()) {
+        openai_body["top_p"] = serde_json::json!(top_p);
+    }
+    if let Some(stream) = body.get("stream").and_then(|v| v.as_bool()) {
+        openai_body["stream"] = serde_json::json!(stream);
+        if stream {
+            openai_body["stream_options"] = serde_json::json!({ "include_usage": true });
+        }
+    }
+    if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
+        let mapped: Vec<Value> = tools.iter().filter_map(|tool| {
+            let name = tool.get("name").and_then(|v| v.as_str())?;
+            let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let params = tool.get("input_schema").cloned().unwrap_or_else(|| serde_json::json!({ "type": "object" }));
+            Some(serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": params
+                }
+            }))
+        }).collect();
+        if !mapped.is_empty() {
+            openai_body["tools"] = Value::Array(mapped);
+        }
+    }
+    if let Some(choice) = body.get("tool_choice") {
+        let mapped = match choice {
+            Value::String(s) => {
+                if s == "auto" {
+                    Some(serde_json::json!("auto"))
+                } else {
+                    None
+                }
+            }
+            Value::Object(obj) => {
+                let t = obj.get("type").and_then(|v| v.as_str()).unwrap_or("auto");
+                if t == "auto" || t == "any" {
+                    Some(serde_json::json!("auto"))
+                } else if t == "tool" {
+                    obj.get("name").and_then(|v| v.as_str()).map(|name| {
+                        serde_json::json!({ "type": "function", "function": { "name": name } })
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(mapped) = mapped {
+            openai_body["tool_choice"] = mapped;
+        }
+    }
+
+    Ok(openai_body)
+}
+
+fn openai_response_to_anthropic(resp: &Value, request_model: &str) -> Value {
+    let choice = resp.get("choices").and_then(|v| v.as_array()).and_then(|arr| arr.first());
+    let message = choice.and_then(|c| c.get("message")).unwrap_or(&Value::Null);
+    let finish_reason = choice.and_then(|c| c.get("finish_reason")).and_then(|v| v.as_str());
+
+    let mut content_blocks: Vec<Value> = Vec::new();
+    if let Some(text) = message.get("content").and_then(|v| v.as_str()) {
+        if !text.is_empty() {
+            content_blocks.push(serde_json::json!({ "type": "text", "text": text }));
+        }
+    }
+    if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
+        for call in tool_calls {
+            let id = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = call.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = call.pointer("/function/arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+            let input = serde_json::from_str::<Value>(args)
+                .unwrap_or_else(|_| serde_json::json!({ "_raw": args }));
+            if !id.is_empty() && !name.is_empty() {
+                content_blocks.push(serde_json::json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": input
+                }));
+            }
+        }
+    }
+
+    let usage = resp.get("usage").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    serde_json::json!({
+        "id": resp.get("id").cloned().unwrap_or_else(|| serde_json::json!("msg_openai")),
+        "type": "message",
+        "role": "assistant",
+        "model": resp.get("model").and_then(|v| v.as_str()).unwrap_or(request_model),
+        "content": content_blocks,
+        "stop_reason": map_finish_reason(finish_reason),
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
+        }
+    })
+}
+
+struct AnthStreamToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+struct AnthStreamState {
+    buffer: String,
+    pending: std::collections::VecDeque<Bytes>,
+    started: bool,
+    text_started: bool,
+    tool_calls: Vec<Option<AnthStreamToolCall>>,
+    message_id: String,
+    model: String,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
+    done: bool,
+}
+
+fn push_sse_event(state: &mut AnthStreamState, event: &str, payload: &Value) {
+    let line = format!(
+        "event: {event}\ndata: {}\n\n",
+        serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string())
+    );
+    state.pending.push_back(Bytes::from(line));
+}
+
+fn stream_finalize(state: &mut AnthStreamState) {
+    let mut next_index = 0usize;
+    if state.text_started {
+        push_sse_event(state, "content_block_stop", &serde_json::json!({
+            "type": "content_block_stop",
+            "index": 0
+        }));
+        next_index = 1;
+    }
+
+    for (i, call_opt) in state.tool_calls.iter().enumerate() {
+        if let Some(call) = call_opt {
+            let input = serde_json::from_str::<Value>(&call.arguments)
+                .unwrap_or_else(|_| serde_json::json!({ "_raw": call.arguments }));
+            let idx = next_index + i;
+            push_sse_event(state, "content_block_start", &serde_json::json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": input
+                }
+            }));
+            push_sse_event(state, "content_block_stop", &serde_json::json!({
+                "type": "content_block_stop",
+                "index": idx
+            }));
+        }
+    }
+
+    let stop_reason = map_finish_reason(state.finish_reason.as_deref());
+    let mut usage_payload = serde_json::json!({});
+    if let Some(usage) = &state.usage {
+        let input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        usage_payload = serde_json::json!({ "input_tokens": input_tokens, "output_tokens": output_tokens });
+    }
+    push_sse_event(state, "message_delta", &serde_json::json!({
+        "type": "message_delta",
+        "delta": {
+            "stop_reason": stop_reason,
+            "stop_sequence": null
+        },
+        "usage": usage_payload
+    }));
+    push_sse_event(state, "message_stop", &serde_json::json!({
+        "type": "message_stop"
+    }));
+}
+
+async fn anthropic_proxy_handler(
+    axum::extract::State(state): axum::extract::State<Arc<reqwest::Client>>,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response<axum::body::Body> {
+    use axum::{body::Body, http::StatusCode, response::Response};
+    use futures_util::StreamExt;
+
+    let request_id = ANTHROPIC_REQ_ID.fetch_add(1, Ordering::SeqCst);
+    let method = req.method().clone();
+    let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/").to_string();
+    let req_headers = req.headers().clone();
+
+    if method == axum::http::Method::OPTIONS {
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+            .header("Access-Control-Allow-Headers", "*")
+            .header("Access-Control-Max-Age", "86400")
+            .body(Body::empty()).unwrap();
+    }
+
+    if method != axum::http::Method::POST || !path.starts_with("/v1/messages") {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Body::from("Unsupported Anthropic endpoint")).unwrap();
+    }
+
+    if !proxy_api_key_valid(&req_headers) {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Body::from("Unauthorized")).unwrap();
+    }
+
+    let openai_base = match anthropic_openai_base_url() {
+        Some(v) => v,
+        None => {
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("Access-Control-Allow-Origin", "*")
+                .body(Body::from("OpenAI proxy not running")).unwrap();
+        }
+    };
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 100 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Body::from("Failed to read request body")).unwrap(),
+    };
+
+    let body_json: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Body::from("Invalid JSON")).unwrap(),
+    };
+
+    let request_model = body_json.get("model").and_then(|v| v.as_str()).unwrap_or("gpt-4o-mini");
+    let is_stream = body_json.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let openai_body = match anthropic_to_openai_request(&body_json) {
+        Ok(b) => b,
+        Err(err) => return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Body::from(err)).unwrap(),
+    };
+
+    let mut forward_headers = reqwest::header::HeaderMap::new();
+    if let Some(v) = req_headers.get(axum::http::header::AUTHORIZATION) {
+        forward_headers.insert(reqwest::header::AUTHORIZATION, v.clone());
+    }
+    if let Some(v) = req_headers.get("x-api-key") {
+        if let Ok(val) = reqwest::header::HeaderValue::from_bytes(v.as_bytes()) {
+            forward_headers.insert(reqwest::header::HeaderName::from_static("x-api-key"), val);
+        }
+    }
+    forward_headers.insert(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"));
+    forward_headers.insert(reqwest::header::ACCEPT, reqwest::header::HeaderValue::from_static(
+        if is_stream { "text/event-stream" } else { "application/json" }
+    ));
+
+    let target = format!("{openai_base}/v1/chat/completions");
+    log_proxy(&format!("anth req#{request_id} -> {target}"));
+    let resp = state
+        .post(&target)
+        .headers(forward_headers)
+        .body(serde_json::to_vec(&openai_body).unwrap_or_default())
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => return Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Body::from(format!("Upstream error: {e}"))).unwrap(),
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let bytes = resp.bytes().await.unwrap_or_default();
+        return Response::builder()
+            .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Body::from(bytes)).unwrap();
+    }
+
+    if !is_stream {
+        let bytes = resp.bytes().await.unwrap_or_default();
+        let openai_json: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}));
+        let payload = openai_response_to_anthropic(&openai_json, request_model);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Allow-Headers", "*")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap_or_default()))
+            .unwrap();
+    }
+
+    let upstream = resp.bytes_stream();
+    let stream_state = AnthStreamState {
+        buffer: String::new(),
+        pending: std::collections::VecDeque::new(),
+        started: false,
+        text_started: false,
+        tool_calls: Vec::new(),
+        message_id: format!("msg_{request_id}"),
+        model: request_model.to_string(),
+        finish_reason: None,
+        usage: None,
+        done: false,
+    };
+
+    let stream = futures_util::stream::unfold(
+        (Box::pin(upstream), stream_state),
+        |(mut upstream, mut state)| async move {
+            loop {
+                if let Some(chunk) = state.pending.pop_front() {
+                    return Some((Ok::<Bytes, io::Error>(chunk), (upstream, state)));
+                }
+                if state.done {
+                    return None;
+                }
+
+                match upstream.next().await {
+                    Some(Ok(chunk)) => {
+                        state.buffer.push_str(&String::from_utf8_lossy(&chunk));
+                        while let Some(pos) = state.buffer.find('\n') {
+                            let line = state.buffer[..pos].trim_end().to_string();
+                            state.buffer = state.buffer[pos + 1..].to_string();
+                            if !line.starts_with("data:") {
+                                continue;
+                            }
+                            let data = line.trim_start_matches("data:").trim();
+                            if data.is_empty() {
+                                continue;
+                            }
+                            if data == "[DONE]" {
+                                stream_finalize(&mut state);
+                                state.done = true;
+                                break;
+                            }
+                            if let Ok(payload) = serde_json::from_str::<Value>(data) {
+                                if !state.started {
+                                    if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
+                                        state.message_id = id.to_string();
+                                    }
+                                    if let Some(model) = payload.get("model").and_then(|v| v.as_str()) {
+                                        state.model = model.to_string();
+                                    }
+                                    push_sse_event(&mut state, "message_start", &serde_json::json!({
+                                        "type": "message_start",
+                                        "message": {
+                                            "id": state.message_id,
+                                            "type": "message",
+                                            "role": "assistant",
+                                            "model": state.model,
+                                            "content": [],
+                                            "stop_reason": null,
+                                            "stop_sequence": null,
+                                            "usage": { "input_tokens": 0, "output_tokens": 0 }
+                                        }
+                                    }));
+                                    state.started = true;
+                                }
+
+                                if let Some(choice) = payload.get("choices").and_then(|v| v.as_array()).and_then(|arr| arr.first()) {
+                                    if let Some(delta) = choice.get("delta") {
+                                        if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+                                            if !state.text_started {
+                                                push_sse_event(&mut state, "content_block_start", &serde_json::json!({
+                                                    "type": "content_block_start",
+                                                    "index": 0,
+                                                    "content_block": { "type": "text", "text": "" }
+                                                }));
+                                                state.text_started = true;
+                                            }
+                                            push_sse_event(&mut state, "content_block_delta", &serde_json::json!({
+                                                "type": "content_block_delta",
+                                                "index": 0,
+                                                "delta": { "type": "text_delta", "text": text }
+                                            }));
+                                        }
+                                        if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                            for call in tool_calls {
+                                                let idx = call.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                                if state.tool_calls.len() <= idx {
+                                                    state.tool_calls.resize_with(idx + 1, || None);
+                                                }
+                                                let entry = state.tool_calls[idx].get_or_insert(AnthStreamToolCall {
+                                                    id: String::new(),
+                                                    name: String::new(),
+                                                    arguments: String::new(),
+                                                });
+                                                if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
+                                                    if entry.id.is_empty() { entry.id = id.to_string(); }
+                                                }
+                                                if let Some(name) = call.pointer("/function/name").and_then(|v| v.as_str()) {
+                                                    if entry.name.is_empty() { entry.name = name.to_string(); }
+                                                }
+                                                if let Some(args) = call.pointer("/function/arguments").and_then(|v| v.as_str()) {
+                                                    entry.arguments.push_str(args);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                                        state.finish_reason = Some(reason.to_string());
+                                    }
+                                }
+                                if let Some(usage) = payload.get("usage") {
+                                    state.usage = Some(usage.clone());
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(_)) | None => {
+                        stream_finalize(&mut state);
+                        state.done = true;
+                    }
+                }
+            }
+        },
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Headers", "*")
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(Body::empty()).unwrap())
 }
 
 async fn anthropic_proxy_handler(
@@ -2596,33 +3199,19 @@ async fn start_anthropic_proxy(port: Option<u16>) -> Result<Value, String> {
     }
 
     let proxy_port = port.unwrap_or(8081);
-    let raw_keys = load_anthropic_keys();
-    if raw_keys.is_empty() {
-        return Err("No Anthropic API keys configured.".into());
-    }
-
-    let slots: Vec<AnthKeySlot> = raw_keys.into_iter().map(|e| {
-        let is_oauth = is_oauth_access_token(&e.key);
-        AnthKeySlot { id: e.id, key: e.key, is_oauth, health: AnthKeyHealth::Active }
-    }).collect();
-    let key_count = slots.len();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     *ANTHROPIC_PROXY_SHUTDOWN.lock().unwrap() = Some(shutdown_tx);
     *ANTHROPIC_PROXY_PORT.lock().unwrap() = Some(proxy_port);
 
-    let state = Arc::new(AnthProxyState {
-        client: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .unwrap_or_default(),
-        keys: Arc::new(RwLock::new(slots)),
-        req_counter: AtomicUsize::new(0),
-    });
+    let client = Arc::new(reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .unwrap_or_default());
 
     let app = axum::Router::new()
         .fallback(axum::routing::any(anthropic_proxy_handler))
-        .with_state(state);
+        .with_state(client);
 
     let addr = format!("localhost:{proxy_port}");
     let shutdown_notify = Arc::new(Notify::new());
@@ -2646,8 +3235,8 @@ async fn start_anthropic_proxy(port: Option<u16>) -> Result<Value, String> {
         *lock = None;
     });
 
-    log_proxy(&format!("anthropic proxy started on port {proxy_port} with {key_count} keys"));
-    Ok(serde_json::json!({ "success": true, "port": proxy_port, "key_count": key_count }))
+    log_proxy(&format!("anthropic proxy started on port {proxy_port}"));
+    Ok(serde_json::json!({ "success": true, "port": proxy_port }))
 }
 
 #[tauri::command]

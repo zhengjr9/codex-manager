@@ -106,7 +106,7 @@ export const accountService = {
   updateAnthropicKeyLabel: (id: string, label: string | undefined) =>
     invoke<void>('update_anthropic_key_label', { id, label: label ?? null }),
   startAnthropicProxy: (port?: number) =>
-    invoke<{ success: boolean; port: number; key_count: number }>('start_anthropic_proxy', { port: port ?? null }),
+    invoke<{ success: boolean; port: number }>('start_anthropic_proxy', { port: port ?? null }),
   stopAnthropicProxy: () => invoke<{ success: boolean }>('stop_anthropic_proxy'),
   getAnthropicProxyStatus: () =>
     invoke<{ running: boolean; port: number | null }>('get_anthropic_proxy_status'),
