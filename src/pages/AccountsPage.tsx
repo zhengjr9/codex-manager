@@ -360,6 +360,17 @@ export default function AccountsPage() {
     }
   }
 
+  function formatHeaders(raw?: string | null) {
+    if (!raw) return '--'
+    try {
+      const parsed = JSON.parse(raw) as Array<[string, string]>
+      if (Array.isArray(parsed)) {
+        return parsed.map(([k, v]) => `${k}: ${v}`).join('\n')
+      }
+    } catch {}
+    return raw
+  }
+
   async function handleRefreshAll() {
     await refresh()
     accounts.forEach(a => fetchUsage(a.id))
@@ -816,6 +827,35 @@ export default function AccountsPage() {
               if (!detail) return <Text type="secondary" className="text-xs">加载失败</Text>
               return (
                 <div className="space-y-3 py-2 px-1">
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between">
+                      <Text strong className="text-xs">请求地址</Text>
+                      <Button size="small" onClick={() => copyText('请求地址', detail.request_url)}>复制</Button>
+                    </div>
+                    <pre className="text-xs bg-gray-50 p-2 rounded border border-gray-200 overflow-auto max-h-24 whitespace-pre-wrap break-all">
+                      {detail.request_url || '--'}
+                    </pre>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between">
+                        <Text strong className="text-xs">请求头</Text>
+                        <Button size="small" onClick={() => copyText('请求头', detail.request_headers)}>复制</Button>
+                      </div>
+                      <pre className="text-xs bg-gray-50 p-2 rounded border border-gray-200 overflow-auto max-h-32 whitespace-pre-wrap break-all">
+                        {formatHeaders(detail.request_headers)}
+                      </pre>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between">
+                        <Text strong className="text-xs">响应头</Text>
+                        <Button size="small" onClick={() => copyText('响应头', detail.response_headers)}>复制</Button>
+                      </div>
+                      <pre className="text-xs bg-gray-50 p-2 rounded border border-gray-200 overflow-auto max-h-32 whitespace-pre-wrap break-all">
+                        {formatHeaders(detail.response_headers)}
+                      </pre>
+                    </div>
+                  </div>
                   <div className="grid grid-cols-2 gap-3">
                     <div className="space-y-1">
                       <div className="flex items-center justify-between">

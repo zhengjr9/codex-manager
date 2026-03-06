@@ -45,6 +45,7 @@ export interface ProxyRequestLog {
 }
 
 export interface ProxyLogDetail extends ProxyRequestLog {
+  request_url: string | null
   request_headers: string | null
   response_headers: string | null
   request_body: string | null
