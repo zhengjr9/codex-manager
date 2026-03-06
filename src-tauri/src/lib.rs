@@ -411,6 +411,12 @@ fn usage_limit_cooldown_until(resets_at: Option<i64>, resets_in_seconds: Option<
 struct MetaEntry {
     label: Option<String>,
     added_at: u64,
+    #[serde(default = "default_proxy_enabled")]
+    proxy_enabled: bool,
+}
+
+fn default_proxy_enabled() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -425,6 +431,7 @@ pub struct CodexAccount {
     openai_api_key: Option<String>,
     label: Option<String>,
     added_at: u64,
+    proxy_enabled: bool,
 }
 
 // ─── Global State for Proxy Gateway ──────────────────────────────────────────
@@ -1547,6 +1554,7 @@ fn parse_auth_data(auth_data: &Value, account_id: &str) -> CodexAccount {
         openai_api_key,
         label: None,
         added_at: 0,
+        proxy_enabled: true,
     }
 }
 
@@ -1728,6 +1736,7 @@ fn list_accounts() -> Result<Vec<CodexAccount>, String> {
         if let Some(m) = meta.get(&dir_name) {
             account.label = m.label.clone();
             account.added_at = m.added_at;
+            account.proxy_enabled = m.proxy_enabled;
         }
         accounts.push(account);
     }
@@ -1774,6 +1783,7 @@ fn get_current_account() -> Result<Option<CodexAccount>, String> {
                             if let Some(m) = meta.get(&dir_name) {
                                 parsed.label = m.label.clone();
                                 parsed.added_at = m.added_at;
+                                parsed.proxy_enabled = m.proxy_enabled;
                             }
                             return Ok(Some(parsed));
                         }
@@ -1847,8 +1857,25 @@ fn update_label(id: String, label: String) -> Result<bool, String> {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64,
+        proxy_enabled: true,
     });
     entry.label = if label.is_empty() { None } else { Some(label) };
+    write_meta(&meta);
+    Ok(true)
+}
+
+#[tauri::command]
+fn update_proxy_enabled(id: String, enabled: bool) -> Result<bool, String> {
+    let mut meta = read_meta();
+    let entry = meta.entry(id).or_insert_with(|| MetaEntry {
+        label: None,
+        added_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        proxy_enabled: true,
+    });
+    entry.proxy_enabled = enabled;
     write_meta(&meta);
     Ok(true)
 }
@@ -1903,6 +1930,7 @@ fn import_current(label: Option<String>) -> Result<Value, String> {
         MetaEntry {
             label,
             added_at: now,
+            proxy_enabled: true,
         },
     );
     write_meta(&meta);
@@ -2491,6 +2519,7 @@ async fn run_proxy_server(
 fn load_proxy_accounts() -> Result<Vec<ProxyAccount>, String> {
     let mut pool = Vec::new();
     let accounts_path = accounts_dir();
+    let meta = read_meta();
 
     if !accounts_path.exists() {
         return Err("No accounts directory found. Please login at least one account.".into());
@@ -2499,6 +2528,11 @@ fn load_proxy_accounts() -> Result<Vec<ProxyAccount>, String> {
     let entries = fs::read_dir(&accounts_path).map_err(|e| e.to_string())?;
     for entry in entries.flatten() {
         let id = entry.file_name().to_string_lossy().to_string();
+        if let Some(m) = meta.get(&id) {
+            if !m.proxy_enabled {
+                continue;
+            }
+        }
         let auth_path = entry.path().join("auth.json");
         if !auth_path.exists() { continue; }
 
@@ -2528,7 +2562,7 @@ fn load_proxy_accounts() -> Result<Vec<ProxyAccount>, String> {
     }
 
     if pool.is_empty() {
-        Err("No valid access tokens found. Please login at least one account.".into())
+        Err("No enabled accounts in pool. Please enable at least one account.".into())
     } else {
         Ok(pool)
     }
@@ -4259,6 +4293,7 @@ pub fn run() {
             switch_account,
             delete_account,
             update_label,
+            update_proxy_enabled,
             import_current,
             get_config,
             launch_codex_login,

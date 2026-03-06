@@ -166,7 +166,7 @@ export default function AccountsPage() {
     accounts, currentAccount, loading, error, proxyStatus,
     usageMap, usageLoading,
     refresh, switchAccount, deleteAccount, refreshAccountToken,
-    fetchUsage, startProxy, stopProxy, reloadProxy
+    fetchUsage, startProxy, stopProxy, reloadProxy, updateProxyEnabled
   } = useAccountStore()
 
   const [addOpen, setAddOpen] = useState(false)
@@ -429,6 +429,24 @@ export default function AccountsPage() {
             <Text type="secondary" style={{ fontSize: 11 }}>{record.email}</Text>
           )}
         </div>
+      ),
+    },
+    {
+      title: '代理',
+      width: 90,
+      render: (_: unknown, record: CodexAccount) => (
+        <Switch
+          size="small"
+          checked={record.proxy_enabled ?? true}
+          onChange={async (checked) => {
+            try {
+              await updateProxyEnabled(record.id, checked)
+              message.success(checked ? '已加入代理池' : '已移出代理池')
+            } catch (e) {
+              message.error(String(e))
+            }
+          }}
+        />
       ),
     },
     {
