@@ -70,18 +70,16 @@ export default function AnthropicProxyCard() {
     }
   }
 
-  async function toggleProxy() {
+  async function toggleProxy(checked: boolean) {
     setProxyLoading(true)
     try {
-      if (proxyRunning) {
+      if (!checked) {
         await accountService.stopAnthropicProxy()
-        setProxyRunning(false)
-        setProxyPort(null)
+        await loadStatus()
         message.success('Anthropic 代理已停止')
       } else {
         const res = await accountService.startAnthropicProxy(portInput)
-        setProxyRunning(true)
-        setProxyPort(res.port)
+        await loadStatus()
         message.success(`Anthropic 代理已启动，端口 ${res.port}`)
       }
     } catch (e) {
