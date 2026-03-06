@@ -390,6 +390,332 @@ static PROXY_PORT: Mutex<Option<u16>> = Mutex::new(None);
 // Shared live proxy state for status queries and hot-reload
 static PROXY_STATE: Mutex<Option<Arc<ProxyState>>> = Mutex::new(None);
 
+// ─── Anthropic proxy globals ─────────────────────────────────────────────────
+
+static ANTHROPIC_PROXY_SHUTDOWN: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
+static ANTHROPIC_PROXY_PORT: Mutex<Option<u16>> = Mutex::new(None);
+
+fn anthropic_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".codex-manager").join("anthropic_keys.json")
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AnthropicKeyEntry {
+    id: String,
+    label: Option<String>,
+    // Either a raw sk-ant- API key or a Claude Code OAuth access_token
+    key: String,
+    added_at: u64,
+}
+
+fn load_anthropic_keys() -> Vec<AnthropicKeyEntry> {
+    let path = anthropic_config_path();
+    if !path.exists() {
+        return vec![];
+    }
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_anthropic_keys(keys: &[AnthropicKeyEntry]) {
+    let path = anthropic_config_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(keys) {
+        let _ = fs::write(&path, s);
+    }
+}
+
+// Determine Anthropic auth header: sk-ant-* keys use x-api-key,
+// OAuth access_tokens (Bearer) use Authorization header
+fn is_oauth_access_token(key: &str) -> bool {
+    !key.starts_with("sk-ant-")
+}
+
+#[tauri::command]
+fn list_anthropic_keys() -> Result<Vec<AnthropicKeyEntry>, String> {
+    Ok(load_anthropic_keys())
+}
+
+#[tauri::command]
+fn add_anthropic_key(label: Option<String>, key: String) -> Result<AnthropicKeyEntry, String> {
+    if key.trim().is_empty() {
+        return Err("Key cannot be empty".into());
+    }
+    let mut keys = load_anthropic_keys();
+    let entry = AnthropicKeyEntry {
+        id: format!("{}", chrono::Utc::now().timestamp_millis()),
+        label,
+        key: key.trim().to_string(),
+        added_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    };
+    keys.push(entry.clone());
+    save_anthropic_keys(&keys);
+    Ok(entry)
+}
+
+#[tauri::command]
+fn delete_anthropic_key(id: String) -> Result<(), String> {
+    let mut keys = load_anthropic_keys();
+    keys.retain(|k| k.id != id);
+    save_anthropic_keys(&keys);
+    Ok(())
+}
+
+#[tauri::command]
+fn update_anthropic_key_label(id: String, label: Option<String>) -> Result<(), String> {
+    let mut keys = load_anthropic_keys();
+    if let Some(entry) = keys.iter_mut().find(|k| k.id == id) {
+        entry.label = label;
+        save_anthropic_keys(&keys);
+        Ok(())
+    } else {
+        Err("Key not found".into())
+    }
+}
+
+// ─── Anthropic proxy server ───────────────────────────────────────────────────
+
+static ANTHROPIC_REQ_ID: AtomicUsize = AtomicUsize::new(1);
+const ANTHROPIC_DEFAULT_VERSION: &str = "2023-06-01";
+const ANTHROPIC_COOLDOWN_SECS: u64 = 60;
+
+fn anthropic_base_url() -> String {
+    std::env::var("CODEXMANAGER_ANTHROPIC_BASE_URL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "https://api.anthropic.com".to_string())
+}
+
+fn anthropic_version() -> String {
+    std::env::var("CODEXMANAGER_ANTHROPIC_VERSION")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| ANTHROPIC_DEFAULT_VERSION.to_string())
+}
+
+fn build_anthropic_url(path_and_query: &str) -> String {
+    let base = anthropic_base_url();
+    let base = base.trim_end_matches('/');
+    format!("{base}{path_and_query}")
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum AnthKeyHealth {
+    Active,
+    Cooldown(std::time::Instant),
+    Blocked,
+}
+
+#[derive(Debug, Clone)]
+struct AnthKeySlot {
+    id: String,
+    key: String,
+    is_oauth: bool,
+    health: AnthKeyHealth,
+}
+
+struct AnthProxyState {
+    client: reqwest::Client,
+    keys: Arc<RwLock<Vec<AnthKeySlot>>>,
+    req_counter: AtomicUsize,
+}
+
+async fn anthropic_proxy_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AnthProxyState>>,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response<axum::body::Body> {
+    use axum::{body::Body, http::StatusCode, response::Response};
+
+    let request_id = ANTHROPIC_REQ_ID.fetch_add(1, Ordering::SeqCst);
+    let method = req.method().clone();
+    let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/").to_string();
+    let req_headers = req.headers().clone();
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 100 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Body::from("Failed to read request body")).unwrap(),
+    };
+
+    if method == axum::http::Method::OPTIONS {
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+            .header("Access-Control-Allow-Headers", "*")
+            .header("Access-Control-Max-Age", "86400")
+            .body(Body::empty()).unwrap();
+    }
+
+    let target = build_anthropic_url(&path);
+    let body_str = std::str::from_utf8(&body_bytes).unwrap_or("");
+    let accept_stream = req_headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_lowercase().contains("text/event-stream"))
+        .unwrap_or(false);
+    let is_stream = accept_stream
+        || body_str.contains("\"stream\":true")
+        || body_str.contains("\"stream\": true");
+
+    let resolved_version = req_headers
+        .get("anthropic-version")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(anthropic_version);
+
+    // Build forwarded headers, injecting auth + anthropic-version
+    let make_headers = |key: &str, is_oauth: bool, version: &str| {
+        let mut h = reqwest::header::HeaderMap::new();
+        for (name, value) in req_headers.iter() {
+            let n = name.as_str().to_lowercase();
+            if matches!(n.as_str(), "host" | "connection" | "content-length"
+                | "authorization" | "x-api-key" | "anthropic-version"
+                | "transfer-encoding" | "keep-alive") { continue; }
+            if let (Ok(k), Ok(v)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+                reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
+            ) { h.insert(k, v); }
+        }
+        if is_oauth {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
+                h.insert(reqwest::header::AUTHORIZATION, v);
+            }
+        } else if let Ok(v) = reqwest::header::HeaderValue::from_str(key) {
+            h.insert(reqwest::header::HeaderName::from_static("x-api-key"), v);
+        }
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(version) {
+            h.insert(reqwest::header::HeaderName::from_static("anthropic-version"), v);
+        }
+        if !body_bytes.is_empty() && !h.contains_key(reqwest::header::CONTENT_TYPE) {
+            h.insert(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"));
+        }
+        h.insert(reqwest::header::ACCEPT, reqwest::header::HeaderValue::from_static(
+            if is_stream { "text/event-stream" } else { "application/json" }
+        ));
+        h
+    };
+
+    // Pick healthy key (round-robin)
+    let chosen = {
+        let now = std::time::Instant::now();
+        let mut lock = state.keys.write().unwrap();
+        for slot in lock.iter_mut() {
+            if let AnthKeyHealth::Cooldown(u) = &slot.health {
+                if now >= *u { slot.health = AnthKeyHealth::Active; }
+            }
+        }
+        let n = lock.len();
+        if n == 0 {
+            return Response::builder().status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("Access-Control-Allow-Origin", "*")
+                .body(Body::from("No Anthropic keys configured.")).unwrap();
+        }
+        let cnt = state.req_counter.fetch_add(1, Ordering::SeqCst);
+        (0..n).map(|i| (cnt + i) % n)
+            .find(|&idx| lock[idx].health == AnthKeyHealth::Active)
+            .map(|idx| (idx, lock[idx].key.clone(), lock[idx].is_oauth, lock[idx].id.clone()))
+    };
+
+    let (chosen_idx, chosen_key, chosen_is_oauth, chosen_id) = match chosen {
+        Some(c) => c,
+        None => return Response::builder().status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Body::from("All Anthropic keys are on cooldown or blocked.")).unwrap(),
+    };
+
+    log_proxy(&format!("anth req#{request_id} {method} {path} key={chosen_id}"));
+
+    let resp = state.client
+        .request(method.clone(), &target)
+        .headers(make_headers(&chosen_key, chosen_is_oauth, &resolved_version))
+        .body(body_bytes.clone())
+        .send().await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => return Response::builder().status(StatusCode::BAD_GATEWAY)
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Body::from(format!("Upstream error: {e}"))).unwrap(),
+    };
+
+    let status = resp.status();
+    log_proxy(&format!("anth req#{request_id} status={}", status.as_u16()));
+
+    // 429: cooldown + retry with another key
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(ANTHROPIC_COOLDOWN_SECS);
+            let mut lock = state.keys.write().unwrap();
+            if let Some(slot) = lock.get_mut(chosen_idx) { slot.health = AnthKeyHealth::Cooldown(until); }
+        }
+        let fallback = {
+            let now = std::time::Instant::now();
+            let mut lock = state.keys.write().unwrap();
+            for slot in lock.iter_mut() {
+                if let AnthKeyHealth::Cooldown(u) = &slot.health {
+                    if now >= *u { slot.health = AnthKeyHealth::Active; }
+                }
+            }
+            let n = lock.len();
+            let cnt = state.req_counter.load(Ordering::SeqCst);
+            (0..n).map(|i| (cnt + i) % n)
+                .find(|&idx| idx != chosen_idx && lock[idx].health == AnthKeyHealth::Active)
+                .map(|idx| (lock[idx].key.clone(), lock[idx].is_oauth))
+        };
+        if let Some((fb_key, fb_is_oauth)) = fallback {
+            log_proxy(&format!("anth req#{request_id} 429-retry with fallback key"));
+            if let Ok(r) = state.client
+                .request(method, &target)
+                .headers(make_headers(&fb_key, fb_is_oauth, &resolved_version))
+                .body(body_bytes).send().await
+            {
+                return anth_build_proxy_response(r).await;
+            }
+        }
+    } else if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        let mut lock = state.keys.write().unwrap();
+        if let Some(slot) = lock.get_mut(chosen_idx) { slot.health = AnthKeyHealth::Blocked; }
+    }
+
+    anth_build_proxy_response(resp).await
+}
+
+async fn anth_build_proxy_response(resp: reqwest::Response) -> axum::response::Response<axum::body::Body> {
+    use axum::{body::Body, response::Response};
+    let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let mut builder = Response::builder().status(status)
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Headers", "*");
+    for (k, v) in resp.headers() {
+        if skip_response_header(k.as_str()) { continue; }
+        if let (Ok(name), Ok(val)) = (
+            axum::http::HeaderName::from_bytes(k.as_str().as_bytes()),
+            axum::http::HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            builder = builder.header(name, val);
+        }
+    }
+    let stream = resp.bytes_stream();
+    builder.body(Body::from_stream(stream)).unwrap_or_else(|_|
+        Response::builder().status(axum::http::StatusCode::INTERNAL_SERVER_ERROR).body(Body::empty()).unwrap()
+    )
+}
+
 // ─── JWT / auth helpers ───────────────────────────────────────────────────────
 
 fn decode_jwt(token: &str) -> Value {
@@ -2263,6 +2589,86 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn start_anthropic_proxy(port: Option<u16>) -> Result<Value, String> {
+    {
+        let mut lock = ANTHROPIC_PROXY_SHUTDOWN.lock().unwrap();
+        if let Some(tx) = lock.take() { let _ = tx.send(()); }
+    }
+
+    let proxy_port = port.unwrap_or(8081);
+    let raw_keys = load_anthropic_keys();
+    if raw_keys.is_empty() {
+        return Err("No Anthropic API keys configured.".into());
+    }
+
+    let slots: Vec<AnthKeySlot> = raw_keys.into_iter().map(|e| {
+        let is_oauth = is_oauth_access_token(&e.key);
+        AnthKeySlot { id: e.id, key: e.key, is_oauth, health: AnthKeyHealth::Active }
+    }).collect();
+    let key_count = slots.len();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    *ANTHROPIC_PROXY_SHUTDOWN.lock().unwrap() = Some(shutdown_tx);
+    *ANTHROPIC_PROXY_PORT.lock().unwrap() = Some(proxy_port);
+
+    let state = Arc::new(AnthProxyState {
+        client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .unwrap_or_default(),
+        keys: Arc::new(RwLock::new(slots)),
+        req_counter: AtomicUsize::new(0),
+    });
+
+    let app = axum::Router::new()
+        .fallback(axum::routing::any(anthropic_proxy_handler))
+        .with_state(state);
+
+    let addr = format!("localhost:{proxy_port}");
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_waiter = shutdown_notify.clone();
+
+    tokio::spawn(async move {
+        let _ = shutdown_rx.await;
+        shutdown_waiter.notify_waiters();
+    });
+
+    tauri::async_runtime::spawn(async move {
+        let serve_result = run_proxy_server(&addr, app, shutdown_notify).await;
+
+        if let Err(err) = serve_result {
+            log_proxy(&format!("anthropic proxy exited with error: {err}"));
+        } else {
+            log_proxy("anthropic proxy exited");
+        }
+
+        let mut lock = ANTHROPIC_PROXY_PORT.lock().unwrap();
+        *lock = None;
+    });
+
+    log_proxy(&format!("anthropic proxy started on port {proxy_port} with {key_count} keys"));
+    Ok(serde_json::json!({ "success": true, "port": proxy_port, "key_count": key_count }))
+}
+
+#[tauri::command]
+fn stop_anthropic_proxy() -> Result<Value, String> {
+    let mut lock = ANTHROPIC_PROXY_SHUTDOWN.lock().unwrap();
+    if let Some(tx) = lock.take() {
+        let _ = tx.send(());
+        *ANTHROPIC_PROXY_PORT.lock().unwrap() = None;
+        Ok(serde_json::json!({ "success": true }))
+    } else {
+        Ok(serde_json::json!({ "success": false, "message": "Proxy not running" }))
+    }
+}
+
+#[tauri::command]
+fn get_anthropic_proxy_status() -> Result<Value, String> {
+    let port = *ANTHROPIC_PROXY_PORT.lock().unwrap();
+    Ok(serde_json::json!({ "running": port.is_some(), "port": port }))
+}
+
+#[tauri::command]
 fn stop_api_proxy() -> Result<Value, String> {
     let mut lock = PROXY_SHUTDOWN.lock().unwrap();
     if let Some(tx) = lock.take() {
@@ -2609,6 +3015,13 @@ pub fn run() {
             get_proxy_logs_count_filtered,
             get_proxy_logs_filtered,
             get_proxy_log_detail,
+            list_anthropic_keys,
+            add_anthropic_key,
+            delete_anthropic_key,
+            update_anthropic_key_label,
+            start_anthropic_proxy,
+            stop_anthropic_proxy,
+            get_anthropic_proxy_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
