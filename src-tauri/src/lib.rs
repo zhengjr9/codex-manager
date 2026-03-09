@@ -65,6 +65,30 @@ fn log_proxy(message: &str) {
     }
 }
 
+fn log_proxy_error_detail(
+    request_id: usize,
+    status: u16,
+    method: &str,
+    path: &str,
+    request_url: &Option<String>,
+    request_headers: &Option<String>,
+    request_body: &Option<String>,
+    response_body: &Option<String>,
+    error: &Option<String>,
+) {
+    let detail = serde_json::json!({
+        "status": status,
+        "method": method,
+        "path": path,
+        "request_url": request_url,
+        "request_headers": request_headers,
+        "request_body": request_body,
+        "response_body": response_body,
+        "error": error,
+    });
+    log_proxy(&format!("req#{request_id} error detail {detail}"));
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct ProxyConfig {
     api_key: Option<String>,
@@ -2728,6 +2752,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         let method_label = method.to_string();
         let started_at = std::time::Instant::now();
         let mut target = build_upstream_url(&upstream_path);
+        let mut request_url = Some(target.clone());
 
         // Collect and filter incoming headers (pass them through, except hop-by-hop)
         let mut forward_headers = reqwest::header::HeaderMap::new();
@@ -2740,6 +2765,8 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 forward_headers.insert(name, val);
             }
         }
+        let request_headers_json = headers_to_json_string(sanitize_headers(&req_headers));
+        let request_body_text = None;
 
         let max_body_bytes = front_proxy_max_body_bytes();
         if let Some(content_length) = req
@@ -2749,6 +2776,38 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             .and_then(|v| v.trim().parse::<u64>().ok())
         {
             if content_length > max_body_bytes as u64 {
+                let entry = ProxyLogEntry {
+                    timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    method: method_label.clone(),
+                    path: path.to_string(),
+                    request_url: request_url.clone(),
+                    status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                    duration_ms: started_at.elapsed().as_millis() as u64,
+                    proxy_account_id: "".to_string(),
+                    account_id: None,
+                    error: Some("request body too large".to_string()),
+                    model: None,
+                    request_headers: request_headers_json.clone(),
+                    response_headers: headers_to_json_string(vec![
+                        ("content-type".to_string(), "text/plain".to_string()),
+                    ]),
+                    request_body: None,
+                    response_body: Some("Request body too large".to_string()),
+                    input_tokens: None,
+                    output_tokens: None,
+                };
+                let _ = insert_proxy_log(&entry);
+                log_proxy_error_detail(
+                    request_id,
+                    StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                    &method_label,
+                    path,
+                    &request_url,
+                    &request_headers_json,
+                    &request_body_text,
+                    &entry.response_body,
+                    &entry.error,
+                );
                 return Response::builder()
                     .status(StatusCode::PAYLOAD_TOO_LARGE)
                     .header("Access-Control-Allow-Origin", "*")
@@ -2761,6 +2820,38 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         let body_bytes = match axum::body::to_bytes(req.into_body(), max_body_bytes).await {
             Ok(b) => b,
             Err(_) => {
+                let entry = ProxyLogEntry {
+                    timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    method: method_label.clone(),
+                    path: path.to_string(),
+                    request_url: request_url.clone(),
+                    status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                    duration_ms: started_at.elapsed().as_millis() as u64,
+                    proxy_account_id: "".to_string(),
+                    account_id: None,
+                    error: Some("request body too large".to_string()),
+                    model: None,
+                    request_headers: request_headers_json.clone(),
+                    response_headers: headers_to_json_string(vec![
+                        ("content-type".to_string(), "text/plain".to_string()),
+                    ]),
+                    request_body: None,
+                    response_body: Some("Request body too large".to_string()),
+                    input_tokens: None,
+                    output_tokens: None,
+                };
+                let _ = insert_proxy_log(&entry);
+                log_proxy_error_detail(
+                    request_id,
+                    StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                    &method_label,
+                    path,
+                    &request_url,
+                    &request_headers_json,
+                    &request_body_text,
+                    &entry.response_body,
+                    &entry.error,
+                );
                 return Response::builder()
                     .status(StatusCode::PAYLOAD_TOO_LARGE)
                     .header("Access-Control-Allow-Origin", "*")
@@ -2770,12 +2861,49 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         };
 
         let mut upstream_body_bytes = body_bytes.clone();
+        let request_body_text = if body_bytes.is_empty() {
+            None
+        } else {
+            Some(truncate_body(&body_bytes))
+        };
         let mut request_model = extract_model(&body_bytes);
         let mut anthropic_reverse_tool_map: Option<HashMap<String, String>> = None;
         let mut anthropic_stream = None;
 
         if is_anthropic {
             if method != reqwest::Method::POST {
+                let entry = ProxyLogEntry {
+                    timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    method: method_label.clone(),
+                    path: path.to_string(),
+                    request_url: request_url.clone(),
+                    status: StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+                    duration_ms: started_at.elapsed().as_millis() as u64,
+                    proxy_account_id: "".to_string(),
+                    account_id: None,
+                    error: Some("method not allowed".to_string()),
+                    model: None,
+                    request_headers: request_headers_json.clone(),
+                    response_headers: headers_to_json_string(vec![
+                        ("content-type".to_string(), "text/plain".to_string()),
+                    ]),
+                    request_body: request_body_text.clone(),
+                    response_body: Some("Method not allowed".to_string()),
+                    input_tokens: None,
+                    output_tokens: None,
+                };
+                let _ = insert_proxy_log(&entry);
+                log_proxy_error_detail(
+                    request_id,
+                    StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+                    &method_label,
+                    path,
+                    &request_url,
+                    &request_headers_json,
+                    &request_body_text,
+                    &entry.response_body,
+                    &entry.error,
+                );
                 return Response::builder()
                     .status(StatusCode::METHOD_NOT_ALLOWED)
                     .header("Access-Control-Allow-Origin", "*")
@@ -2785,6 +2913,38 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             let body_json: Value = match serde_json::from_slice(&body_bytes) {
                 Ok(v) => v,
                 Err(_) => {
+                    let entry = ProxyLogEntry {
+                        timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                        method: method_label.clone(),
+                        path: path.to_string(),
+                        request_url: request_url.clone(),
+                        status: StatusCode::BAD_REQUEST.as_u16(),
+                        duration_ms: started_at.elapsed().as_millis() as u64,
+                        proxy_account_id: "".to_string(),
+                        account_id: None,
+                        error: Some("invalid json".to_string()),
+                        model: None,
+                        request_headers: request_headers_json.clone(),
+                        response_headers: headers_to_json_string(vec![
+                            ("content-type".to_string(), "text/plain".to_string()),
+                        ]),
+                        request_body: request_body_text.clone(),
+                        response_body: Some("Invalid JSON".to_string()),
+                        input_tokens: None,
+                        output_tokens: None,
+                    };
+                    let _ = insert_proxy_log(&entry);
+                    log_proxy_error_detail(
+                        request_id,
+                        StatusCode::BAD_REQUEST.as_u16(),
+                        &method_label,
+                        path,
+                        &request_url,
+                        &request_headers_json,
+                        &request_body_text,
+                        &entry.response_body,
+                        &entry.error,
+                    );
                     return Response::builder()
                         .status(StatusCode::BAD_REQUEST)
                         .header("Access-Control-Allow-Origin", "*")
@@ -2798,10 +2958,43 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     upstream_body_bytes = serde_json::to_vec(&codex_body).unwrap_or_default().into();
                     upstream_path = "/v1/responses".to_string();
                     target = build_upstream_url(&upstream_path);
+                    request_url = Some(target.clone());
                     anthropic_reverse_tool_map = Some(reverse_map);
                     anthropic_stream = Some(stream);
                 }
                 Err(err) => {
+                    let entry = ProxyLogEntry {
+                        timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                        method: method_label.clone(),
+                        path: path.to_string(),
+                        request_url: request_url.clone(),
+                        status: StatusCode::BAD_REQUEST.as_u16(),
+                        duration_ms: started_at.elapsed().as_millis() as u64,
+                        proxy_account_id: "".to_string(),
+                        account_id: None,
+                        error: Some(err.clone()),
+                        model: request_model.clone(),
+                        request_headers: request_headers_json.clone(),
+                        response_headers: headers_to_json_string(vec![
+                            ("content-type".to_string(), "text/plain".to_string()),
+                        ]),
+                        request_body: request_body_text.clone(),
+                        response_body: Some(err.clone()),
+                        input_tokens: None,
+                        output_tokens: None,
+                    };
+                    let _ = insert_proxy_log(&entry);
+                    log_proxy_error_detail(
+                        request_id,
+                        StatusCode::BAD_REQUEST.as_u16(),
+                        &method_label,
+                        path,
+                        &request_url,
+                        &request_headers_json,
+                        &request_body_text,
+                        &entry.response_body,
+                        &entry.error,
+                    );
                     return Response::builder()
                         .status(StatusCode::BAD_REQUEST)
                         .header("Access-Control-Allow-Origin", "*")
@@ -2811,15 +3004,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             }
         } else {
             target = build_upstream_url(&upstream_path);
+            request_url = Some(target.clone());
         }
 
-        let request_headers_json = headers_to_json_string(sanitize_headers(&req_headers));
-        let request_body_text = if body_bytes.is_empty() {
-            None
-        } else {
-            Some(truncate_body(&body_bytes))
-        };
-        let request_url = Some(target.clone());
         log_proxy(&format!("req#{request_id} start {method_label} {path} -> {target}"));
 
         if !proxy_api_key_valid(&req_headers) {
