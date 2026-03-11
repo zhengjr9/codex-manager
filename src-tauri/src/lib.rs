@@ -3161,7 +3161,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         }
                     }
                     // Retry with refreshed token
-                    let mut retry_headers = forward_headers;
+                    let mut retry_headers = forward_headers.clone();
                     apply_upstream_headers(
                         &mut retry_headers,
                         &new_token,
@@ -3171,7 +3171,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         is_stream,
                     );
                     if let Ok(retry_resp) = state.client
-                        .request(method, &target)
+                        .request(method.clone(), &target)
                         .headers(retry_headers)
                         .body(upstream_body_bytes.clone())
                         .send()
@@ -3411,7 +3411,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 if let Some((fallback_idx, fallback_token, fallback_account_id)) =
                     select_highest_quota_account(state.clone(), chosen_idx).await
                 {
-                    let mut retry_headers = forward_headers;
+                    let mut retry_headers = forward_headers.clone();
                     apply_upstream_headers(
                         &mut retry_headers,
                         &fallback_token,
@@ -3421,7 +3421,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         is_stream,
                     );
                     if let Ok(retry_resp) = state.client
-                        .request(method, &target)
+                        .request(method.clone(), &target)
                         .headers(retry_headers)
                         .body(upstream_body_bytes.clone())
                         .send()
@@ -3616,7 +3616,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 };
 
                 if let Some((fallback_token, fallback_account_id)) = fallback {
-                    let mut retry_headers = forward_headers;
+                    let mut retry_headers = forward_headers.clone();
                     apply_upstream_headers(
                         &mut retry_headers,
                         &fallback_token,
@@ -3626,7 +3626,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         is_stream,
                     );
                     if let Ok(retry_resp) = state.client
-                        .request(method, &target)
+                        .request(method.clone(), &target)
                         .headers(retry_headers)
                         .body(upstream_body_bytes.clone())
                         .send()
@@ -3835,6 +3835,147 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         .unwrap();
                 }
             };
+            if status == reqwest::StatusCode::BAD_REQUEST {
+                if let Some((resets_at, resets_in_seconds)) = parse_usage_limit_error(&bytes) {
+                    let until = usage_limit_cooldown_until(resets_at, resets_in_seconds);
+                    {
+                        let mut accounts_lock = state.accounts.write().unwrap();
+                        if let Some(acc) = accounts_lock.get_mut(chosen_idx) {
+                            acc.health = AccountHealth::Cooldown(until);
+                        }
+                    }
+                    log_proxy(&format!(
+                        "req#{request_id} usage_limit_reached on {chosen_id} (status 400), selecting highest quota account"
+                    ));
+                    if let Some((fallback_idx, fallback_token, fallback_account_id)) =
+                        select_highest_quota_account(state.clone(), chosen_idx).await
+                    {
+                        let mut retry_headers = forward_headers.clone();
+                        apply_upstream_headers(
+                            &mut retry_headers,
+                            &fallback_token,
+                            fallback_account_id.as_deref(),
+                            &req_headers,
+                            !upstream_body_bytes.is_empty(),
+                            is_stream,
+                        );
+                        if let Ok(retry_resp) = state.client
+                            .request(method.clone(), &target)
+                            .headers(retry_headers)
+                            .body(upstream_body_bytes.clone())
+                            .send()
+                            .await
+                        {
+                            let retry_status = retry_resp.status();
+                            log_proxy(&format!("req#{request_id} usage-limit retry status: {}", retry_status.as_u16()));
+                            let resp_hdrs_json = headers_to_json_string(sanitize_reqwest_headers(retry_resp.headers()));
+                            let headers = retry_resp.headers().clone();
+                            let bytes = retry_resp.bytes().await.unwrap_or_default();
+                            if is_anthropic {
+                                let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
+                                let model_name = request_model.clone().unwrap_or_default();
+                                let (converted, input_tokens, output_tokens, response_body_text) =
+                                    match build_claude_response_body(&bytes, &reverse_map, &model_name) {
+                                        Ok(v) => v,
+                                        Err(err) => {
+                                            let entry = ProxyLogEntry {
+                                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                                method: method_label.clone(),
+                                                path: path.to_string(),
+                                                request_url: request_url.clone(),
+                                                status: StatusCode::BAD_GATEWAY.as_u16(),
+                                                duration_ms: started_at.elapsed().as_millis() as u64,
+                                                proxy_account_id: chosen_id.clone(),
+                                                account_id: fallback_account_id.clone(),
+                                                error: Some(err),
+                                                model: request_model.clone(),
+                                                request_headers: request_headers_json.clone(),
+                                                response_headers: resp_hdrs_json.clone(),
+                                                request_body: request_body_text.clone(),
+                                                response_body: None,
+                                                input_tokens: None,
+                                                output_tokens: None,
+                                            };
+                                            let _ = insert_proxy_log(&entry);
+                                            return Response::builder()
+                                                .status(StatusCode::BAD_GATEWAY)
+                                                .header("Access-Control-Allow-Origin", "*")
+                                                .body(Body::from("Anthropic response conversion failed"))
+                                                .unwrap();
+                                        }
+                                    };
+                                let entry = ProxyLogEntry {
+                                    timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                    method: method_label.clone(),
+                                    path: path.to_string(),
+                                    request_url: request_url.clone(),
+                                    status: retry_status.as_u16(),
+                                    duration_ms: started_at.elapsed().as_millis() as u64,
+                                    proxy_account_id: chosen_id.clone(),
+                                    account_id: fallback_account_id.clone(),
+                                    error: None,
+                                    model: request_model.clone(),
+                                    request_headers: request_headers_json.clone(),
+                                    response_headers: headers_to_json_string(vec![
+                                        ("content-type".to_string(), "application/json".to_string()),
+                                    ]),
+                                    request_body: request_body_text.clone(),
+                                    response_body: response_body_text,
+                                    input_tokens,
+                                    output_tokens,
+                                };
+                                let _ = insert_proxy_log(&entry);
+                                let status = axum::http::StatusCode::from_u16(retry_status.as_u16())
+                                    .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                                return Response::builder()
+                                    .status(status)
+                                    .header("Content-Type", "application/json")
+                                    .header("Access-Control-Allow-Origin", "*")
+                                    .header("Access-Control-Allow-Headers", "*")
+                                    .body(Body::from(converted))
+                                    .unwrap_or_else(|_| {
+                                        Response::builder()
+                                            .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(Body::empty())
+                                            .unwrap()
+                                    });
+                            }
+                            let response_body_text = if bytes.is_empty() {
+                                None
+                            } else {
+                                Some(truncate_body(&bytes))
+                            };
+                            let (input_tokens, output_tokens) = extract_usage(&bytes);
+                            let entry = ProxyLogEntry {
+                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                method: method_label.clone(),
+                                path: path.to_string(),
+                                request_url: request_url.clone(),
+                                status: retry_status.as_u16(),
+                                duration_ms: started_at.elapsed().as_millis() as u64,
+                                proxy_account_id: chosen_id.clone(),
+                                account_id: fallback_account_id.clone(),
+                                error: None,
+                                model: request_model.clone(),
+                                request_headers: request_headers_json.clone(),
+                                response_headers: resp_hdrs_json,
+                                request_body: request_body_text.clone(),
+                                response_body: response_body_text,
+                                input_tokens,
+                                output_tokens,
+                            };
+                            let _ = insert_proxy_log(&entry);
+                            return build_proxy_response_from_bytes(retry_status, &headers, bytes);
+                        }
+                        {
+                            let mut accounts_lock = state.accounts.write().unwrap();
+                            if let Some(acc) = accounts_lock.get_mut(fallback_idx) {
+                                acc.health = AccountHealth::Active;
+                            }
+                        }
+                    }
+                }
+            }
             if is_anthropic {
                 let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
                 let model_name = request_model.clone().unwrap_or_default();
