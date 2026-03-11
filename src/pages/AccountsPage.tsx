@@ -977,9 +977,6 @@ export default function AccountsPage() {
                 </div>
               )
             },
-            onExpand: (expanded, record) => {
-              if (expanded) loadExpandedRow(record.id)
-            },
           }}
           pagination={{
             current: logsPage,
