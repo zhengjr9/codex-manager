@@ -782,32 +782,15 @@ fn update_anthropic_key_label(id: String, label: Option<String>) -> Result<(), S
 
 // ─── Anthropic protocol (Codex compatibility) ─────────────────────────────────
 
-static ANTHROPIC_REQ_ID: AtomicUsize = AtomicUsize::new(1);
-
-#[derive(Debug, Clone)]
-struct AnthToolUse {
-    id: String,
-    name: String,
-    input: Value,
-}
-
-#[derive(Debug, Clone)]
-struct AnthToolResult {
-    tool_use_id: String,
-    content: String,
-}
-
-#[derive(Debug, Default)]
-struct AnthContentParsed {
-    text_parts: Vec<String>,
-    image_urls: Vec<String>,
-    tool_uses: Vec<AnthToolUse>,
-    tool_results: Vec<AnthToolResult>,
-}
-
-fn anthropic_text_from_content(value: &Value) -> String {
+fn anthropic_system_parts(value: &Value) -> Vec<String> {
     match value {
-        Value::String(s) => s.clone(),
+        Value::String(s) => {
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![s.clone()]
+            }
+        }
         Value::Array(items) => items
             .iter()
             .filter_map(|item| {
@@ -817,89 +800,46 @@ fn anthropic_text_from_content(value: &Value) -> String {
                     None
                 }
             })
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => "".to_string(),
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
     }
+}
+
+fn anthropic_image_url(item: &Value) -> Option<String> {
+    let source = item.get("source")?;
+    let src_type = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if src_type == "base64" {
+        let data = source
+            .get("data")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .or_else(|| source.get("base64").and_then(|v| v.as_str()));
+        if let Some(data) = data {
+            let media_type = source
+                .get("media_type")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .or_else(|| source.get("mime_type").and_then(|v| v.as_str()))
+                .unwrap_or("application/octet-stream");
+            return Some(format!("data:{media_type};base64,{data}"));
+        }
+    } else if src_type == "url" {
+        if let Some(url) = source.get("url").and_then(|v| v.as_str()) {
+            if !url.is_empty() {
+                return Some(url.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn anthropic_tool_result_content(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
-        Value::Array(_) | Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
-        _ => "".to_string(),
+        Value::Null => "".to_string(),
+        _ => serde_json::to_string(value).unwrap_or_default(),
     }
-}
-
-fn parse_anthropic_content(value: &Value) -> AnthContentParsed {
-    let mut parsed = AnthContentParsed::default();
-    match value {
-        Value::String(text) => {
-            if !text.is_empty() {
-                parsed.text_parts.push(text.clone());
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                match kind {
-                    "text" => {
-                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                            if !text.is_empty() {
-                                parsed.text_parts.push(text.to_string());
-                            }
-                        }
-                    }
-                    "image" => {
-                        if let Some(source) = item.get("source") {
-                            let src_type = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            if src_type == "base64" {
-                                let data = source
-                                    .get("data")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|v| !v.is_empty())
-                                    .or_else(|| source.get("base64").and_then(|v| v.as_str()));
-                                if let Some(data) = data {
-                                    let media_type = source
-                                        .get("media_type")
-                                        .and_then(|v| v.as_str())
-                                        .filter(|v| !v.is_empty())
-                                        .or_else(|| source.get("mime_type").and_then(|v| v.as_str()))
-                                        .unwrap_or("application/octet-stream");
-                                    parsed.image_urls.push(format!("data:{media_type};base64,{data}"));
-                                }
-                            } else if src_type == "url" {
-                                if let Some(url) = source.get("url").and_then(|v| v.as_str()) {
-                                    parsed.image_urls.push(url.to_string());
-                                }
-                            }
-                        }
-                    }
-                    "tool_use" => {
-                        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let input = item.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
-                        if !id.is_empty() && !name.is_empty() {
-                            parsed.tool_uses.push(AnthToolUse { id, name, input });
-                        }
-                    }
-                    "tool_result" => {
-                        let tool_use_id = item.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let content = item
-                            .get("content")
-                            .map(anthropic_tool_result_content)
-                            .unwrap_or_default();
-                        if !tool_use_id.is_empty() {
-                            parsed.tool_results.push(AnthToolResult { tool_use_id, content });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-    parsed
 }
 
 fn convert_budget_to_effort(budget: i64) -> Option<&'static str> {
@@ -1054,17 +994,20 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
     }
 
     if let Some(system) = body.get("system") {
-        let system_text = anthropic_text_from_content(system);
-        if !system_text.trim().is_empty() {
+        let parts = anthropic_system_parts(system);
+        if !parts.is_empty() {
             let mut msg = serde_json::json!({
                 "type": "message",
                 "role": "developer",
                 "content": []
             });
-            let content = vec![serde_json::json!({
-                "type": "input_text",
-                "text": system_text
-            })];
+            let mut content = Vec::new();
+            for part in parts {
+                content.push(serde_json::json!({
+                    "type": "input_text",
+                    "text": part
+                }));
+            }
             msg["content"] = Value::Array(content);
             template["input"].as_array_mut().unwrap().push(msg);
         }
@@ -1106,57 +1049,84 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
             };
 
             let content_value = msg.get("content").unwrap_or(&Value::Null);
-            let parsed = parse_anthropic_content(content_value);
-
-            if !parsed.text_parts.is_empty() {
-                append_text(&parsed.text_parts.join(""), &mut message, &mut has_content);
-            }
-            for url in parsed.image_urls {
-                append_image(&url, &mut message, &mut has_content);
-            }
-
-            for tool_use in parsed.tool_uses {
-                flush_message(&mut template, &mut message, &mut has_content);
-                let mut name = tool_use.name;
-                if let Some(short) = short_map.get(&name) {
-                    name = short.clone();
-                } else {
-                    name = shorten_name_if_needed(&name);
+            match content_value {
+                Value::Array(items) => {
+                    for item in items {
+                        let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        match kind {
+                            "text" => {
+                                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                    if !text.is_empty() {
+                                        append_text(text, &mut message, &mut has_content);
+                                    }
+                                }
+                            }
+                            "image" => {
+                                if let Some(url) = anthropic_image_url(item) {
+                                    append_image(&url, &mut message, &mut has_content);
+                                }
+                            }
+                            "tool_use" => {
+                                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let name_raw = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                if id.is_empty() || name_raw.is_empty() {
+                                    continue;
+                                }
+                                flush_message(&mut template, &mut message, &mut has_content);
+                                let mut name = name_raw;
+                                if let Some(short) = short_map.get(&name) {
+                                    name = short.clone();
+                                } else {
+                                    name = shorten_name_if_needed(&name);
+                                }
+                                let input = item.get("input").cloned().unwrap_or(Value::Null);
+                                let args_string = if input.is_null() {
+                                    "{}".to_string()
+                                } else {
+                                    serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
+                                };
+                                let mut fn_call = serde_json::json!({
+                                    "type": "function_call",
+                                    "call_id": id,
+                                    "name": name,
+                                    "arguments": args_string,
+                                });
+                                if let Some(arr) = template["input"].as_array_mut() {
+                                    arr.push(fn_call.take());
+                                }
+                            }
+                            "tool_result" => {
+                                let tool_use_id = item.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                if tool_use_id.is_empty() {
+                                    continue;
+                                }
+                                flush_message(&mut template, &mut message, &mut has_content);
+                                let content = item.get("content").unwrap_or(&Value::Null);
+                                let output_string = anthropic_tool_result_content(content);
+                                let mut fn_out = serde_json::json!({
+                                    "type": "function_call_output",
+                                    "call_id": tool_use_id,
+                                    "output": output_string,
+                                });
+                                if let Some(arr) = template["input"].as_array_mut() {
+                                    arr.push(fn_out.take());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    flush_message(&mut template, &mut message, &mut has_content);
                 }
-                let args_string = match &tool_use.input {
-                    Value::String(s) => s.clone(),
-                    Value::Null => "{}".to_string(),
-                    other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
-                };
-                let mut fn_call = serde_json::json!({
-                    "type": "function_call",
-                    "call_id": tool_use.id,
-                    "name": name,
-                    "arguments": args_string,
-                });
-                if let Some(arr) = template["input"].as_array_mut() {
-                    arr.push(fn_call.take());
+                Value::String(text) => {
+                    if !text.is_empty() {
+                        append_text(text, &mut message, &mut has_content);
+                    }
+                    flush_message(&mut template, &mut message, &mut has_content);
+                }
+                _ => {
+                    flush_message(&mut template, &mut message, &mut has_content);
                 }
             }
-
-            for tool_result in parsed.tool_results {
-                flush_message(&mut template, &mut message, &mut has_content);
-                let output_string = if tool_result.content.is_empty() {
-                    "".to_string()
-                } else {
-                    tool_result.content.clone()
-                };
-                let mut fn_out = serde_json::json!({
-                    "type": "function_call_output",
-                    "call_id": tool_result.tool_use_id,
-                    "output": output_string,
-                });
-                if let Some(arr) = template["input"].as_array_mut() {
-                    arr.push(fn_out.take());
-                }
-            }
-
-            flush_message(&mut template, &mut message, &mut has_content);
         }
     }
 
