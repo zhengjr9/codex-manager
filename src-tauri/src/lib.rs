@@ -443,6 +443,166 @@ fn usage_limit_cooldown_until(resets_at: Option<i64>, resets_in_seconds: Option<
     std::time::Instant::now() + std::time::Duration::from_secs(COOLDOWN_SECS)
 }
 
+fn rough_token_count(text: &str) -> i64 {
+    let mut count: i64 = 0;
+    let mut in_ascii_word = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if in_ascii_word {
+                count += 1;
+                in_ascii_word = false;
+            }
+            continue;
+        }
+        if ch.is_ascii() {
+            if ch.is_ascii_punctuation() {
+                if in_ascii_word {
+                    count += 1;
+                    in_ascii_word = false;
+                }
+                count += 1;
+            } else {
+                in_ascii_word = true;
+            }
+        } else {
+            if in_ascii_word {
+                count += 1;
+                in_ascii_word = false;
+            }
+            count += 1;
+        }
+    }
+    if in_ascii_word {
+        count += 1;
+    }
+    count
+}
+
+fn count_codex_input_tokens(body: &Value) -> i64 {
+    let mut segments: Vec<String> = Vec::new();
+
+    if let Some(inst) = body.get("instructions").and_then(|v| v.as_str()) {
+        let trimmed = inst.trim();
+        if !trimmed.is_empty() {
+            segments.push(trimmed.to_string());
+        }
+    }
+
+    if let Some(items) = body.get("input").and_then(|v| v.as_array()) {
+        for item in items {
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match item_type {
+                "message" => {
+                    if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
+                        for part in parts {
+                            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                let trimmed = text.trim();
+                                if !trimmed.is_empty() {
+                                    segments.push(trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                "function_call" => {
+                    if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                        let trimmed = name.trim();
+                        if !trimmed.is_empty() {
+                            segments.push(trimmed.to_string());
+                        }
+                    }
+                    if let Some(args) = item.get("arguments") {
+                        let text = if let Some(s) = args.as_str() {
+                            s.to_string()
+                        } else {
+                            serde_json::to_string(args).unwrap_or_default()
+                        };
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            segments.push(trimmed.to_string());
+                        }
+                    }
+                }
+                "function_call_output" => {
+                    if let Some(out) = item.get("output") {
+                        let text = if let Some(s) = out.as_str() {
+                            s.to_string()
+                        } else {
+                            serde_json::to_string(out).unwrap_or_default()
+                        };
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            segments.push(trimmed.to_string());
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            segments.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
+        for tool in tools {
+            if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() {
+                    segments.push(trimmed.to_string());
+                }
+            }
+            if let Some(desc) = tool.get("description").and_then(|v| v.as_str()) {
+                let trimmed = desc.trim();
+                if !trimmed.is_empty() {
+                    segments.push(trimmed.to_string());
+                }
+            }
+            if let Some(params) = tool.get("parameters") {
+                let text = if let Some(s) = params.as_str() {
+                    s.to_string()
+                } else {
+                    serde_json::to_string(params).unwrap_or_default()
+                };
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    segments.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(text) = body.get("text").and_then(|v| v.get("format")) {
+        if let Some(name) = text.get("name").and_then(|v| v.as_str()) {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                segments.push(trimmed.to_string());
+            }
+        }
+        if let Some(schema) = text.get("schema") {
+            let text = if let Some(s) = schema.as_str() {
+                s.to_string()
+            } else {
+                serde_json::to_string(schema).unwrap_or_default()
+            };
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                segments.push(trimmed.to_string());
+            }
+        }
+    }
+
+    let joined = segments.join("\n");
+    if joined.is_empty() {
+        return 0;
+    }
+    rough_token_count(&joined)
+}
+
 fn apply_usage_limit_policy(state: &Arc<ProxyState>, idx: usize, id: &str, until: std::time::Instant) {
     let cfg = proxy_config_snapshot();
     if cfg.disable_on_usage_limit {
@@ -3003,6 +3163,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         let path = normalize_models_path(path);
         let mut upstream_path = path.to_string();
         let mut is_anthropic = upstream_path.starts_with("/v1/messages");
+        let is_count_tokens = upstream_path.starts_with("/v1/messages/count_tokens");
         let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
             .unwrap_or(reqwest::Method::GET);
         let method_label = method.to_string();
@@ -3125,6 +3286,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         let mut request_model = extract_model(&body_bytes);
         let mut anthropic_reverse_tool_map: Option<HashMap<String, String>> = None;
         let mut anthropic_stream = None;
+        let mut anthropic_body_json: Option<Value> = None;
 
         if is_anthropic {
             if method != reqwest::Method::POST {
@@ -3208,54 +3370,57 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         .unwrap();
                 }
             };
+            anthropic_body_json = Some(body_json.clone());
             request_model = body_json.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
-            match convert_claude_to_codex(&body_json) {
-                Ok((codex_body, reverse_map, stream)) => {
-                    upstream_body_bytes = serde_json::to_vec(&codex_body).unwrap_or_default().into();
-                    upstream_path = "/v1/responses".to_string();
-                    target = build_upstream_url(&upstream_path);
-                    request_url = Some(target.clone());
-                    anthropic_reverse_tool_map = Some(reverse_map);
-                    anthropic_stream = Some(stream);
-                }
-                Err(err) => {
-                    let entry = ProxyLogEntry {
-                        timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                        method: method_label.clone(),
-                        path: path.to_string(),
-                        request_url: request_url.clone(),
-                        status: StatusCode::BAD_REQUEST.as_u16(),
-                        duration_ms: started_at.elapsed().as_millis() as u64,
-                        proxy_account_id: "".to_string(),
-                        account_id: None,
-                        error: Some(err.clone()),
-                        model: request_model.clone(),
-                        request_headers: request_headers_json.clone(),
-                        response_headers: headers_to_json_string(vec![
-                            ("content-type".to_string(), "text/plain".to_string()),
-                        ]),
-                        request_body: request_body_text.clone(),
-                        response_body: Some(err.clone()),
-                        input_tokens: None,
-                        output_tokens: None,
-                    };
-                    let _ = insert_proxy_log(&entry);
-                    log_proxy_error_detail(
-                        request_id,
-                        StatusCode::BAD_REQUEST.as_u16(),
-                        &method_label,
-                        &path,
-                        &request_url,
-                        &request_headers_json,
-                        &request_body_text,
-                        &entry.response_body,
-                        &entry.error,
-                    );
-                    return Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .header("Access-Control-Allow-Origin", "*")
-                        .body(Body::from(err))
-                        .unwrap();
+            if !is_count_tokens {
+                match convert_claude_to_codex(&body_json) {
+                    Ok((codex_body, reverse_map, stream)) => {
+                        upstream_body_bytes = serde_json::to_vec(&codex_body).unwrap_or_default().into();
+                        upstream_path = "/v1/responses".to_string();
+                        target = build_upstream_url(&upstream_path);
+                        request_url = Some(target.clone());
+                        anthropic_reverse_tool_map = Some(reverse_map);
+                        anthropic_stream = Some(stream);
+                    }
+                    Err(err) => {
+                        let entry = ProxyLogEntry {
+                            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                            method: method_label.clone(),
+                            path: path.to_string(),
+                            request_url: request_url.clone(),
+                            status: StatusCode::BAD_REQUEST.as_u16(),
+                            duration_ms: started_at.elapsed().as_millis() as u64,
+                            proxy_account_id: "".to_string(),
+                            account_id: None,
+                            error: Some(err.clone()),
+                            model: request_model.clone(),
+                            request_headers: request_headers_json.clone(),
+                            response_headers: headers_to_json_string(vec![
+                                ("content-type".to_string(), "text/plain".to_string()),
+                            ]),
+                            request_body: request_body_text.clone(),
+                            response_body: Some(err.clone()),
+                            input_tokens: None,
+                            output_tokens: None,
+                        };
+                        let _ = insert_proxy_log(&entry);
+                        log_proxy_error_detail(
+                            request_id,
+                            StatusCode::BAD_REQUEST.as_u16(),
+                            &method_label,
+                            &path,
+                            &request_url,
+                            &request_headers_json,
+                            &request_body_text,
+                            &entry.response_body,
+                            &entry.error,
+                        );
+                        return Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header("Access-Control-Allow-Origin", "*")
+                            .body(Body::from(err))
+                            .unwrap();
+                    }
                 }
             }
         } else {
@@ -3290,6 +3455,65 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 .header("Access-Control-Allow-Origin", "*")
                 .body(Body::from("Unauthorized"))
                 .unwrap();
+        }
+
+        if is_anthropic && is_count_tokens {
+            let body_json = match anthropic_body_json.as_ref() {
+                Some(v) => v,
+                None => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Body::from("Invalid JSON"))
+                        .unwrap();
+                }
+            };
+            let codex_body = match convert_claude_to_codex(body_json) {
+                Ok((v, _, _)) => v,
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Body::from(err))
+                        .unwrap();
+                }
+            };
+            let count = count_codex_input_tokens(&codex_body);
+            let response_payload = serde_json::json!({ "input_tokens": count });
+            let response_body = serde_json::to_vec(&response_payload).unwrap_or_else(|_| b"{}".to_vec());
+            let entry = ProxyLogEntry {
+                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                method: method_label.clone(),
+                path: path.to_string(),
+                request_url: Some("local:count_tokens".to_string()),
+                status: StatusCode::OK.as_u16(),
+                duration_ms: started_at.elapsed().as_millis() as u64,
+                proxy_account_id: "".to_string(),
+                account_id: None,
+                error: None,
+                model: request_model.clone(),
+                request_headers: request_headers_json.clone(),
+                response_headers: headers_to_json_string(vec![
+                    ("content-type".to_string(), "application/json".to_string()),
+                ]),
+                request_body: request_body_text.clone(),
+                response_body: Some(truncate_body(&response_body)),
+                input_tokens: Some(count),
+                output_tokens: Some(0),
+            };
+            let _ = insert_proxy_log(&entry);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Access-Control-Allow-Headers", "*")
+                .body(Body::from(response_body))
+                .unwrap_or_else(|_| {
+                    Response::builder()
+                        .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::empty())
+                        .unwrap()
+                });
         }
 
         // Pick a healthy account (skip cooldown-expired accounts, revive if cooldown elapsed)
@@ -3403,6 +3627,39 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
 
         let upstream_status = upstream_resp.status();
         log_proxy(&format!("req#{request_id} upstream status: {}", upstream_status.as_u16()));
+
+        if is_stream && upstream_status == reqwest::StatusCode::BAD_REQUEST {
+            let headers = upstream_resp.headers().clone();
+            let bytes = upstream_resp.bytes().await.unwrap_or_default();
+            if let Some((resets_at, resets_in_seconds)) = parse_usage_limit_error(&bytes) {
+                let until = usage_limit_cooldown_until(resets_at, resets_in_seconds);
+                apply_usage_limit_policy(&state, chosen_idx, &chosen_id, until);
+                log_proxy(&format!("req#{request_id} usage_limit_reached on {chosen_id} (status 400), selecting highest quota account"));
+                if let Some(resp) = retry_usage_limit_across_accounts(
+                    state.clone(),
+                    request_id,
+                    chosen_idx,
+                    &method,
+                    &target,
+                    &forward_headers,
+                    &req_headers,
+                    &upstream_body_bytes,
+                    is_stream,
+                    is_anthropic,
+                    &request_model,
+                    &request_body_text,
+                    &request_headers_json,
+                    &request_url,
+                    &anthropic_reverse_tool_map,
+                    &method_label,
+                    &path,
+                    started_at,
+                ).await {
+                    return resp;
+                }
+            }
+            return build_proxy_response_from_bytes(upstream_status, &headers, bytes);
+        }
 
         // Handle 401: try token refresh once, then retry
         if upstream_status == reqwest::StatusCode::UNAUTHORIZED {
