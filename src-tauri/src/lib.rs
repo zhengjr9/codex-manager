@@ -823,6 +823,14 @@ fn anthropic_text_from_content(value: &Value) -> String {
     }
 }
 
+fn anthropic_tool_result_content(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Array(_) | Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
+        _ => "".to_string(),
+    }
+}
+
 fn parse_anthropic_content(value: &Value) -> AnthContentParsed {
     let mut parsed = AnthContentParsed::default();
     match value {
@@ -846,10 +854,18 @@ fn parse_anthropic_content(value: &Value) -> AnthContentParsed {
                         if let Some(source) = item.get("source") {
                             let src_type = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
                             if src_type == "base64" {
-                                if let (Some(media_type), Some(data)) = (
-                                    source.get("media_type").and_then(|v| v.as_str()),
-                                    source.get("data").and_then(|v| v.as_str()),
-                                ) {
+                                let data = source
+                                    .get("data")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|v| !v.is_empty())
+                                    .or_else(|| source.get("base64").and_then(|v| v.as_str()));
+                                if let Some(data) = data {
+                                    let media_type = source
+                                        .get("media_type")
+                                        .and_then(|v| v.as_str())
+                                        .filter(|v| !v.is_empty())
+                                        .or_else(|| source.get("mime_type").and_then(|v| v.as_str()))
+                                        .unwrap_or("application/octet-stream");
                                     parsed.image_urls.push(format!("data:{media_type};base64,{data}"));
                                 }
                             } else if src_type == "url" {
@@ -869,7 +885,10 @@ fn parse_anthropic_content(value: &Value) -> AnthContentParsed {
                     }
                     "tool_result" => {
                         let tool_use_id = item.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let content = item.get("content").map(anthropic_text_from_content).unwrap_or_default();
+                        let content = item
+                            .get("content")
+                            .map(anthropic_tool_result_content)
+                            .unwrap_or_default();
                         if !tool_use_id.is_empty() {
                             parsed.tool_results.push(AnthToolResult { tool_use_id, content });
                         }
@@ -1104,11 +1123,16 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
                 } else {
                     name = shorten_name_if_needed(&name);
                 }
+                let args_string = match &tool_use.input {
+                    Value::String(s) => s.clone(),
+                    Value::Null => "{}".to_string(),
+                    other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+                };
                 let mut fn_call = serde_json::json!({
                     "type": "function_call",
                     "call_id": tool_use.id,
                     "name": name,
-                    "arguments": tool_use.input,
+                    "arguments": args_string,
                 });
                 if let Some(arr) = template["input"].as_array_mut() {
                     arr.push(fn_call.take());
@@ -1117,10 +1141,15 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
 
             for tool_result in parsed.tool_results {
                 flush_message(&mut template, &mut message, &mut has_content);
+                let output_string = if tool_result.content.is_empty() {
+                    "".to_string()
+                } else {
+                    tool_result.content.clone()
+                };
                 let mut fn_out = serde_json::json!({
                     "type": "function_call_output",
                     "call_id": tool_result.tool_use_id,
-                    "output": tool_result.content,
+                    "output": output_string,
                 });
                 if let Some(arr) = template["input"].as_array_mut() {
                     arr.push(fn_out.take());
@@ -1190,6 +1219,9 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
         }
     }
     let model_lc = model.to_lowercase();
+    if reasoning_effort == "minimal" {
+        reasoning_effort = "low".to_string();
+    }
     if reasoning_effort == "xhigh" && model_lc.starts_with("gpt-5.1") {
         reasoning_effort = "high".to_string();
     }
