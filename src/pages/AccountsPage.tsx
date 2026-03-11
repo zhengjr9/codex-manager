@@ -289,6 +289,7 @@ export default function AccountsPage() {
         api_key: apiKeyInput,
         enable_logging: proxyConfig.enable_logging,
         max_logs: proxyConfig.max_logs,
+        disable_on_usage_limit: proxyConfig.disable_on_usage_limit,
       })
       setProxyConfig(cfg)
       setApiKeyInput(cfg.api_key ?? '')
@@ -773,6 +774,11 @@ export default function AccountsPage() {
                 max={20000}
                 value={proxyConfig.max_logs}
                 onChange={(val) => setProxyConfig({ ...proxyConfig, max_logs: val || 1000 })}
+              />
+              <span>额度用尽自动禁用账号</span>
+              <Switch
+                checked={proxyConfig.disable_on_usage_limit}
+                onChange={(val) => setProxyConfig({ ...proxyConfig, disable_on_usage_limit: val })}
               />
             </div>
             <Text type="secondary" className="text-xs">
