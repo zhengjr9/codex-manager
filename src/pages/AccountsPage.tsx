@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { listen } from '@tauri-apps/api/event'
 import {
   Table, Button, Popconfirm, Tag, Tooltip, message, Spin, Alert,
   Space, Typography, Card, Statistic, Row, Col, Progress, Switch, InputNumber, Input
@@ -168,6 +169,18 @@ export default function AccountsPage() {
     refresh, switchAccount, deleteAccount, refreshAccountToken,
     fetchUsage, startProxy, stopProxy, reloadProxy, updateProxyEnabled
   } = useAccountStore()
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    listen('accounts_updated', async () => {
+      await refresh()
+    }).then((dispose) => {
+      unlisten = dispose
+    })
+    return () => {
+      if (unlisten) unlisten()
+    }
+  }, [refresh])
 
   const [addOpen, setAddOpen] = useState(false)
   const [switching, setSwitching] = useState<string | null>(null)

@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
+use tauri::Emitter;
 
 // ─── paths ───────────────────────────────────────────────────────────────────
 
@@ -110,6 +111,7 @@ impl Default for ProxyConfig {
 }
 
 static PROXY_CONFIG: OnceLock<Mutex<ProxyConfig>> = OnceLock::new();
+static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
 // Pending OAuth session (verifier + state + redirect_uri) for manual callback flow
 struct OAuthPending {
@@ -143,6 +145,14 @@ fn save_proxy_config(cfg: &ProxyConfig) -> Result<(), String> {
 
 fn proxy_config() -> &'static Mutex<ProxyConfig> {
     PROXY_CONFIG.get_or_init(|| Mutex::new(load_proxy_config()))
+}
+
+fn emit_accounts_updated(reason: &str) {
+    if let Some(handle) = APP_HANDLE.get() {
+        let _ = handle.emit("accounts_updated", serde_json::json!({
+            "reason": reason,
+        }));
+    }
 }
 
 fn proxy_config_snapshot() -> ProxyConfig {
@@ -1927,6 +1937,7 @@ fn update_proxy_enabled(id: String, enabled: bool) -> Result<bool, String> {
     });
     entry.proxy_enabled = enabled;
     write_meta(&meta);
+    emit_accounts_updated("proxy_enabled_changed");
     Ok(true)
 }
 
@@ -4586,6 +4597,7 @@ async fn select_highest_quota_account_excluding(
             .collect::<Vec<_>>()
     };
 
+    let fallback = candidates.first().cloned();
     let mut best: Option<(usize, String, String, Option<String>, f64)> = None;
     for (idx, id, token, account_id) in candidates {
         if let Ok(usage) = fetch_account_usage_by_id(&id).await {
@@ -4597,7 +4609,10 @@ async fn select_highest_quota_account_excluding(
         }
     }
 
-    best.map(|(idx, id, token, account_id, _)| (idx, id, token, account_id))
+    match best {
+        Some((idx, id, token, account_id, _)) => Some((idx, id, token, account_id)),
+        None => fallback,
+    }
 }
 
 /// Fetch rate-limit / usage snapshot for a managed account from chatgpt.com.
@@ -4611,6 +4626,10 @@ async fn get_account_usage(id: String) -> Result<AccountUsage, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            let _ = APP_HANDLE.set(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_accounts,
             get_current_account,
