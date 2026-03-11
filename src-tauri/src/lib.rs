@@ -97,6 +97,10 @@ struct ProxyConfig {
     max_logs: usize,
     #[serde(default)]
     disable_on_usage_limit: bool,
+    #[serde(default)]
+    model_override: Option<String>,
+    #[serde(default)]
+    reasoning_effort_override: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -106,6 +110,8 @@ impl Default for ProxyConfig {
             enable_logging: true,
             max_logs: 1000,
             disable_on_usage_limit: false,
+            model_override: None,
+            reasoning_effort_override: None,
         }
     }
 }
@@ -476,6 +482,13 @@ fn rough_token_count(text: &str) -> i64 {
         count += 1;
     }
     count
+}
+
+fn normalize_reasoning_effort(value: &str) -> Option<String> {
+    match value.trim() {
+        "none" | "low" | "medium" | "high" | "xhigh" => Some(value.trim().to_string()),
+        _ => None,
+    }
 }
 
 fn count_codex_input_tokens(body: &Value) -> i64 {
@@ -989,7 +1002,18 @@ fn build_reverse_tool_map(original: &Value) -> HashMap<String, String> {
 }
 
 fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, String>, bool), String> {
-    let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("gpt-4o-mini");
+    let mut model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gpt-4o-mini")
+        .to_string();
+    let cfg = proxy_config_snapshot();
+    if let Some(override_model) = cfg.model_override.as_ref() {
+        let trimmed = override_model.trim();
+        if !trimmed.is_empty() {
+            model = trimmed.to_string();
+        }
+    }
     let mut template = serde_json::json!({
         "model": model,
         "instructions": "",
@@ -1159,6 +1183,15 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
                 _ => {}
             }
         }
+    }
+    if let Some(override_effort) = cfg.reasoning_effort_override.as_ref() {
+        if let Some(normalized) = normalize_reasoning_effort(override_effort) {
+            reasoning_effort = normalized;
+        }
+    }
+    let model_lc = model.to_lowercase();
+    if reasoning_effort == "xhigh" && model_lc.starts_with("gpt-5.1") {
+        reasoning_effort = "high".to_string();
     }
     template["reasoning"] = serde_json::json!({
         "effort": reasoning_effort,
@@ -3375,6 +3408,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             if !is_count_tokens {
                 match convert_claude_to_codex(&body_json) {
                     Ok((codex_body, reverse_map, stream)) => {
+                        request_model = codex_body.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
                         upstream_body_bytes = serde_json::to_vec(&codex_body).unwrap_or_default().into();
                         upstream_path = "/v1/responses".to_string();
                         target = build_upstream_url(&upstream_path);
@@ -4583,6 +4617,8 @@ fn update_proxy_config(
     enable_logging: Option<bool>,
     max_logs: Option<usize>,
     disable_on_usage_limit: Option<bool>,
+    model_override: Option<String>,
+    reasoning_effort_override: Option<String>,
 ) -> Result<ProxyConfig, String> {
     let mut cfg = proxy_config_snapshot();
     if let Some(value) = api_key {
@@ -4597,6 +4633,14 @@ fn update_proxy_config(
     }
     if let Some(value) = disable_on_usage_limit {
         cfg.disable_on_usage_limit = value;
+    }
+    if let Some(value) = model_override {
+        let trimmed = value.trim().to_string();
+        cfg.model_override = if trimmed.is_empty() { None } else { Some(trimmed) };
+    }
+    if let Some(value) = reasoning_effort_override {
+        let trimmed = value.trim().to_string();
+        cfg.reasoning_effort_override = if trimmed.is_empty() { None } else { Some(trimmed) };
     }
     save_proxy_config(&cfg)?;
     let mut lock = proxy_config().lock().unwrap();

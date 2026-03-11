@@ -30,6 +30,8 @@ export interface ProxyConfig {
   enable_logging: boolean
   max_logs: number
   disable_on_usage_limit: boolean
+  model_override: string | null
+  reasoning_effort_override: string | null
 }
 
 export interface ProxyRequestLog {
@@ -91,7 +93,7 @@ export const accountService = {
   reloadProxy: () => invoke<{ success: boolean; account_count: number }>('reload_proxy_accounts'),
   getProxyStatus: () => invoke<ProxyStatus>('get_proxy_status'),
   getProxyConfig: () => invoke<ProxyConfig>('get_proxy_config'),
-  updateProxyConfig: (payload: { api_key?: string | null; enable_logging?: boolean; max_logs?: number; disable_on_usage_limit?: boolean }) =>
+  updateProxyConfig: (payload: { api_key?: string | null; enable_logging?: boolean; max_logs?: number; disable_on_usage_limit?: boolean; model_override?: string | null; reasoning_effort_override?: string | null }) =>
     invoke<ProxyConfig>('update_proxy_config', payload),
   generateProxyApiKey: () => invoke<string>('generate_proxy_api_key'),
   clearProxyLogs: () => invoke<{ success: boolean }>('clear_proxy_logs'),

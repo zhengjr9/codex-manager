@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import {
   Table, Button, Popconfirm, Tag, Tooltip, message, Spin, Alert,
-  Space, Typography, Card, Statistic, Row, Col, Progress, Switch, InputNumber, Input
+  Space, Typography, Card, Statistic, Row, Col, Progress, Switch, InputNumber, Input, Select
 } from 'antd'
 import {
   PlusOutlined, ReloadOutlined, CheckCircleFilled,
@@ -303,6 +303,8 @@ export default function AccountsPage() {
         enable_logging: proxyConfig.enable_logging,
         max_logs: proxyConfig.max_logs,
         disable_on_usage_limit: proxyConfig.disable_on_usage_limit,
+        model_override: proxyConfig.model_override,
+        reasoning_effort_override: proxyConfig.reasoning_effort_override,
       })
       setProxyConfig(cfg)
       setApiKeyInput(cfg.api_key ?? '')
@@ -792,6 +794,28 @@ export default function AccountsPage() {
               <Switch
                 checked={proxyConfig.disable_on_usage_limit}
                 onChange={(val) => setProxyConfig({ ...proxyConfig, disable_on_usage_limit: val })}
+              />
+              <span>模型覆盖</span>
+              <Input
+                placeholder="留空=按请求"
+                value={proxyConfig.model_override ?? ''}
+                onChange={(e) => setProxyConfig({ ...proxyConfig, model_override: e.target.value || null })}
+                className="w-40"
+              />
+              <span>思考强度</span>
+              <Select
+                allowClear
+                placeholder="自动"
+                value={proxyConfig.reasoning_effort_override ?? undefined}
+                onChange={(val) => setProxyConfig({ ...proxyConfig, reasoning_effort_override: val ?? null })}
+                className="w-32"
+                options={[
+                  { label: 'none', value: 'none' },
+                  { label: 'low', value: 'low' },
+                  { label: 'medium', value: 'medium' },
+                  { label: 'high', value: 'high' },
+                  { label: 'xhigh', value: 'xhigh' },
+                ]}
               />
             </div>
             <Text type="secondary" className="text-xs">
