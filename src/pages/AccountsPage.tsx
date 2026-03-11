@@ -191,6 +191,8 @@ export default function AccountsPage() {
   const [proxyConfig, setProxyConfig] = useState<ProxyConfig | null>(null)
   const [apiKeyInput, setApiKeyInput] = useState('')
   const [configSaving, setConfigSaving] = useState(false)
+  const [codexModels, setCodexModels] = useState<string[]>([])
+  const [codexModelsLoading, setCodexModelsLoading] = useState(false)
   const [logs, setLogs] = useState<ProxyRequestLog[]>([])
   const [logsLoading, setLogsLoading] = useState(false)
   const [logsFilter, setLogsFilter] = useState('')
@@ -230,6 +232,23 @@ export default function AccountsPage() {
       })
       .catch(() => {})
     return () => { active = false }
+  }, [])
+
+  async function refreshCodexModels() {
+    setCodexModelsLoading(true)
+    try {
+      const models = await accountService.listCodexModels()
+      setCodexModels(models)
+    } catch (e) {
+      setCodexModels([])
+      message.error(String(e))
+    } finally {
+      setCodexModelsLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    refreshCodexModels()
   }, [])
 
   async function refreshProxyLogs(page = logsPage, pageSize = logsPageSize) {
@@ -796,12 +815,19 @@ export default function AccountsPage() {
                 onChange={(val) => setProxyConfig({ ...proxyConfig, disable_on_usage_limit: val })}
               />
               <span>模型覆盖</span>
-              <Input
-                placeholder="留空=按请求"
-                value={proxyConfig.model_override ?? ''}
-                onChange={(e) => setProxyConfig({ ...proxyConfig, model_override: e.target.value || null })}
-                className="w-40"
+              <Select
+                allowClear
+                showSearch
+                placeholder={codexModelsLoading ? '加载中...' : '按请求'}
+                value={proxyConfig.model_override ?? undefined}
+                onChange={(val) => setProxyConfig({ ...proxyConfig, model_override: val ?? null })}
+                className="w-56"
+                options={codexModels.map(m => ({ label: m, value: m }))}
+                notFoundContent={codexModelsLoading ? <Spin size="small" /> : '暂无模型'}
               />
+              <Button size="small" icon={<ReloadOutlined />} loading={codexModelsLoading} onClick={refreshCodexModels}>
+                刷新模型
+              </Button>
               <span>思考强度</span>
               <Select
                 allowClear
@@ -882,6 +908,11 @@ export default function AccountsPage() {
           columns={logColumns}
           dataSource={logs}
           expandable={{
+            onExpand: (expanded, record) => {
+              if (expanded) {
+                loadExpandedRow(record.id)
+              }
+            },
             expandedRowRender: (record) => {
               const detail = expandedRowData[record.id]
               if (expandedRowLoading.has(record.id)) return <Spin size="small" />

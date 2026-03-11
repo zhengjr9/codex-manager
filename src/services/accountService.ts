@@ -102,6 +102,7 @@ export const accountService = {
   getProxyLogs: (payload?: { filter?: string; errors_only?: boolean; limit?: number; offset?: number }) =>
     invoke<ProxyRequestLog[]>('get_proxy_logs_filtered', payload ?? {}),
   getProxyLogDetail: (logId: number) => invoke<ProxyLogDetail>('get_proxy_log_detail', { log_id: logId }),
+  listCodexModels: () => invoke<string[]>('list_codex_models'),
 
   // Anthropic Proxy
   listAnthropicKeys: () => invoke<AnthropicKeyEntry[]>('list_anthropic_keys'),

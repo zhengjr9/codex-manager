@@ -1813,6 +1813,51 @@ fn parse_auth_data(auth_data: &Value, account_id: &str) -> CodexAccount {
     }
 }
 
+fn extract_auth_tokens(auth_data: &Value) -> (String, Option<String>, Option<String>) {
+    let tokens = auth_data.get("tokens").unwrap_or(&Value::Null);
+    let access_token = tokens
+        .get("access_token")
+        .or_else(|| auth_data.get("access_token"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let refresh_token = tokens
+        .get("refresh_token")
+        .or_else(|| auth_data.get("refresh_token"))
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let account_id = tokens
+        .get("account_id")
+        .or_else(|| auth_data.get("account_id"))
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    (access_token, refresh_token, account_id)
+}
+
+fn load_any_auth_data() -> Result<(Value, bool), String> {
+    if let Ok(content) = fs::read_to_string(auth_file()) {
+        if let Ok(auth_data) = serde_json::from_str::<Value>(&content) {
+            return Ok((auth_data, false));
+        }
+    }
+    let accounts_path = accounts_dir();
+    if accounts_path.exists() {
+        let entries = fs::read_dir(&accounts_path).map_err(|e| e.to_string())?;
+        for entry in entries.flatten() {
+            let auth_path = entry.path().join("auth.json");
+            if !auth_path.exists() {
+                continue;
+            }
+            if let Ok(content) = fs::read_to_string(&auth_path) {
+                if let Ok(auth_data) = serde_json::from_str::<Value>(&content) {
+                    return Ok((auth_data, true));
+                }
+            }
+        }
+    }
+    Err("未找到可用的账号，请先登录或导入账号。".to_string())
+}
+
 // ─── OAuth PKCE helpers ───────────────────────────────────────────────────────
 
 // OAuth parameters for OpenAI
@@ -4924,6 +4969,76 @@ async fn get_account_usage(id: String) -> Result<AccountUsage, String> {
     fetch_account_usage_by_id(&id).await
 }
 
+/// Fetch available Codex models from upstream for UI selection.
+#[tauri::command]
+async fn list_codex_models() -> Result<Vec<String>, String> {
+    let (auth_data, is_managed) = load_any_auth_data()?;
+    let (access_token, refresh_token, account_id) = extract_auth_tokens(&auth_data);
+    if access_token.trim().is_empty() {
+        return Err("账号缺少 access_token，请重新登录。".to_string());
+    }
+
+    let client = reqwest::Client::new();
+    let path = normalize_models_path("/v1/models");
+    let url = build_upstream_url(&path);
+    let mut headers = reqwest::header::HeaderMap::new();
+    let incoming_headers = axum::http::HeaderMap::new();
+    apply_upstream_headers(
+        &mut headers,
+        &access_token,
+        account_id.as_deref(),
+        &incoming_headers,
+        false,
+        false,
+    );
+
+    let mut resp = client
+        .get(&url)
+        .headers(headers.clone())
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED && is_managed {
+        if let (Some(id), Some(rt)) = (account_id.as_deref(), refresh_token.as_deref()) {
+            if let Some(new_token) = try_refresh_account(id, rt).await {
+                headers.insert(
+                    reqwest::header::AUTHORIZATION,
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", new_token))
+                        .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("")),
+                );
+                resp = client
+                    .get(&url)
+                    .headers(headers)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("获取模型失败 (HTTP {status}): {text}"));
+    }
+
+    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let mut models = Vec::new();
+    if let Some(arr) = body.get("data").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                if !id.is_empty() {
+                    models.push(id.to_string());
+                }
+            }
+        }
+    }
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
 // ─── App entry ───────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -4948,6 +5063,7 @@ pub fn run() {
             complete_oauth_manual,
             refresh_account_token,
             get_account_usage,
+            list_codex_models,
             start_api_proxy,
             stop_api_proxy,
             reload_proxy_accounts,
