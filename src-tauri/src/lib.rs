@@ -4824,7 +4824,11 @@ fn get_proxy_log_detail(log_id: i64) -> Result<ProxyLogDetail, String> {
             input_tokens: row.get(15)?,
             output_tokens: row.get(16)?,
         })
-    }).map_err(|e| e.to_string())?;
+    }).map_err(|e| {
+        let msg = format!("日志详情查询失败 (id={log_id}): {e}");
+        log_proxy(&msg);
+        msg
+    })?;
     Ok(log)
 }
 
@@ -5057,6 +5061,12 @@ async fn list_codex_models() -> Result<Vec<String>, String> {
                 }
             }
             if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                if !id.is_empty() {
+                    models.push(id.to_string());
+                    continue;
+                }
+            }
+            if let Some(id) = item.get("slug").and_then(|v| v.as_str()) {
                 if !id.is_empty() {
                     models.push(id.to_string());
                 }
