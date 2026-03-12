@@ -61,3 +61,54 @@ jobs:
           files: ${{ env.DMG_PATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Tauri app (windows)
+        run: npm run tauri:build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Collect Windows artifacts
+        shell: pwsh
+        run: |
+          $bundle = "src-tauri/target/release/bundle"
+          $files = Get-ChildItem -Recurse $bundle -Include *.msi, *.exe | Select-Object -ExpandProperty FullName
+          if (-not $files) {
+            Write-Error "Windows artifacts not found!"
+            exit 1
+          }
+          "WIN_FILES<<EOF" | Out-File -FilePath $env:GITHUB_ENV -Append
+          ($files -join "`n") | Out-File -FilePath $env:GITHUB_ENV -Append
+          "EOF" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: ${{ env.WIN_FILES }}
+
+      - name: Create GitHub Release (windows assets)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.WIN_FILES }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
