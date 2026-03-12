@@ -4987,6 +4987,7 @@ async fn list_codex_models() -> Result<Vec<String>, String> {
     let client = reqwest::Client::new();
     let path = normalize_models_path("/v1/models");
     let url = build_upstream_url(&path);
+    log_proxy(&format!("models: request -> {url}"));
     let mut headers = reqwest::header::HeaderMap::new();
     let incoming_headers = axum::http::HeaderMap::new();
     apply_upstream_headers(
@@ -5023,17 +5024,47 @@ async fn list_codex_models() -> Result<Vec<String>, String> {
         }
     }
 
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("获取模型失败 (HTTP {status}): {text}"));
+    let status = resp.status().as_u16();
+    let body_bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let body_text = truncate_body(&body_bytes);
+    log_proxy(&format!("models: status {status} body={body_text}"));
+    if !(200..300).contains(&status) {
+        return Err(format!("获取模型失败 (HTTP {status}): {body_text}"));
     }
 
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let mut models = Vec::new();
+    let body: Value = serde_json::from_slice(&body_bytes).map_err(|e| e.to_string())?;
+    let mut models: Vec<String> = Vec::new();
     if let Some(arr) = body.get("data").and_then(|v| v.as_array()) {
         for item in arr {
             if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                if !id.is_empty() {
+                    models.push(id.to_string());
+                    continue;
+                }
+            }
+            if let Some(id) = item.get("model").and_then(|v| v.as_str()) {
+                if !id.is_empty() {
+                    models.push(id.to_string());
+                }
+            }
+        }
+    } else if let Some(arr) = body.get("models").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(id) = item.as_str() {
+                if !id.is_empty() {
+                    models.push(id.to_string());
+                    continue;
+                }
+            }
+            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                if !id.is_empty() {
+                    models.push(id.to_string());
+                }
+            }
+        }
+    } else if let Some(arr) = body.get("result").and_then(|v| v.get("models")).and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(id) = item.as_str() {
                 if !id.is_empty() {
                     models.push(id.to_string());
                 }
@@ -5042,6 +5073,9 @@ async fn list_codex_models() -> Result<Vec<String>, String> {
     }
     models.sort();
     models.dedup();
+    if models.is_empty() {
+        return Err(format!("模型列表为空，请检查账号权限或稍后重试。响应：{body_text}"));
+    }
     Ok(models)
 }
 

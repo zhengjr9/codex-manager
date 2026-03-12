@@ -206,6 +206,7 @@ export default function AccountsPage() {
   const [logsCollapsed, setLogsCollapsed] = useState(true)
   const [expandedRowData, setExpandedRowData] = useState<Record<number, ProxyLogDetail>>({})
   const [expandedRowLoading, setExpandedRowLoading] = useState<Set<number>>(new Set())
+  const [expandedRowError, setExpandedRowError] = useState<Record<number, string>>({})
 
   // 初始加载账号
   useEffect(() => {
@@ -369,12 +370,18 @@ export default function AccountsPage() {
   }
 
   async function loadExpandedRow(id: number) {
-    if (expandedRowData[id]) return
+    if (expandedRowData[id] && !expandedRowError[id]) return
     setExpandedRowLoading(prev => new Set(prev).add(id))
+    setExpandedRowError(prev => {
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
     try {
       const detail = await accountService.getProxyLogDetail(id)
       setExpandedRowData(prev => ({ ...prev, [id]: detail }))
     } catch (e) {
+      setExpandedRowError(prev => ({ ...prev, [id]: String(e) }))
       message.error(String(e))
     } finally {
       setExpandedRowLoading(prev => {
@@ -916,7 +923,17 @@ export default function AccountsPage() {
             expandedRowRender: (record) => {
               const detail = expandedRowData[record.id]
               if (expandedRowLoading.has(record.id)) return <Spin size="small" />
-              if (!detail) return <Text type="secondary" className="text-xs">加载失败</Text>
+              if (!detail) {
+                const err = expandedRowError[record.id]
+                return (
+                  <div className="flex items-center gap-2">
+                    <Text type="secondary" className="text-xs">
+                      {err ? `加载失败: ${err}` : '加载失败'}
+                    </Text>
+                    <Button size="small" onClick={() => loadExpandedRow(record.id)}>重试</Button>
+                  </div>
+                )
+              }
               return (
                 <div className="space-y-3 py-2 px-1">
                   <div className="space-y-1">
