@@ -993,24 +993,29 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
         short_map = build_short_name_map(&names);
     }
 
-    if let Some(system) = body.get("system") {
-        let parts = anthropic_system_parts(system);
-        if !parts.is_empty() {
-            let mut msg = serde_json::json!({
-                "type": "message",
-                "role": "developer",
-                "content": []
-            });
-            let mut content = Vec::new();
-            for part in parts {
-                content.push(serde_json::json!({
-                    "type": "input_text",
-                    "text": part
-                }));
-            }
-            msg["content"] = Value::Array(content);
-            template["input"].as_array_mut().unwrap().push(msg);
+    let mut system_parts = if let Some(system) = body.get("system") {
+        anthropic_system_parts(system)
+    } else {
+        Vec::new()
+    };
+    if system_parts.first().map(|s| s.as_str()) != Some(CLAUDE_CODE_SYSTEM_PROMPT) {
+        system_parts.insert(0, CLAUDE_CODE_SYSTEM_PROMPT.to_string());
+    }
+    if !system_parts.is_empty() {
+        let mut msg = serde_json::json!({
+            "type": "message",
+            "role": "developer",
+            "content": []
+        });
+        let mut content = Vec::new();
+        for part in system_parts {
+            content.push(serde_json::json!({
+                "type": "input_text",
+                "text": part
+            }));
         }
+        msg["content"] = Value::Array(content);
+        template["input"].as_array_mut().unwrap().push(msg);
     }
 
     if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
@@ -2561,6 +2566,7 @@ const CODEX_CLIENT_VERSION: &str = "0.101.0";
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464";
 const CODEX_OPENAI_BETA: &str = "responses=experimental";
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CLAUDE_CODE_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 static PROXY_REQ_ID: AtomicUsize = AtomicUsize::new(1);
 
 fn front_proxy_max_body_bytes() -> usize {
