@@ -228,7 +228,13 @@ export default function AccountsPage() {
     accountService.getProxyConfig()
       .then(cfg => {
         if (!active) return
-        setProxyConfig(cfg)
+        const normalized = {
+          ...cfg,
+          upstream_mode: 'codex',
+          custom_openai_base_url: null,
+          custom_openai_api_key: null,
+        }
+        setProxyConfig(normalized)
         setApiKeyInput(cfg.api_key ?? '')
       })
       .catch(() => {})
@@ -236,12 +242,6 @@ export default function AccountsPage() {
   }, [])
 
   async function refreshCodexModels(showError = true) {
-    if (proxyConfig?.upstream_mode === 'openai_compatible') {
-      if (!proxyConfig.custom_openai_base_url || !proxyConfig.custom_openai_api_key) {
-        setCodexModels(proxyConfig.model_override ? [proxyConfig.model_override] : [])
-        return
-      }
-    }
     setCodexModelsLoading(true)
     try {
       const models = await accountService.listCodexModels()
@@ -259,7 +259,7 @@ export default function AccountsPage() {
   useEffect(() => {
     if (!proxyConfig) return
     refreshCodexModels(false)
-  }, [proxyConfig?.upstream_mode, proxyConfig?.custom_openai_base_url, proxyConfig?.custom_openai_api_key, proxyConfig?.model_override])
+  }, [proxyConfig?.model_override])
 
   async function refreshProxyLogs(page = logsPage, pageSize = logsPageSize) {
     setLogsLoading(true)
@@ -334,9 +334,9 @@ export default function AccountsPage() {
         disable_on_usage_limit: proxyConfig.disable_on_usage_limit,
         model_override: proxyConfig.model_override,
         reasoning_effort_override: proxyConfig.reasoning_effort_override,
-        upstream_mode: proxyConfig.upstream_mode,
-        custom_openai_base_url: proxyConfig.custom_openai_base_url,
-        custom_openai_api_key: proxyConfig.custom_openai_api_key,
+        upstream_mode: 'codex',
+        custom_openai_base_url: null,
+        custom_openai_api_key: null,
       })
       setProxyConfig(cfg)
       setApiKeyInput(cfg.api_key ?? '')
@@ -435,12 +435,7 @@ export default function AccountsPage() {
     setProxyLoading(true)
     try {
       if (checked) {
-        const customMode = proxyConfig?.upstream_mode === 'openai_compatible'
-        if (customMode) {
-          if (!proxyConfig?.custom_openai_base_url || !proxyConfig?.custom_openai_api_key) {
-            throw new Error('请先配置自定义 OpenAI 地址和 API Key。')
-          }
-        } else if (!currentAccount) {
+        if (!currentAccount) {
           throw new Error('没有活跃账号。请先切换至某个账号，或通过 OAuth 登录。')
         }
         await startProxy(proxyPortInput)
@@ -775,9 +770,7 @@ export default function AccountsPage() {
       >
         <div className="flex items-center justify-between text-sm text-gray-600">
           <div>
-            {proxyConfig?.upstream_mode === 'openai_compatible'
-              ? <>代理将 Codex 的 <code>/v1/responses</code> 转换为 OpenAI Chat Completions，并转发到你配置的兼容地址。</>
-              : <>代理拦截本地请求，Round-Robin 轮询账号池转发至 <code>api.openai.com</code>。401 自动刷新 Token，429 冷却 60s 后自动恢复。</>}
+            代理拦截本地请求，Round-Robin 轮询账号池转发至 <code>api.openai.com</code>。401 自动刷新 Token，429 冷却 60s 后自动恢复。
           </div>
           {proxyStatus.running && proxyStatus.port && (
             <div className="flex gap-2 flex-wrap justify-end">
@@ -826,37 +819,6 @@ export default function AccountsPage() {
               </Space>
             </div>
             <div className="flex flex-wrap items-center gap-4 text-sm text-gray-600">
-              <span>上游类型</span>
-              <Select
-                value={proxyConfig.upstream_mode}
-                onChange={(val) => setProxyConfig({
-                  ...proxyConfig,
-                  upstream_mode: val,
-                })}
-                className="w-44"
-                options={[
-                  { label: 'Codex 官方', value: 'codex' },
-                  { label: 'OpenAI 兼容', value: 'openai_compatible' },
-                ]}
-              />
-              {proxyConfig.upstream_mode === 'openai_compatible' && (
-                <>
-                  <span>兼容地址</span>
-                  <Input
-                    placeholder="https://example.com/v1"
-                    value={proxyConfig.custom_openai_base_url ?? ''}
-                    onChange={(e) => setProxyConfig({ ...proxyConfig, custom_openai_base_url: e.target.value || null })}
-                    className="w-80"
-                  />
-                  <span>兼容 Key</span>
-                  <Input.Password
-                    placeholder="sk-..."
-                    value={proxyConfig.custom_openai_api_key ?? ''}
-                    onChange={(e) => setProxyConfig({ ...proxyConfig, custom_openai_api_key: e.target.value || null })}
-                    className="w-72"
-                  />
-                </>
-              )}
               <span>启用流量日志</span>
               <Switch
                 checked={proxyConfig.enable_logging}
@@ -873,33 +835,21 @@ export default function AccountsPage() {
               <Switch
                 checked={proxyConfig.disable_on_usage_limit}
                 onChange={(val) => setProxyConfig({ ...proxyConfig, disable_on_usage_limit: val })}
-                disabled={proxyConfig.upstream_mode === 'openai_compatible'}
               />
               <span>模型覆盖</span>
-              {proxyConfig.upstream_mode === 'openai_compatible' ? (
-                <Input
-                  placeholder="例如 glm-5"
-                  value={proxyConfig.model_override ?? ''}
-                  onChange={(e) => setProxyConfig({ ...proxyConfig, model_override: e.target.value || null })}
-                  className="w-56"
-                />
-              ) : (
-                <>
-                  <Select
-                    allowClear
-                    showSearch
-                    placeholder={codexModelsLoading ? '加载中...' : '按请求'}
-                    value={proxyConfig.model_override ?? undefined}
-                    onChange={(val) => setProxyConfig({ ...proxyConfig, model_override: val ?? null })}
-                    className="w-56"
-                    options={codexModels.map(m => ({ label: m, value: m }))}
-                    notFoundContent={codexModelsLoading ? <Spin size="small" /> : '暂无模型'}
-                  />
-                  <Button size="small" icon={<ReloadOutlined />} loading={codexModelsLoading} onClick={() => refreshCodexModels()}>
-                    刷新模型
-                  </Button>
-                </>
-              )}
+              <Select
+                allowClear
+                showSearch
+                placeholder={codexModelsLoading ? '加载中...' : '按请求'}
+                value={proxyConfig.model_override ?? undefined}
+                onChange={(val) => setProxyConfig({ ...proxyConfig, model_override: val ?? null })}
+                className="w-56"
+                options={codexModels.map(m => ({ label: m, value: m }))}
+                notFoundContent={codexModelsLoading ? <Spin size="small" /> : '暂无模型'}
+              />
+              <Button size="small" icon={<ReloadOutlined />} loading={codexModelsLoading} onClick={() => refreshCodexModels()}>
+                刷新模型
+              </Button>
               <span>思考强度</span>
               <Select
                 allowClear
@@ -917,7 +867,7 @@ export default function AccountsPage() {
               />
             </div>
             <Text type="secondary" className="text-xs">
-              客户端需在 Authorization Bearer 或 x-api-key 中携带 API Key（留空则不校验）。OpenAI 兼容模式下，模型建议直接填写后保存。
+              客户端需在 Authorization Bearer 或 x-api-key 中携带 API Key（留空则不校验）。
             </Text>
           </div>
         ) : (

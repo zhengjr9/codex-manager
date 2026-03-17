@@ -1,18 +1,38 @@
-import { Outlet } from 'react-router-dom'
-import { Layout as AntLayout, Typography } from 'antd'
-import { CodeOutlined } from '@ant-design/icons'
+import { Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { Layout as AntLayout, Menu, Typography } from 'antd'
+import { ApiOutlined, CodeOutlined } from '@ant-design/icons'
 
 const { Header, Content } = AntLayout
 
 export default function Layout() {
+  const location = useLocation()
+  const navigate = useNavigate()
+
   return (
     <AntLayout className="min-h-screen">
-      <Header className="flex items-center gap-3 px-6" style={{ background: '#1a1a2e' }}>
-        <CodeOutlined style={{ color: '#6366f1', fontSize: 22 }} />
-        <Typography.Title level={4} style={{ color: '#fff', margin: 0 }}>
-          Codex Manager
-        </Typography.Title>
-        <span className="text-gray-400 text-sm ml-1">多账号管理</span>
+      <Header className="flex items-center gap-6 px-6" style={{ background: '#1a1a2e' }}>
+        <div className="flex items-center gap-3 shrink-0">
+          <CodeOutlined style={{ color: '#6366f1', fontSize: 22 }} />
+          <Typography.Title level={4} style={{ color: '#fff', margin: 0 }}>
+            Codex Manager
+          </Typography.Title>
+        </div>
+        <Menu
+          mode="horizontal"
+          selectedKeys={[location.pathname === '/openai-compat' ? '/openai-compat' : '/']}
+          onClick={({ key }) => navigate(key)}
+          items={[
+            { key: '/', icon: <CodeOutlined />, label: '账号与 Codex 代理' },
+            { key: '/openai-compat', icon: <ApiOutlined />, label: 'OpenAI 兼容代理' },
+          ]}
+          style={{
+            background: 'transparent',
+            color: '#fff',
+            minWidth: 420,
+            flex: 1,
+          }}
+          theme="dark"
+        />
       </Header>
       <Content className="p-6">
         <Outlet />

@@ -132,6 +132,41 @@ impl Default for ProxyConfig {
 static PROXY_CONFIG: OnceLock<Mutex<ProxyConfig>> = OnceLock::new();
 static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
+fn openai_compat_configs_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home)
+        .join(".codex-manager")
+        .join("openai_compat_configs.json")
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct OpenAICompatModelMapping {
+    alias: String,
+    provider_model: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct OpenAICompatProviderConfig {
+    id: String,
+    provider_name: String,
+    base_url: String,
+    api_key: String,
+    default_model: Option<String>,
+    #[serde(default)]
+    model_mappings: Vec<OpenAICompatModelMapping>,
+    created_at: u64,
+    updated_at: u64,
+}
+
+struct OpenAICompatProxyState {
+    client: reqwest::Client,
+    config: Arc<RwLock<OpenAICompatProviderConfig>>,
+}
+
+static OPENAI_COMPAT_PROXY_SHUTDOWN: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
+static OPENAI_COMPAT_PROXY_PORT: Mutex<Option<u16>> = Mutex::new(None);
+static OPENAI_COMPAT_PROXY_STATE: Mutex<Option<Arc<OpenAICompatProxyState>>> = Mutex::new(None);
+
 // Pending OAuth session (verifier + state + redirect_uri) for manual callback flow
 struct OAuthPending {
     verifier: String,
@@ -176,6 +211,118 @@ fn emit_accounts_updated(reason: &str) {
 
 fn proxy_config_snapshot() -> ProxyConfig {
     proxy_config().lock().unwrap().clone()
+}
+
+fn load_openai_compat_configs() -> Vec<OpenAICompatProviderConfig> {
+    let path = openai_compat_configs_path();
+    if !path.exists() {
+        return vec![];
+    }
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_openai_compat_configs(configs: &[OpenAICompatProviderConfig]) -> Result<(), String> {
+    let path = openai_compat_configs_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let payload = serde_json::to_string_pretty(configs).map_err(|e| e.to_string())?;
+    fs::write(path, payload).map_err(|e| e.to_string())
+}
+
+fn sanitize_openai_compat_mappings(
+    mappings: Vec<OpenAICompatModelMapping>,
+) -> Vec<OpenAICompatModelMapping> {
+    let mut out = Vec::new();
+    for mapping in mappings {
+        let alias = mapping.alias.trim().to_string();
+        let provider_model = mapping.provider_model.trim().to_string();
+        if alias.is_empty() || provider_model.is_empty() {
+            continue;
+        }
+        out.push(OpenAICompatModelMapping { alias, provider_model });
+    }
+    out
+}
+
+fn now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn build_openai_compat_provider_config(
+    id: Option<String>,
+    provider_name: String,
+    base_url: String,
+    api_key: String,
+    default_model: Option<String>,
+    model_mappings: Vec<OpenAICompatModelMapping>,
+    created_at: Option<u64>,
+) -> Result<OpenAICompatProviderConfig, String> {
+    let provider_name = provider_name.trim().to_string();
+    if provider_name.is_empty() {
+        return Err("Provider 命名不能为空".to_string());
+    }
+    let base_url = base_url.trim().trim_end_matches('/').to_string();
+    if base_url.is_empty() {
+        return Err("兼容地址不能为空".to_string());
+    }
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Err("兼容 API Key 不能为空".to_string());
+    }
+    let default_model = default_model
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let now = now_unix_millis();
+    Ok(OpenAICompatProviderConfig {
+        id: id.unwrap_or_else(|| format!("openai-compat-{now}")),
+        provider_name,
+        base_url,
+        api_key,
+        default_model,
+        model_mappings: sanitize_openai_compat_mappings(model_mappings),
+        created_at: created_at.unwrap_or(now),
+        updated_at: now,
+    })
+}
+
+fn openai_compat_exposed_models(config: &OpenAICompatProviderConfig) -> Vec<String> {
+    let mut models = Vec::new();
+    for mapping in &config.model_mappings {
+        if !mapping.alias.is_empty() {
+            models.push(mapping.alias.clone());
+        }
+    }
+    if let Some(default_model) = config.default_model.as_ref().filter(|v| !v.trim().is_empty()) {
+        models.push(default_model.trim().to_string());
+    }
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn map_openai_compat_model(config: &OpenAICompatProviderConfig, requested_model: Option<&str>) -> Option<String> {
+    let requested = requested_model
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .or_else(|| config.default_model.clone())?;
+    for mapping in &config.model_mappings {
+        if mapping.alias.eq_ignore_ascii_case(&requested) {
+            return Some(mapping.provider_model.clone());
+        }
+    }
+    if requested.eq_ignore_ascii_case("glm5") {
+        Some("glm-5".to_string())
+    } else {
+        Some(requested)
+    }
 }
 
 fn normalize_proxy_upstream_mode(value: &str) -> &'static str {
@@ -4380,8 +4527,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         }
 
         let req_headers = req.headers().clone();
-        let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
-        let path = normalize_models_path(path);
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let path = normalize_models_path(&path);
         let mut upstream_path = path.to_string();
         let mut is_anthropic = upstream_path.starts_with("/v1/messages");
         let is_count_tokens = upstream_path.starts_with("/v1/messages/count_tokens");
@@ -6008,6 +6159,592 @@ fn get_anthropic_proxy_status() -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn list_openai_compat_configs() -> Result<Vec<OpenAICompatProviderConfig>, String> {
+    Ok(load_openai_compat_configs())
+}
+
+#[tauri::command]
+fn create_openai_compat_config(
+    provider_name: String,
+    base_url: String,
+    api_key: String,
+    default_model: Option<String>,
+    model_mappings: Vec<OpenAICompatModelMapping>,
+) -> Result<OpenAICompatProviderConfig, String> {
+    let mut configs = load_openai_compat_configs();
+    let config = build_openai_compat_provider_config(
+        None,
+        provider_name,
+        base_url,
+        api_key,
+        default_model,
+        model_mappings,
+        None,
+    )?;
+    configs.push(config.clone());
+    save_openai_compat_configs(&configs)?;
+    Ok(config)
+}
+
+#[tauri::command]
+fn update_openai_compat_config(
+    id: String,
+    provider_name: String,
+    base_url: String,
+    api_key: String,
+    default_model: Option<String>,
+    model_mappings: Vec<OpenAICompatModelMapping>,
+) -> Result<OpenAICompatProviderConfig, String> {
+    let mut configs = load_openai_compat_configs();
+    let idx = configs
+        .iter()
+        .position(|cfg| cfg.id == id)
+        .ok_or_else(|| "配置不存在".to_string())?;
+    let created_at = configs[idx].created_at;
+    let config = build_openai_compat_provider_config(
+        Some(id),
+        provider_name,
+        base_url,
+        api_key,
+        default_model,
+        model_mappings,
+        Some(created_at),
+    )?;
+    configs[idx] = config.clone();
+    save_openai_compat_configs(&configs)?;
+    if let Some(state) = OPENAI_COMPAT_PROXY_STATE.lock().unwrap().clone() {
+        let mut lock = state.config.write().unwrap();
+        if lock.id == config.id {
+            *lock = config.clone();
+        }
+    }
+    Ok(config)
+}
+
+#[tauri::command]
+fn delete_openai_compat_config(id: String) -> Result<bool, String> {
+    let mut configs = load_openai_compat_configs();
+    let before = configs.len();
+    configs.retain(|cfg| cfg.id != id);
+    if configs.len() == before {
+        return Ok(false);
+    }
+    save_openai_compat_configs(&configs)?;
+    Ok(true)
+}
+
+#[tauri::command]
+async fn list_openai_compat_provider_models(config_id: String) -> Result<Vec<String>, String> {
+    let config = load_openai_compat_configs()
+        .into_iter()
+        .find(|cfg| cfg.id == config_id)
+        .ok_or_else(|| "配置不存在".to_string())?;
+    let client = reqwest::Client::new();
+    let url = build_upstream_url_with_base(&config.base_url, "/v1/models");
+    let mut headers = reqwest::header::HeaderMap::new();
+    apply_custom_openai_headers(&mut headers, &config.api_key, false, false);
+    log_proxy(&format!("openai-compat models request -> {url}"));
+    let resp = client
+        .get(&url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    let body_bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let body_text = truncate_body(&body_bytes);
+    log_proxy(&format!("openai-compat models status {status} body={body_text}"));
+    if (200..300).contains(&status) {
+        let body: Value = serde_json::from_slice(&body_bytes).map_err(|e| e.to_string())?;
+        let mut models: Vec<String> = Vec::new();
+        if let Some(arr) = body.get("data").and_then(|v| v.as_array()) {
+            for item in arr {
+                for field in ["id", "model", "slug"] {
+                    if let Some(model) = item.get(field).and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+                        models.push(model.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        models.extend(openai_compat_exposed_models(&config));
+        models.sort();
+        models.dedup();
+        if !models.is_empty() {
+            return Ok(models);
+        }
+    }
+    let fallback = openai_compat_exposed_models(&config);
+    if fallback.is_empty() {
+        return Err("模型列表为空，请先配置默认模型或模型映射".to_string());
+    }
+    Ok(fallback)
+}
+
+#[tauri::command]
+async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Result<Value, String> {
+    {
+        let mut lock = OPENAI_COMPAT_PROXY_SHUTDOWN.lock().unwrap();
+        if let Some(tx) = lock.take() {
+            let _ = tx.send(());
+        }
+    }
+
+    let config = load_openai_compat_configs()
+        .into_iter()
+        .find(|cfg| cfg.id == config_id)
+        .ok_or_else(|| "配置不存在".to_string())?;
+    let proxy_port = port.unwrap_or(8081);
+
+    use axum::{
+        body::Body,
+        extract::State,
+        http::StatusCode,
+        response::Response,
+        routing::any,
+        Router,
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let proxy_state = Arc::new(OpenAICompatProxyState {
+        client,
+        config: Arc::new(RwLock::new(config.clone())),
+    });
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    {
+        let mut lock = OPENAI_COMPAT_PROXY_SHUTDOWN.lock().unwrap();
+        *lock = Some(shutdown_tx);
+    }
+
+    async fn openai_compat_proxy_handler(
+        State(state): State<Arc<OpenAICompatProxyState>>,
+        req: axum::http::Request<Body>,
+    ) -> Response<Body> {
+        if req.method() == axum::http::Method::OPTIONS {
+            return Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
+                .header("Access-Control-Allow-Headers", "*")
+                .header("Access-Control-Max-Age", "86400")
+                .body(Body::empty())
+                .unwrap();
+        }
+
+        let config = state.config.read().unwrap().clone();
+        let request_id = PROXY_REQ_ID.fetch_add(1, Ordering::SeqCst);
+        let req_headers = req.headers().clone();
+        if !proxy_api_key_valid(&req_headers) {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("Access-Control-Allow-Origin", "*")
+                .body(Body::from("Unauthorized"))
+                .unwrap();
+        }
+
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
+            .unwrap_or(reqwest::Method::GET);
+        let method_label = method.to_string();
+        let started_at = std::time::Instant::now();
+        let request_headers_json = headers_to_json_string(sanitize_headers(&req_headers));
+
+        if path == "/v1/models" || path.starts_with("/v1/models?") {
+            let models = openai_compat_exposed_models(&config);
+            let response_body = build_local_models_response(&models);
+            let entry = ProxyLogEntry {
+                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                method: method_label,
+                path: path.clone(),
+                request_url: Some("local:/v1/models".to_string()),
+                status: StatusCode::OK.as_u16(),
+                duration_ms: started_at.elapsed().as_millis() as u64,
+                proxy_account_id: config.provider_name.clone(),
+                account_id: None,
+                error: None,
+                model: models.first().cloned(),
+                request_headers: request_headers_json,
+                response_headers: headers_to_json_string(vec![
+                    ("content-type".to_string(), "application/json".to_string()),
+                ]),
+                request_body: None,
+                response_body: Some(truncate_body(&response_body)),
+                input_tokens: None,
+                output_tokens: None,
+            };
+            let _ = insert_proxy_log(&entry);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Access-Control-Allow-Headers", "*")
+                .body(Body::from(response_body))
+                .unwrap();
+        }
+
+        let body_bytes = match axum::body::to_bytes(req.into_body(), front_proxy_max_body_bytes()).await {
+            Ok(b) => b,
+            Err(_) => {
+                return Response::builder()
+                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(Body::from("Request body too large"))
+                    .unwrap();
+            }
+        };
+        let mut request_body_text = if body_bytes.is_empty() {
+            None
+        } else {
+            Some(truncate_body(&body_bytes))
+        };
+        let mut request_model = extract_model(&body_bytes);
+        let mut upstream_path = path.clone();
+        let custom_responses_path = upstream_path == "/v1/responses" || upstream_path.starts_with("/v1/responses?");
+        let mut upstream_body_bytes = body_bytes.clone();
+        let mut is_stream = req_headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("text/event-stream"))
+            .unwrap_or(false);
+        let mut translated_request_json: Option<Value> = None;
+
+        if custom_responses_path {
+            if method != reqwest::Method::POST {
+                return Response::builder()
+                    .status(StatusCode::METHOD_NOT_ALLOWED)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(Body::from("Method not allowed"))
+                    .unwrap();
+            }
+            let mut request_json: Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Body::from(format!("Invalid JSON: {err}")))
+                        .unwrap();
+                }
+            };
+            let mapped_model = map_openai_compat_model(
+                &config,
+                request_json.get("model").and_then(|v| v.as_str()),
+            )
+            .ok_or_else(|| "请先配置默认模型或模型映射".to_string())
+            .unwrap_or_default();
+            let mut temp_cfg = proxy_config_snapshot();
+            temp_cfg.model_override = Some(mapped_model);
+            let (chat_request, stream) =
+                match convert_responses_request_to_chat_completions(&request_json, &temp_cfg) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header("Access-Control-Allow-Origin", "*")
+                            .body(Body::from(err))
+                            .unwrap();
+                    }
+                };
+            request_json["model"] = serde_json::json!(
+                request_json.get("model").and_then(|v| v.as_str()).unwrap_or(
+                    config.default_model.as_deref().unwrap_or("")
+                )
+            );
+            request_model = request_json.get("model").and_then(|v| v.as_str()).map(|v| v.to_string());
+            request_body_text = Some(truncate_body(&serde_json::to_vec(&chat_request).unwrap_or_default()));
+            upstream_body_bytes = serde_json::to_vec(&chat_request).unwrap_or_default().into();
+            upstream_path = "/v1/chat/completions".to_string();
+            translated_request_json = Some(chat_request);
+            is_stream = stream;
+        } else if upstream_path == "/v1/chat/completions" || upstream_path.starts_with("/v1/chat/completions?") {
+            if let Ok(mut request_json) = serde_json::from_slice::<Value>(&body_bytes) {
+                if let Some(mapped_model) = map_openai_compat_model(
+                    &config,
+                    request_json.get("model").and_then(|v| v.as_str()),
+                ) {
+                    request_json["model"] = serde_json::json!(mapped_model);
+                    request_model = request_json.get("model").and_then(|v| v.as_str()).map(|v| v.to_string());
+                    request_body_text = Some(truncate_body(&serde_json::to_vec(&request_json).unwrap_or_default()));
+                    upstream_body_bytes = serde_json::to_vec(&request_json).unwrap_or_default().into();
+                }
+            }
+        }
+
+        let target = build_upstream_url_with_base(&config.base_url, &upstream_path);
+        log_proxy(&format!("req#{request_id} start {method_label} {path} -> {target}"));
+        let request_url = Some(target.clone());
+
+        let mut upstream_headers = reqwest::header::HeaderMap::new();
+        apply_custom_openai_headers(
+            &mut upstream_headers,
+            &config.api_key,
+            !upstream_body_bytes.is_empty(),
+            is_stream,
+        );
+
+        let upstream_resp = match state.client
+            .request(method.clone(), &target)
+            .headers(upstream_headers)
+            .body(upstream_body_bytes.clone())
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                let entry = ProxyLogEntry {
+                    timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    method: method_label,
+                    path: path.clone(),
+                    request_url,
+                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                    duration_ms: started_at.elapsed().as_millis() as u64,
+                    proxy_account_id: config.provider_name.clone(),
+                    account_id: None,
+                    error: Some(err.to_string()),
+                    model: request_model,
+                    request_headers: request_headers_json,
+                    response_headers: None,
+                    request_body: request_body_text,
+                    response_body: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                };
+                let _ = insert_proxy_log(&entry);
+                return Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(Body::from(format!("Upstream error: {err}")))
+                    .unwrap();
+            }
+        };
+
+        let upstream_status = upstream_resp.status();
+        let response_headers_json = headers_to_json_string(sanitize_reqwest_headers(upstream_resp.headers()));
+
+        if custom_responses_path && is_stream && upstream_status.is_success() {
+            let entry = ProxyLogEntry {
+                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                method: method_label,
+                path: path.clone(),
+                request_url,
+                status: upstream_status.as_u16(),
+                duration_ms: started_at.elapsed().as_millis() as u64,
+                proxy_account_id: config.provider_name.clone(),
+                account_id: None,
+                error: None,
+                model: request_model,
+                request_headers: request_headers_json,
+                response_headers: headers_to_json_string(vec![
+                    ("content-type".to_string(), "text/event-stream".to_string()),
+                ]),
+                request_body: request_body_text,
+                response_body: None,
+                input_tokens: None,
+                output_tokens: None,
+            };
+            return build_custom_openai_stream_response(
+                upstream_resp,
+                translated_request_json.unwrap_or_else(|| serde_json::json!({})),
+                entry,
+            )
+            .await;
+        }
+
+        let headers = upstream_resp.headers().clone();
+        let bytes = upstream_resp.bytes().await.unwrap_or_default();
+        if custom_responses_path && upstream_status.is_success() {
+            let request_json = translated_request_json.unwrap_or_else(|| serde_json::json!({}));
+            match convert_chat_completions_non_stream_to_responses(&request_json, &bytes) {
+                Ok((converted, input_tokens, output_tokens, response_body_text)) => {
+                    let entry = ProxyLogEntry {
+                        timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                        method: method_label,
+                        path: path.clone(),
+                        request_url,
+                        status: upstream_status.as_u16(),
+                        duration_ms: started_at.elapsed().as_millis() as u64,
+                        proxy_account_id: config.provider_name.clone(),
+                        account_id: None,
+                        error: None,
+                        model: request_model,
+                        request_headers: request_headers_json,
+                        response_headers: headers_to_json_string(vec![
+                            ("content-type".to_string(), "application/json".to_string()),
+                        ]),
+                        request_body: request_body_text,
+                        response_body: response_body_text,
+                        input_tokens,
+                        output_tokens,
+                    };
+                    let _ = insert_proxy_log(&entry);
+                    return Response::builder()
+                        .status(axum::http::StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::OK))
+                        .header("Content-Type", "application/json")
+                        .header("Access-Control-Allow-Origin", "*")
+                        .header("Access-Control-Allow-Headers", "*")
+                        .body(Body::from(converted))
+                        .unwrap();
+                }
+                Err(err) => {
+                    let entry = ProxyLogEntry {
+                        timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                        method: method_label,
+                        path: path.clone(),
+                        request_url,
+                        status: StatusCode::BAD_GATEWAY.as_u16(),
+                        duration_ms: started_at.elapsed().as_millis() as u64,
+                        proxy_account_id: config.provider_name.clone(),
+                        account_id: None,
+                        error: Some(err.clone()),
+                        model: request_model,
+                        request_headers: request_headers_json,
+                        response_headers: response_headers_json,
+                        request_body: request_body_text,
+                        response_body: Some(truncate_body(&bytes)),
+                        input_tokens: None,
+                        output_tokens: None,
+                    };
+                    let _ = insert_proxy_log(&entry);
+                    return Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Body::from(err))
+                        .unwrap();
+                }
+            }
+        }
+
+        let response_body_text = if bytes.is_empty() { None } else { Some(truncate_body(&bytes)) };
+        let (input_tokens, output_tokens) = extract_usage(&bytes);
+        let entry = ProxyLogEntry {
+            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            method: method_label,
+            path: path.clone(),
+            request_url,
+            status: upstream_status.as_u16(),
+            duration_ms: started_at.elapsed().as_millis() as u64,
+            proxy_account_id: config.provider_name.clone(),
+            account_id: None,
+            error: None,
+            model: request_model,
+            request_headers: request_headers_json,
+            response_headers: response_headers_json,
+            request_body: request_body_text,
+            response_body: response_body_text,
+            input_tokens,
+            output_tokens,
+        };
+        let _ = insert_proxy_log(&entry);
+        let mut builder = Response::builder()
+            .status(axum::http::StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::OK))
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Allow-Headers", "*");
+        for (k, v) in headers.iter() {
+            if skip_response_header(k.as_str()) {
+                continue;
+            }
+            if let (Ok(name), Ok(val)) = (
+                axum::http::HeaderName::from_bytes(k.as_str().as_bytes()),
+                axum::http::HeaderValue::from_bytes(v.as_bytes()),
+            ) {
+                builder = builder.header(name, val);
+            }
+        }
+        builder.body(Body::from(bytes)).unwrap()
+    }
+
+    let app = Router::new()
+        .fallback(any(openai_compat_proxy_handler))
+        .with_state(proxy_state.clone());
+
+    let addr = format!("localhost:{proxy_port}");
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_waiter = shutdown_notify.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = shutdown_rx.await;
+        shutdown_waiter.notify_waiters();
+    });
+
+    {
+        let mut lock = OPENAI_COMPAT_PROXY_STATE.lock().unwrap();
+        *lock = Some(proxy_state.clone());
+    }
+    {
+        let mut lock = OPENAI_COMPAT_PROXY_PORT.lock().unwrap();
+        *lock = Some(proxy_port);
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let serve_result = run_proxy_server(&addr, app, shutdown_notify).await;
+        if let Err(err) = serve_result {
+            log_proxy(&format!("openai compat proxy exited with error: {err}"));
+        }
+        let mut lock = OPENAI_COMPAT_PROXY_PORT.lock().unwrap();
+        *lock = None;
+        let mut lock = OPENAI_COMPAT_PROXY_STATE.lock().unwrap();
+        *lock = None;
+    });
+
+    Ok(serde_json::json!({
+        "success": true,
+        "port": proxy_port,
+        "base_url": format!("http://127.0.0.1:{proxy_port}"),
+        "config_id": config.id,
+        "provider_name": config.provider_name,
+    }))
+}
+
+#[tauri::command]
+fn stop_openai_compat_proxy() -> Result<Value, String> {
+    let mut lock = OPENAI_COMPAT_PROXY_SHUTDOWN.lock().unwrap();
+    if let Some(tx) = lock.take() {
+        let _ = tx.send(());
+        Ok(serde_json::json!({ "success": true }))
+    } else {
+        Ok(serde_json::json!({ "success": false }))
+    }
+}
+
+#[tauri::command]
+fn get_openai_compat_proxy_status() -> Result<Value, String> {
+    let port = *OPENAI_COMPAT_PROXY_PORT.lock().unwrap();
+    let running = if let Some(port) = port {
+        let addr = format!("127.0.0.1:{port}");
+        let socket_addr: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e: std::net::AddrParseError| e.to_string())?;
+        std::net::TcpStream::connect_timeout(
+            &socket_addr,
+            std::time::Duration::from_millis(200),
+        )
+        .is_ok()
+    } else {
+        false
+    };
+    let state = OPENAI_COMPAT_PROXY_STATE.lock().unwrap();
+    let (config_id, provider_name) = if let Some(state) = &*state {
+        let config = state.config.read().unwrap();
+        (Some(config.id.clone()), Some(config.provider_name.clone()))
+    } else {
+        (None, None)
+    };
+    Ok(serde_json::json!({
+        "running": running,
+        "port": port,
+        "config_id": config_id,
+        "provider_name": provider_name,
+    }))
+}
+
+#[tauri::command]
 fn stop_api_proxy() -> Result<Value, String> {
     let mut lock = PROXY_SHUTDOWN.lock().unwrap();
     if let Some(tx) = lock.take() {
@@ -6599,6 +7336,14 @@ pub fn run() {
             stop_api_proxy,
             reload_proxy_accounts,
             get_proxy_status,
+            list_openai_compat_configs,
+            create_openai_compat_config,
+            update_openai_compat_config,
+            delete_openai_compat_config,
+            list_openai_compat_provider_models,
+            start_openai_compat_proxy,
+            stop_openai_compat_proxy,
+            get_openai_compat_proxy_status,
             get_proxy_config,
             update_proxy_config,
             generate_proxy_api_key,

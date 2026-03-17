@@ -4,6 +4,7 @@ import { RouterProvider, createHashRouter } from 'react-router-dom'
 import { ConfigProvider, theme } from 'antd'
 import Layout from './components/layout/Layout'
 import AccountsPage from './pages/AccountsPage'
+import OpenAICompatProxyPage from './pages/OpenAICompatProxyPage'
 import './index.css'
 
 const router = createHashRouter([
@@ -12,6 +13,7 @@ const router = createHashRouter([
     element: <Layout />,
     children: [
       { index: true, element: <AccountsPage /> },
+      { path: 'openai-compat', element: <OpenAICompatProxyPage /> },
     ],
   },
 ])

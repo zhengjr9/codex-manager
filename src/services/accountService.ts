@@ -25,6 +25,29 @@ export interface ProxyStatus {
   blocked: number
 }
 
+export interface OpenAICompatModelMapping {
+  alias: string
+  provider_model: string
+}
+
+export interface OpenAICompatConfig {
+  id: string
+  provider_name: string
+  base_url: string
+  api_key: string
+  default_model: string | null
+  model_mappings: OpenAICompatModelMapping[]
+  created_at: number
+  updated_at: number
+}
+
+export interface OpenAICompatProxyStatus {
+  running: boolean
+  port: number | null
+  config_id: string | null
+  provider_name: string | null
+}
+
 export interface ProxyConfig {
   api_key: string | null
   enable_logging: boolean
@@ -116,6 +139,34 @@ export const accountService = {
     invoke<ProxyRequestLog[]>('get_proxy_logs_filtered', payload ?? {}),
   getProxyLogDetail: (logId: number) => invoke<ProxyLogDetail>('get_proxy_log_detail', { log_id: logId }),
   listCodexModels: () => invoke<string[]>('list_codex_models'),
+
+  // OpenAI Compat Proxy
+  listOpenAICompatConfigs: () => invoke<OpenAICompatConfig[]>('list_openai_compat_configs'),
+  createOpenAICompatConfig: (payload: {
+    provider_name: string
+    base_url: string
+    api_key: string
+    default_model?: string | null
+    model_mappings?: OpenAICompatModelMapping[]
+  }) => invoke<OpenAICompatConfig>('create_openai_compat_config', payload),
+  updateOpenAICompatConfig: (payload: {
+    id: string
+    provider_name: string
+    base_url: string
+    api_key: string
+    default_model?: string | null
+    model_mappings?: OpenAICompatModelMapping[]
+  }) => invoke<OpenAICompatConfig>('update_openai_compat_config', payload),
+  deleteOpenAICompatConfig: (id: string) => invoke<boolean>('delete_openai_compat_config', { id }),
+  listOpenAICompatProviderModels: (configId: string) =>
+    invoke<string[]>('list_openai_compat_provider_models', { configId }),
+  startOpenAICompatProxy: (configId: string, port?: number) =>
+    invoke<{ success: boolean; port: number; base_url: string; config_id: string; provider_name: string }>('start_openai_compat_proxy', {
+      configId,
+      port: port ?? 8081,
+    }),
+  stopOpenAICompatProxy: () => invoke<{ success: boolean }>('stop_openai_compat_proxy'),
+  getOpenAICompatProxyStatus: () => invoke<OpenAICompatProxyStatus>('get_openai_compat_proxy_status'),
 
   // Anthropic Proxy
   listAnthropicKeys: () => invoke<AnthropicKeyEntry[]>('list_anthropic_keys'),
