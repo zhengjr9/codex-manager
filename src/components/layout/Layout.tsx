@@ -1,6 +1,6 @@
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { Layout as AntLayout, Menu, Typography } from 'antd'
-import { ApiOutlined, CodeOutlined } from '@ant-design/icons'
+import { ApiOutlined, CodeOutlined, DatabaseOutlined } from '@ant-design/icons'
 
 const { Header, Content } = AntLayout
 
@@ -19,11 +19,18 @@ export default function Layout() {
         </div>
         <Menu
           mode="horizontal"
-          selectedKeys={[location.pathname === '/openai-compat' ? '/openai-compat' : '/']}
+          selectedKeys={[
+            location.pathname === '/openai-compat'
+              ? '/openai-compat'
+              : location.pathname === '/ai-cache'
+                ? '/ai-cache'
+                : '/',
+          ]}
           onClick={({ key }) => navigate(key)}
           items={[
             { key: '/', icon: <CodeOutlined />, label: '账号与 Codex 代理' },
             { key: '/openai-compat', icon: <ApiOutlined />, label: 'AI代理' },
+            { key: '/ai-cache', icon: <DatabaseOutlined />, label: 'AI缓存' },
           ]}
           style={{
             background: 'transparent',

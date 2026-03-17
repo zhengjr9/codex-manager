@@ -58,6 +58,15 @@ export interface ProxyConfig {
   upstream_mode: string
   custom_openai_base_url: string | null
   custom_openai_api_key: string | null
+  enable_exact_cache: boolean
+  exact_cache_ttl_minutes: number
+  exact_cache_max_entries: number
+  enable_semantic_cache: boolean
+  semantic_cache_threshold: number
+  vector_provider_mode: string
+  vector_api_base_url: string | null
+  vector_api_key: string | null
+  vector_model: string | null
 }
 
 export interface ProxyRequestLog {
@@ -102,6 +111,52 @@ export interface ProxyTokenStats {
   avg_duration_ms: number
   top_models: ProxyTokenStatsItem[]
   top_accounts: ProxyTokenStatsItem[]
+}
+
+export interface AICacheOverview {
+  window_hours: number
+  total_requests: number
+  cache_eligible_requests: number
+  local_hits: number
+  local_misses: number
+  bypassed_requests: number
+  provider_cached_requests: number
+  local_hit_rate: number
+  input_tokens: number
+  output_tokens: number
+  local_cached_input_tokens: number
+  provider_cached_input_tokens: number
+  total_cached_input_tokens: number
+  avg_hit_duration_ms: number
+  avg_miss_duration_ms: number
+}
+
+export interface AICacheTrendPoint {
+  bucket: string
+  total_requests: number
+  cache_eligible_requests: number
+  local_hits: number
+  provider_cached_input_tokens: number
+  local_cached_input_tokens: number
+  input_tokens: number
+  output_tokens: number
+}
+
+export interface AICacheEntrySummary {
+  id: number
+  cache_key: string
+  path: string
+  model: string | null
+  cache_type: string
+  hit_count: number
+  input_tokens: number
+  output_tokens: number
+  local_cached_input_tokens: number
+  provider_cached_input_tokens: number
+  created_at: string
+  last_hit_at: string
+  expires_at: string
+  response_preview: string | null
 }
 
 export interface AnthropicKeyEntry {
@@ -150,6 +205,15 @@ export const accountService = {
     upstream_mode?: string | null
     custom_openai_base_url?: string | null
     custom_openai_api_key?: string | null
+    enable_exact_cache?: boolean
+    exact_cache_ttl_minutes?: number
+    exact_cache_max_entries?: number
+    enable_semantic_cache?: boolean
+    semantic_cache_threshold?: number
+    vector_provider_mode?: string | null
+    vector_api_base_url?: string | null
+    vector_api_key?: string | null
+    vector_model?: string | null
   }) =>
     invoke<ProxyConfig>('update_proxy_config', payload),
   generateProxyApiKey: () => invoke<string>('generate_proxy_api_key'),
@@ -161,6 +225,13 @@ export const accountService = {
   getProxyLogDetail: (logId: number) => invoke<ProxyLogDetail>('get_proxy_log_detail', { logId }),
   getProxyTokenStats: (hours?: number) =>
     invoke<ProxyTokenStats>('get_proxy_token_stats', { hours: hours ?? 24 }),
+  getAICacheOverview: (hours?: number) =>
+    invoke<AICacheOverview>('get_ai_cache_overview', { hours: hours ?? 24 }),
+  getAICacheTrend: (hours?: number) =>
+    invoke<AICacheTrendPoint[]>('get_ai_cache_trend', { hours: hours ?? 24 }),
+  listAICacheEntries: (payload?: { limit?: number; offset?: number }) =>
+    invoke<AICacheEntrySummary[]>('list_ai_cache_entries', payload ?? {}),
+  clearAICache: () => invoke<{ success: boolean }>('clear_ai_cache'),
   listCodexModels: () => invoke<string[]>('list_codex_models'),
 
   // OpenAI Compat Proxy

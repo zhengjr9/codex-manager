@@ -5,6 +5,7 @@ import { ConfigProvider, theme } from 'antd'
 import Layout from './components/layout/Layout'
 import AccountsPage from './pages/AccountsPage'
 import OpenAICompatProxyPage from './pages/OpenAICompatProxyPage'
+import AICachePage from './pages/AICachePage'
 import './index.css'
 
 const router = createHashRouter([
@@ -14,6 +15,7 @@ const router = createHashRouter([
     children: [
       { index: true, element: <AccountsPage /> },
       { path: 'openai-compat', element: <OpenAICompatProxyPage /> },
+      { path: 'ai-cache', element: <AICachePage /> },
     ],
   },
 ])

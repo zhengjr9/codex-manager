@@ -3,7 +3,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -107,10 +107,48 @@ struct ProxyConfig {
     custom_openai_base_url: Option<String>,
     #[serde(default)]
     custom_openai_api_key: Option<String>,
+    #[serde(default = "default_enable_exact_cache")]
+    enable_exact_cache: bool,
+    #[serde(default = "default_exact_cache_ttl_minutes")]
+    exact_cache_ttl_minutes: i64,
+    #[serde(default = "default_exact_cache_max_entries")]
+    exact_cache_max_entries: usize,
+    #[serde(default)]
+    enable_semantic_cache: bool,
+    #[serde(default = "default_semantic_cache_threshold")]
+    semantic_cache_threshold: f64,
+    #[serde(default = "default_vector_provider_mode")]
+    vector_provider_mode: String,
+    #[serde(default)]
+    vector_api_base_url: Option<String>,
+    #[serde(default)]
+    vector_api_key: Option<String>,
+    #[serde(default)]
+    vector_model: Option<String>,
 }
 
 fn default_proxy_upstream_mode() -> String {
     "codex".to_string()
+}
+
+fn default_enable_exact_cache() -> bool {
+    true
+}
+
+fn default_exact_cache_ttl_minutes() -> i64 {
+    60
+}
+
+fn default_exact_cache_max_entries() -> usize {
+    2000
+}
+
+fn default_semantic_cache_threshold() -> f64 {
+    0.95
+}
+
+fn default_vector_provider_mode() -> String {
+    "local".to_string()
 }
 
 impl Default for ProxyConfig {
@@ -125,6 +163,15 @@ impl Default for ProxyConfig {
             upstream_mode: default_proxy_upstream_mode(),
             custom_openai_base_url: None,
             custom_openai_api_key: None,
+            enable_exact_cache: default_enable_exact_cache(),
+            exact_cache_ttl_minutes: default_exact_cache_ttl_minutes(),
+            exact_cache_max_entries: default_exact_cache_max_entries(),
+            enable_semantic_cache: false,
+            semantic_cache_threshold: default_semantic_cache_threshold(),
+            vector_provider_mode: default_vector_provider_mode(),
+            vector_api_base_url: None,
+            vector_api_key: None,
+            vector_model: None,
         }
     }
 }
@@ -406,6 +453,12 @@ struct ProxyLogDetail {
     response_body: Option<String>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
+    cache_status: Option<String>,
+    cache_key: Option<String>,
+    cache_eligible: Option<bool>,
+    cache_bypass_reason: Option<String>,
+    local_cached_input_tokens: Option<i64>,
+    provider_cached_input_tokens: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -431,6 +484,66 @@ struct ProxyTokenStats {
     top_accounts: Vec<ProxyTokenStatsItem>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct AICacheOverview {
+    window_hours: i64,
+    total_requests: i64,
+    cache_eligible_requests: i64,
+    local_hits: i64,
+    local_misses: i64,
+    bypassed_requests: i64,
+    provider_cached_requests: i64,
+    local_hit_rate: f64,
+    input_tokens: i64,
+    output_tokens: i64,
+    local_cached_input_tokens: i64,
+    provider_cached_input_tokens: i64,
+    total_cached_input_tokens: i64,
+    avg_hit_duration_ms: f64,
+    avg_miss_duration_ms: f64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AICacheTrendPoint {
+    bucket: String,
+    total_requests: i64,
+    cache_eligible_requests: i64,
+    local_hits: i64,
+    provider_cached_input_tokens: i64,
+    local_cached_input_tokens: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AICacheEntrySummary {
+    id: i64,
+    cache_key: String,
+    path: String,
+    model: Option<String>,
+    cache_type: String,
+    hit_count: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    local_cached_input_tokens: i64,
+    provider_cached_input_tokens: i64,
+    created_at: String,
+    last_hit_at: String,
+    expires_at: String,
+    response_preview: Option<String>,
+}
+
+struct LocalCacheHit {
+    cache_key: String,
+    body: Bytes,
+    status: u16,
+    content_type: String,
+    model: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    provider_cached_input_tokens: i64,
+}
+
 struct ProxyLogEntry {
     timestamp: String,
     method: String,
@@ -448,6 +561,41 @@ struct ProxyLogEntry {
     response_body: Option<String>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
+    cache_status: Option<String>,
+    cache_key: Option<String>,
+    cache_eligible: Option<bool>,
+    cache_bypass_reason: Option<String>,
+    local_cached_input_tokens: Option<i64>,
+    provider_cached_input_tokens: Option<i64>,
+}
+
+impl Default for ProxyLogEntry {
+    fn default() -> Self {
+        Self {
+            timestamp: String::new(),
+            method: String::new(),
+            path: String::new(),
+            request_url: None,
+            status: 0,
+            duration_ms: 0,
+            proxy_account_id: String::new(),
+            account_id: None,
+            error: None,
+            model: None,
+            request_headers: None,
+            response_headers: None,
+            request_body: None,
+            response_body: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_status: None,
+            cache_key: None,
+            cache_eligible: None,
+            cache_bypass_reason: None,
+            local_cached_input_tokens: None,
+            provider_cached_input_tokens: None,
+        }
+    }
 }
 
 fn proxy_log_db() -> Result<Connection, String> {
@@ -466,6 +614,30 @@ fn init_proxy_log_db(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ai_cache_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cache_key TEXT NOT NULL UNIQUE,
+            cache_type TEXT NOT NULL,
+            path TEXT NOT NULL,
+            method TEXT NOT NULL,
+            model TEXT,
+            status INTEGER NOT NULL,
+            content_type TEXT NOT NULL,
+            response_body BLOB NOT NULL,
+            response_preview TEXT,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            local_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+            provider_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_hit_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     ensure_log_columns(conn)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_request_logs_timestamp ON request_logs (id DESC)",
@@ -474,6 +646,16 @@ fn init_proxy_log_db(conn: &Connection) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_request_logs_status ON request_logs (status)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_cache_entries_expires_at ON ai_cache_entries (expires_at)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_cache_entries_last_hit_at ON ai_cache_entries (last_hit_at DESC)",
         [],
     )
     .map_err(|e| e.to_string())?;
@@ -501,6 +683,12 @@ fn ensure_log_columns(conn: &Connection) -> Result<(), String> {
         ("model", "TEXT"),
         ("input_tokens", "INTEGER"),
         ("output_tokens", "INTEGER"),
+        ("cache_status", "TEXT"),
+        ("cache_key", "TEXT"),
+        ("cache_eligible", "INTEGER"),
+        ("cache_bypass_reason", "TEXT"),
+        ("local_cached_input_tokens", "INTEGER"),
+        ("provider_cached_input_tokens", "INTEGER"),
     ];
     for (name, ty) in required {
         if !cols.contains(name) {
@@ -511,14 +699,97 @@ fn ensure_log_columns(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn extract_provider_cached_input_tokens_from_value(value: &Value) -> i64 {
+    if let Some(usage) = value.get("usage") {
+        if let Some(v) = usage
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_i64())
+            .or_else(|| usage.get("input_tokens_details").and_then(|v| v.get("cached_tokens")).and_then(|v| v.as_i64()))
+            .or_else(|| usage.get("prompt_tokens_details").and_then(|v| v.get("cached_tokens")).and_then(|v| v.as_i64()))
+        {
+            return v.max(0);
+        }
+    }
+    0
+}
+
+fn extract_provider_cached_input_tokens_from_text(text: Option<&String>) -> Option<i64> {
+    let text = text?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_str(text).ok()?;
+    let cached = extract_provider_cached_input_tokens_from_value(&value);
+    Some(cached)
+}
+
 fn insert_proxy_log(entry: &ProxyLogEntry) -> Result<(), String> {
     let cfg = proxy_config_snapshot();
     if !cfg.enable_logging {
         return Ok(());
     }
+    let (derived_cache_eligible, derived_cache_key, _, derived_bypass_reason) = if cfg.enable_exact_cache {
+        match entry.request_body.as_ref() {
+            Some(body) => evaluate_local_cache_request(&entry.method, &entry.path, body.as_bytes()),
+            None => (false, None, None, Some("empty_body".to_string())),
+        }
+    } else {
+        (false, None, None, Some("exact_cache_disabled".to_string()))
+    };
+    let cache_eligible = entry.cache_eligible.or(Some(derived_cache_eligible));
+    let cache_key = entry.cache_key.clone().or(derived_cache_key);
+    let cache_bypass_reason = entry
+        .cache_bypass_reason
+        .clone()
+        .or_else(|| if cache_eligible == Some(true) { None } else { derived_bypass_reason });
+    let cache_status = entry.cache_status.clone().or_else(|| {
+        if cache_eligible == Some(true) {
+            Some("miss".to_string())
+        } else {
+            Some("bypass".to_string())
+        }
+    });
+    let provider_cached_input_tokens = entry
+        .provider_cached_input_tokens
+        .or_else(|| extract_provider_cached_input_tokens_from_text(entry.response_body.as_ref()));
+    if cache_eligible == Some(true)
+        && cache_status.as_deref() != Some("local_hit")
+        && entry.status >= 200
+        && entry.status < 300
+    {
+        if let (Some(key), Some(response_body)) = (cache_key.as_ref(), entry.response_body.as_ref()) {
+            let content_type = entry
+                .response_headers
+                .as_ref()
+                .and_then(|text| serde_json::from_str::<Vec<(String, String)>>(text).ok())
+                .and_then(|headers| {
+                    headers
+                        .into_iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, value)| value)
+                })
+                .unwrap_or_else(|| "application/json".to_string());
+            let _ = store_local_cache_entry(
+                key,
+                &entry.method,
+                &entry.path,
+                entry.model.as_deref(),
+                entry.status,
+                &content_type,
+                response_body.as_bytes(),
+                entry.input_tokens,
+                entry.output_tokens,
+                provider_cached_input_tokens,
+            );
+        }
+    }
     let conn = proxy_log_db()?;
     conn.execute(
-        "INSERT INTO request_logs (timestamp, method, path, request_url, status, duration_ms, proxy_account_id, account_id, error, request_headers, response_headers, request_body, response_body, model, input_tokens, output_tokens)         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        "INSERT INTO request_logs (
+            timestamp, method, path, request_url, status, duration_ms, proxy_account_id, account_id, error,
+            request_headers, response_headers, request_body, response_body, model, input_tokens, output_tokens,
+            cache_status, cache_key, cache_eligible, cache_bypass_reason, local_cached_input_tokens, provider_cached_input_tokens
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
         params![
             entry.timestamp,
             entry.method,
@@ -536,6 +807,12 @@ fn insert_proxy_log(entry: &ProxyLogEntry) -> Result<(), String> {
             entry.model,
             entry.input_tokens,
             entry.output_tokens,
+            cache_status,
+            cache_key,
+            cache_eligible.map(|v| if v { 1_i64 } else { 0_i64 }),
+            cache_bypass_reason,
+            entry.local_cached_input_tokens,
+            provider_cached_input_tokens,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -612,6 +889,235 @@ fn extract_model(body: &[u8]) -> Option<String> {
     }
     let value: Value = serde_json::from_slice(body).ok()?;
     value.get("model")?.as_str().map(|s| s.to_string())
+}
+
+fn canonicalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                out.insert(key.clone(), canonicalize_json_value(&map[key]));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json_value).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn request_has_tools(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if map.contains_key("tools")
+                || map.contains_key("tool_choice")
+                || map.contains_key("tool_calls")
+                || map.contains_key("tool_use")
+                || map.contains_key("tool_result")
+                || map.contains_key("parallel_tool_calls")
+            {
+                return true;
+            }
+            map.values().any(request_has_tools)
+        }
+        Value::Array(items) => items.iter().any(request_has_tools),
+        _ => false,
+    }
+}
+
+fn compute_cache_key(namespace: &str, method: &str, path: &str, body: &Value) -> String {
+    let canonical = canonicalize_json_value(body);
+    let payload = serde_json::json!({
+        "namespace": namespace,
+        "method": method,
+        "path": path,
+        "body": canonical,
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    format!("{:x}", digest)
+}
+
+fn cache_namespace(path: &str) -> &'static str {
+    if path.starts_with("/v1/messages") {
+        "anthropic"
+    } else if path.starts_with("/v1/chat/completions") {
+        "openai-chat"
+    } else if path.starts_with("/v1/responses") {
+        "responses"
+    } else {
+        "generic"
+    }
+}
+
+fn evaluate_local_cache_request(
+    method: &str,
+    path: &str,
+    body_bytes: &[u8],
+) -> (bool, Option<String>, Option<String>, Option<String>) {
+    if method != "POST" {
+        return (false, None, None, Some("method_not_post".to_string()));
+    }
+    if !(path.starts_with("/v1/messages")
+        || path.starts_with("/v1/chat/completions")
+        || path.starts_with("/v1/responses"))
+        || path.starts_with("/v1/messages/count_tokens")
+    {
+        return (false, None, None, Some("path_not_supported".to_string()));
+    }
+    if body_bytes.len() > 256 * 1024 {
+        return (false, None, None, Some("request_too_large".to_string()));
+    }
+    let mut value: Value = match serde_json::from_slice(body_bytes) {
+        Ok(v) => v,
+        Err(_) => return (false, None, None, Some("invalid_json".to_string())),
+    };
+    if value.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return (false, None, None, Some("streaming_request".to_string()));
+    }
+    if request_has_tools(&value) {
+        return (false, None, None, Some("tool_request".to_string()));
+    }
+    if value
+        .get("temperature")
+        .and_then(|v| v.as_f64())
+        .map(|v| v > 0.3)
+        .unwrap_or(false)
+    {
+        return (false, None, None, Some("high_temperature".to_string()));
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("stream");
+        obj.remove("stream_options");
+    }
+    let model = value.get("model").and_then(|v| v.as_str()).map(|v| v.to_string());
+    let key = compute_cache_key(cache_namespace(path), method, path, &value);
+    (true, Some(key), model, None)
+}
+
+fn cleanup_expired_ai_cache(conn: &Connection, now: &str, max_entries: usize) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM ai_cache_entries WHERE expires_at <= ?1",
+        params![now],
+    )
+    .map_err(|e| e.to_string())?;
+    if max_entries > 0 {
+        conn.execute(
+            "DELETE FROM ai_cache_entries
+             WHERE id NOT IN (
+                SELECT id FROM ai_cache_entries
+                ORDER BY last_hit_at DESC, id DESC
+                LIMIT ?1
+             )",
+            params![max_entries as i64],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn lookup_local_cache(cache_key: &str) -> Result<Option<LocalCacheHit>, String> {
+    let conn = proxy_log_db()?;
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    cleanup_expired_ai_cache(&conn, &now, proxy_config_snapshot().exact_cache_max_entries)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, status, content_type, response_body, model, input_tokens, output_tokens, provider_cached_input_tokens
+             FROM ai_cache_entries
+             WHERE cache_key = ?1 AND expires_at > ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let hit = stmt
+        .query_row(params![cache_key, now], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)? as u16,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((id, status, content_type, response_body, model, input_tokens, output_tokens, provider_cached_input_tokens)) = hit else {
+        return Ok(None);
+    };
+    conn.execute(
+        "UPDATE ai_cache_entries SET hit_count = hit_count + 1, last_hit_at = ?2 WHERE id = ?1",
+        params![id, chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(Some(LocalCacheHit {
+        cache_key: cache_key.to_string(),
+        body: Bytes::from(response_body),
+        status,
+        content_type,
+        model,
+        input_tokens,
+        output_tokens,
+        provider_cached_input_tokens,
+    }))
+}
+
+fn store_local_cache_entry(
+    cache_key: &str,
+    method: &str,
+    path: &str,
+    model: Option<&str>,
+    status: u16,
+    content_type: &str,
+    response_body: &[u8],
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    provider_cached_input_tokens: Option<i64>,
+) -> Result<(), String> {
+    let cfg = proxy_config_snapshot();
+    let conn = proxy_log_db()?;
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    cleanup_expired_ai_cache(&conn, &now, cfg.exact_cache_max_entries)?;
+    let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(cfg.exact_cache_ttl_minutes.max(1)))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    conn.execute(
+        "INSERT INTO ai_cache_entries (
+            cache_key, cache_type, path, method, model, status, content_type, response_body, response_preview,
+            input_tokens, output_tokens, local_cached_input_tokens, provider_cached_input_tokens,
+            hit_count, created_at, last_hit_at, expires_at
+        ) VALUES (?1, 'exact', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, ?13, ?14)
+        ON CONFLICT(cache_key) DO UPDATE SET
+            model = excluded.model,
+            status = excluded.status,
+            content_type = excluded.content_type,
+            response_body = excluded.response_body,
+            response_preview = excluded.response_preview,
+            input_tokens = excluded.input_tokens,
+            output_tokens = excluded.output_tokens,
+            local_cached_input_tokens = excluded.local_cached_input_tokens,
+            provider_cached_input_tokens = excluded.provider_cached_input_tokens,
+            expires_at = excluded.expires_at",
+        params![
+            cache_key,
+            path,
+            method,
+            model.map(|v| v.to_string()),
+            status as i64,
+            content_type,
+            response_body,
+            truncate_body(response_body),
+            input_tokens.unwrap_or(0),
+            output_tokens.unwrap_or(0),
+            input_tokens.unwrap_or(0),
+            provider_cached_input_tokens.unwrap_or(0),
+            now,
+            expires_at,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn extract_usage(body: &[u8]) -> (Option<i64>, Option<i64>) {
@@ -1694,6 +2200,63 @@ fn repair_json_like_quotes(input: &str) -> String {
     out
 }
 
+fn extract_balanced_json_object(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut start = None;
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut candidates: Vec<String> = Vec::new();
+
+    for (idx, byte) in bytes.iter().enumerate() {
+        let ch = *byte as char;
+
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(begin) = start.take() {
+                            if let Some(slice) = input.get(begin..=idx) {
+                                if let Ok(Value::Object(_)) = serde_json::from_str::<Value>(slice) {
+                                    candidates.push(slice.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    candidates
+        .into_iter()
+        .max_by_key(|candidate| candidate.len())
+}
+
 fn repair_tool_arguments_json(args: &str) -> Option<String> {
     let trimmed = args.trim();
     if trimmed.is_empty() {
@@ -1709,7 +2272,8 @@ fn repair_tool_arguments_json(args: &str) -> Option<String> {
     let repaired = repair_json_like_quotes(trimmed);
     match serde_json::from_str::<Value>(&repaired) {
         Ok(Value::Object(_)) => Some(repaired),
-        _ => None,
+        _ => extract_balanced_json_object(trimmed)
+            .or_else(|| extract_balanced_json_object(&repaired)),
     }
 }
 
@@ -4987,6 +5551,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         response_body: None,
                         input_tokens: None,
                         output_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                     };
                     let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
                     return Some(build_anthropic_stream_response(retry_resp, reverse_map, entry).await);
@@ -5009,6 +5579,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     response_body: None,
                     input_tokens: None,
                     output_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 return Some(build_proxy_response(retry_resp).await);
@@ -5056,6 +5632,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                 response_body: None,
                                 input_tokens: None,
                                 output_tokens: None,
+                            cache_status: None,
+                            cache_key: None,
+                            cache_eligible: None,
+                            cache_bypass_reason: None,
+                            local_cached_input_tokens: None,
+                            provider_cached_input_tokens: None,
                             };
                             let _ = insert_proxy_log(&entry);
                             return Some(Response::builder()
@@ -5084,6 +5666,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     response_body: response_body_text,
                     input_tokens,
                     output_tokens,
+                    ..ProxyLogEntry::default()
                 };
                 let _ = insert_proxy_log(&entry);
                 let status = axum::http::StatusCode::from_u16(retry_status.as_u16())
@@ -5121,6 +5704,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 response_body: response_body_text,
                 input_tokens,
                 output_tokens,
+                ..ProxyLogEntry::default()
             };
             let _ = insert_proxy_log(&entry);
             return Some(build_proxy_response_from_bytes(retry_status, &headers, bytes));
@@ -5202,6 +5786,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     response_body: Some("Request body too large".to_string()),
                     input_tokens: None,
                     output_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 log_proxy_error_detail(
@@ -5246,6 +5836,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     response_body: Some("Request body too large".to_string()),
                     input_tokens: None,
                     output_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 log_proxy_error_detail(
@@ -5277,6 +5873,50 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         let mut anthropic_reverse_tool_map: Option<HashMap<String, String>> = None;
         let mut anthropic_stream = None;
         let mut anthropic_body_json: Option<Value> = None;
+        let cfg = proxy_config_snapshot();
+        let (cache_eligible, cache_key, cache_model, _cache_bypass_reason) = if cfg.enable_exact_cache {
+            evaluate_local_cache_request(&method_label, &path, &body_bytes)
+        } else {
+            (false, None, None, Some("exact_cache_disabled".to_string()))
+        };
+        if request_model.is_none() {
+            request_model = cache_model.clone();
+        }
+        if cache_eligible {
+            if let Some(key) = cache_key.as_ref() {
+                if let Ok(Some(hit)) = lookup_local_cache(key) {
+                    let entry = ProxyLogEntry {
+                        timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                        method: method_label.clone(),
+                        path: path.to_string(),
+                        request_url: Some("local:ai-cache".to_string()),
+                        status: hit.status,
+                        duration_ms: started_at.elapsed().as_millis() as u64,
+                        proxy_account_id: "local-cache".to_string(),
+                        account_id: None,
+                        error: None,
+                        model: hit.model.clone().or_else(|| request_model.clone()),
+                        request_headers: request_headers_json.clone(),
+                        response_headers: headers_to_json_string(vec![
+                            ("content-type".to_string(), hit.content_type.clone()),
+                            ("x-codex-manager-cache".to_string(), "HIT".to_string()),
+                        ]),
+                        request_body: request_body_text.clone(),
+                        response_body: Some(truncate_body(&hit.body)),
+                        input_tokens: Some(hit.input_tokens),
+                        output_tokens: Some(hit.output_tokens),
+                        cache_status: Some("local_hit".to_string()),
+                        cache_key: Some(hit.cache_key.clone()),
+                        cache_eligible: Some(true),
+                        cache_bypass_reason: None,
+                        local_cached_input_tokens: Some(hit.input_tokens),
+                        provider_cached_input_tokens: Some(hit.provider_cached_input_tokens),
+                    };
+                    let _ = insert_proxy_log(&entry);
+                    return build_cached_response(hit.status, &hit.content_type, hit.body);
+                }
+            }
+        }
 
         if is_anthropic {
             if method != reqwest::Method::POST {
@@ -5299,6 +5939,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     response_body: Some("Method not allowed".to_string()),
                     input_tokens: None,
                     output_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 log_proxy_error_detail(
@@ -5340,6 +5986,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         response_body: Some("Invalid JSON".to_string()),
                         input_tokens: None,
                         output_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                     };
                     let _ = insert_proxy_log(&entry);
                     log_proxy_error_detail(
@@ -5393,6 +6045,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                             response_body: Some(err.clone()),
                             input_tokens: None,
                             output_tokens: None,
+                        cache_status: None,
+                        cache_key: None,
+                        cache_eligible: None,
+                        cache_bypass_reason: None,
+                        local_cached_input_tokens: None,
+                        provider_cached_input_tokens: None,
                         };
                         let _ = insert_proxy_log(&entry);
                         log_proxy_error_detail(
@@ -5439,6 +6097,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 response_body: None,
                 input_tokens: None,
                 output_tokens: None,
+            cache_status: None,
+            cache_key: None,
+            cache_eligible: None,
+            cache_bypass_reason: None,
+            local_cached_input_tokens: None,
+            provider_cached_input_tokens: None,
             };
             let _ = insert_proxy_log(&entry);
             return Response::builder()
@@ -5491,6 +6155,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 response_body: Some(truncate_body(&response_body)),
                 input_tokens: Some(count),
                 output_tokens: Some(0),
+            cache_status: None,
+            cache_key: None,
+            cache_eligible: None,
+            cache_bypass_reason: None,
+            local_cached_input_tokens: None,
+            provider_cached_input_tokens: None,
             };
             let _ = insert_proxy_log(&entry);
             return Response::builder()
@@ -5560,6 +6230,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     response_body: Some(truncate_body(&response_body)),
                     input_tokens: None,
                     output_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 return Response::builder()
@@ -5657,6 +6333,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         response_body: None,
                         input_tokens: None,
                         output_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                     };
                     let _ = insert_proxy_log(&entry);
                     return Response::builder()
@@ -5690,6 +6372,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     response_body: None,
                     input_tokens: None,
                     output_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
                 };
                 return build_custom_openai_stream_response(
                     upstream_resp,
@@ -5728,6 +6416,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                             response_body: response_body_text,
                             input_tokens,
                             output_tokens,
+                            ..ProxyLogEntry::default()
                         };
                         let _ = insert_proxy_log(&entry);
                         return Response::builder()
@@ -5756,6 +6445,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                             response_body: Some(truncate_body(&bytes)),
                             input_tokens: None,
                             output_tokens: None,
+                        cache_status: None,
+                        cache_key: None,
+                        cache_eligible: None,
+                        cache_bypass_reason: None,
+                        local_cached_input_tokens: None,
+                        provider_cached_input_tokens: None,
                         };
                         let _ = insert_proxy_log(&entry);
                         return Response::builder()
@@ -5786,6 +6481,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 response_body: response_body_text,
                 input_tokens,
                 output_tokens,
+                ..ProxyLogEntry::default()
             };
             let _ = insert_proxy_log(&entry);
             return build_proxy_response_from_bytes(upstream_status, &headers, bytes);
@@ -5890,6 +6586,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     response_body: None,
                     input_tokens: None,
                     output_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 return Response::builder()
@@ -5989,6 +6691,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                         response_body: None,
                                         input_tokens: None,
                                         output_tokens: None,
+                                    cache_status: None,
+                                    cache_key: None,
+                                    cache_eligible: None,
+                                    cache_bypass_reason: None,
+                                    local_cached_input_tokens: None,
+                                    provider_cached_input_tokens: None,
                                     };
                                     let _ = insert_proxy_log(&entry);
                                     return Response::builder()
@@ -6022,6 +6730,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                                 response_body: None,
                                                 input_tokens: None,
                                                 output_tokens: None,
+                                            cache_status: None,
+                                            cache_key: None,
+                                            cache_eligible: None,
+                                            cache_bypass_reason: None,
+                                            local_cached_input_tokens: None,
+                                            provider_cached_input_tokens: None,
                                             };
                                             let _ = insert_proxy_log(&entry);
                                             return Response::builder()
@@ -6050,6 +6764,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                     response_body: response_body_text,
                                     input_tokens,
                                     output_tokens,
+                                    ..ProxyLogEntry::default()
                                 };
                                 let _ = insert_proxy_log(&entry);
                                 let status = axum::http::StatusCode::from_u16(status.as_u16())
@@ -6090,6 +6805,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                 response_body: response_body_text,
                                 input_tokens,
                                 output_tokens,
+                                ..ProxyLogEntry::default()
                             };
                             let _ = insert_proxy_log(&entry);
                             return build_proxy_response_from_bytes(status, &headers, bytes);
@@ -6114,6 +6830,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                 response_body: None,
                                 input_tokens: None,
                                 output_tokens: None,
+                            cache_status: None,
+                            cache_key: None,
+                            cache_eligible: None,
+                            cache_bypass_reason: None,
+                            local_cached_input_tokens: None,
+                            provider_cached_input_tokens: None,
                             };
                             let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
                             return build_anthropic_stream_response(retry_resp, reverse_map, entry).await;
@@ -6136,6 +6858,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                             response_body: None,
                             input_tokens: None,
                             output_tokens: None,
+                        cache_status: None,
+                        cache_key: None,
+                        cache_eligible: None,
+                        cache_bypass_reason: None,
+                        local_cached_input_tokens: None,
+                        provider_cached_input_tokens: None,
                         };
                         let _ = insert_proxy_log(&entry);
                         return build_proxy_response(retry_resp).await;
@@ -6176,6 +6904,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         response_body: None,
                         input_tokens: None,
                         output_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                     };
                     let _ = insert_proxy_log(&entry);
                     return Response::builder()
@@ -6298,6 +7032,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                                 response_body: None,
                                                 input_tokens: None,
                                                 output_tokens: None,
+                                            cache_status: None,
+                                            cache_key: None,
+                                            cache_eligible: None,
+                                            cache_bypass_reason: None,
+                                            local_cached_input_tokens: None,
+                                            provider_cached_input_tokens: None,
                                             };
                                             let _ = insert_proxy_log(&entry);
                                             return Response::builder()
@@ -6326,6 +7066,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                     response_body: response_body_text,
                                     input_tokens,
                                     output_tokens,
+                                    ..ProxyLogEntry::default()
                                 };
                                 let _ = insert_proxy_log(&entry);
                                 let status = axum::http::StatusCode::from_u16(retry_status.as_u16())
@@ -6362,6 +7103,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                 response_body: response_body_text,
                                 input_tokens,
                                 output_tokens,
+                                ..ProxyLogEntry::default()
                             };
                             let _ = insert_proxy_log(&entry);
                             return build_proxy_response_from_bytes(retry_status, &headers, bytes);
@@ -6386,6 +7128,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                 response_body: None,
                                 input_tokens: None,
                                 output_tokens: None,
+                            cache_status: None,
+                            cache_key: None,
+                            cache_eligible: None,
+                            cache_bypass_reason: None,
+                            local_cached_input_tokens: None,
+                            provider_cached_input_tokens: None,
                             };
                             let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
                             return build_anthropic_stream_response(retry_resp, reverse_map, entry).await;
@@ -6407,6 +7155,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                             response_body: None,
                             input_tokens: None,
                             output_tokens: None,
+                        cache_status: None,
+                        cache_key: None,
+                        cache_eligible: None,
+                        cache_bypass_reason: None,
+                        local_cached_input_tokens: None,
+                        provider_cached_input_tokens: None,
                         };
                         let _ = insert_proxy_log(&entry);
                         return build_proxy_response(retry_resp).await;
@@ -6433,6 +7187,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 response_body: response_body_text,
                 input_tokens,
                 output_tokens,
+                ..ProxyLogEntry::default()
             };
             let _ = insert_proxy_log(&entry);
             return build_proxy_response_from_bytes(upstream_status, &headers, bytes);
@@ -6462,6 +7217,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         response_body: None,
                         input_tokens: None,
                         output_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                     };
                     let _ = insert_proxy_log(&entry);
                     return Response::builder()
@@ -6526,6 +7287,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                 response_body: None,
                                 input_tokens: None,
                                 output_tokens: None,
+                            cache_status: None,
+                            cache_key: None,
+                            cache_eligible: None,
+                            cache_bypass_reason: None,
+                            local_cached_input_tokens: None,
+                            provider_cached_input_tokens: None,
                             };
                             let _ = insert_proxy_log(&entry);
                             return Response::builder()
@@ -6554,6 +7321,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     response_body: response_body_text,
                     input_tokens,
                     output_tokens,
+                    ..ProxyLogEntry::default()
                 };
                 let _ = insert_proxy_log(&entry);
                 let status = axum::http::StatusCode::from_u16(status.as_u16())
@@ -6594,6 +7362,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 response_body: response_body_text,
                 input_tokens,
                 output_tokens,
+                ..ProxyLogEntry::default()
             };
             let _ = insert_proxy_log(&entry);
             return build_proxy_response_from_bytes(status, &headers, bytes);
@@ -6619,6 +7388,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 response_body: None,
                 input_tokens: None,
                 output_tokens: None,
+            cache_status: None,
+            cache_key: None,
+            cache_eligible: None,
+            cache_bypass_reason: None,
+            local_cached_input_tokens: None,
+            provider_cached_input_tokens: None,
             };
             let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
             return build_anthropic_stream_response(upstream_resp, reverse_map, entry).await;
@@ -6641,6 +7416,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             response_body: None,
             input_tokens: None,
             output_tokens: None,
+        cache_status: None,
+        cache_key: None,
+        cache_eligible: None,
+        cache_bypass_reason: None,
+        local_cached_input_tokens: None,
+        provider_cached_input_tokens: None,
         };
         let _ = insert_proxy_log(&entry);
         build_proxy_response(upstream_resp).await
@@ -6700,6 +7481,22 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 .body(Body::empty())
                 .unwrap()
         })
+    }
+
+    fn build_cached_response(status: u16, content_type: &str, body: Bytes) -> Response<Body> {
+        Response::builder()
+            .status(axum::http::StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+            .header("Content-Type", content_type)
+            .header("X-Codex-Manager-Cache", "HIT")
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Allow-Headers", "*")
+            .body(Body::from(body))
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap()
+            })
     }
 
     log_proxy("building router");
@@ -7005,6 +7802,12 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                 response_body: Some(truncate_body(&response_body)),
                 input_tokens: None,
                 output_tokens: None,
+            cache_status: None,
+            cache_key: None,
+            cache_eligible: None,
+            cache_bypass_reason: None,
+            local_cached_input_tokens: None,
+            provider_cached_input_tokens: None,
             };
             let _ = insert_proxy_log(&entry);
             return Response::builder()
@@ -7045,6 +7848,57 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
             .unwrap_or(false);
         let mut translated_request_json: Option<Value> = None;
         let mut anthropic_reverse_tool_map: Option<HashMap<String, String>> = None;
+        let proxy_cfg = proxy_config_snapshot();
+        let (cache_eligible, cache_key, cache_model, _cache_bypass_reason) = if proxy_cfg.enable_exact_cache {
+            evaluate_local_cache_request(&method_label, &path, &body_bytes)
+        } else {
+            (false, None, None, Some("exact_cache_disabled".to_string()))
+        };
+        if request_model.is_none() {
+            request_model = cache_model.clone();
+        }
+        if cache_eligible {
+            if let Some(key) = cache_key.as_ref() {
+                if let Ok(Some(hit)) = lookup_local_cache(key) {
+                    let entry = ProxyLogEntry {
+                        timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                        method: method_label.clone(),
+                        path: path.clone(),
+                        request_url: Some("local:ai-cache".to_string()),
+                        status: hit.status,
+                        duration_ms: started_at.elapsed().as_millis() as u64,
+                        proxy_account_id: "local-cache".to_string(),
+                        account_id: None,
+                        error: None,
+                        model: hit.model.clone().or_else(|| request_model.clone()),
+                        request_headers: request_headers_json.clone(),
+                        response_headers: headers_to_json_string(vec![
+                            ("content-type".to_string(), hit.content_type.clone()),
+                            ("x-codex-manager-cache".to_string(), "HIT".to_string()),
+                        ]),
+                        request_body: request_body_text.clone(),
+                        response_body: Some(truncate_body(&hit.body)),
+                        input_tokens: Some(hit.input_tokens),
+                        output_tokens: Some(hit.output_tokens),
+                        cache_status: Some("local_hit".to_string()),
+                        cache_key: Some(hit.cache_key.clone()),
+                        cache_eligible: Some(true),
+                        cache_bypass_reason: None,
+                        local_cached_input_tokens: Some(hit.input_tokens),
+                        provider_cached_input_tokens: Some(hit.provider_cached_input_tokens),
+                    };
+                    let _ = insert_proxy_log(&entry);
+                    return Response::builder()
+                        .status(StatusCode::from_u16(hit.status).unwrap_or(StatusCode::OK))
+                        .header("Content-Type", hit.content_type)
+                        .header("X-Codex-Manager-Cache", "HIT")
+                        .header("Access-Control-Allow-Origin", "*")
+                        .header("Access-Control-Allow-Headers", "*")
+                        .body(Body::from(hit.body))
+                        .unwrap();
+                }
+            }
+        }
 
         if is_anthropic_count_tokens {
             let body_json: Value = match serde_json::from_slice(&body_bytes) {
@@ -7089,6 +7943,12 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                 response_body: Some(truncate_body(&response_body)),
                 input_tokens: Some(count),
                 output_tokens: Some(0),
+            cache_status: None,
+            cache_key: None,
+            cache_eligible: None,
+            cache_bypass_reason: None,
+            local_cached_input_tokens: None,
+            provider_cached_input_tokens: None,
             };
             let _ = insert_proxy_log(&entry);
             return Response::builder()
@@ -7258,6 +8118,12 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                     response_body: None,
                     input_tokens: None,
                     output_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 return Response::builder()
@@ -7291,6 +8157,12 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                 response_body: None,
                 input_tokens: None,
                 output_tokens: None,
+            cache_status: None,
+            cache_key: None,
+            cache_eligible: None,
+            cache_bypass_reason: None,
+            local_cached_input_tokens: None,
+            provider_cached_input_tokens: None,
             };
             return build_openai_chat_to_claude_stream_response(
                 upstream_resp,
@@ -7320,6 +8192,12 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                 response_body: None,
                 input_tokens: None,
                 output_tokens: None,
+            cache_status: None,
+            cache_key: None,
+            cache_eligible: None,
+            cache_bypass_reason: None,
+            local_cached_input_tokens: None,
+            provider_cached_input_tokens: None,
             };
             return build_custom_openai_stream_response(
                 upstream_resp,
@@ -7352,15 +8230,16 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                                 account_id: None,
                                 error: None,
                                 model: request_model,
-                                request_headers: request_headers_json,
-                                response_headers: headers_to_json_string(vec![
-                                    ("content-type".to_string(), "application/json".to_string()),
-                                ]),
-                                request_body: request_body_text,
-                                response_body: response_body_text,
-                                input_tokens,
-                                output_tokens,
-                            };
+                    request_headers: request_headers_json,
+                    response_headers: headers_to_json_string(vec![
+                        ("content-type".to_string(), "application/json".to_string()),
+                    ]),
+                    request_body: request_body_text,
+                    response_body: response_body_text,
+                    input_tokens,
+                    output_tokens,
+                    ..ProxyLogEntry::default()
+                };
                             let _ = insert_proxy_log(&entry);
                             return Response::builder()
                                 .status(axum::http::StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::OK))
@@ -7388,6 +8267,12 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                                 response_body: Some(truncate_body(&bytes)),
                                 input_tokens: None,
                                 output_tokens: None,
+                            cache_status: None,
+                            cache_key: None,
+                            cache_eligible: None,
+                            cache_bypass_reason: None,
+                            local_cached_input_tokens: None,
+                            provider_cached_input_tokens: None,
                             };
                             let _ = insert_proxy_log(&entry);
                             return Response::builder()
@@ -7430,6 +8315,7 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                         response_body: response_body_text,
                         input_tokens,
                         output_tokens,
+                        ..ProxyLogEntry::default()
                     };
                     let _ = insert_proxy_log(&entry);
                     return Response::builder()
@@ -7458,6 +8344,12 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                         response_body: Some(truncate_body(&bytes)),
                         input_tokens: None,
                         output_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                     };
                     let _ = insert_proxy_log(&entry);
                     return Response::builder()
@@ -7488,6 +8380,7 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
             response_body: response_body_text,
             input_tokens,
             output_tokens,
+            ..ProxyLogEntry::default()
         };
         let _ = insert_proxy_log(&entry);
         let mut builder = Response::builder()
@@ -7678,6 +8571,15 @@ fn update_proxy_config(
     upstream_mode: Option<String>,
     custom_openai_base_url: Option<String>,
     custom_openai_api_key: Option<String>,
+    enable_exact_cache: Option<bool>,
+    exact_cache_ttl_minutes: Option<i64>,
+    exact_cache_max_entries: Option<usize>,
+    enable_semantic_cache: Option<bool>,
+    semantic_cache_threshold: Option<f64>,
+    vector_provider_mode: Option<String>,
+    vector_api_base_url: Option<String>,
+    vector_api_key: Option<String>,
+    vector_model: Option<String>,
 ) -> Result<ProxyConfig, String> {
     let mut cfg = proxy_config_snapshot();
     if let Some(value) = api_key {
@@ -7711,6 +8613,41 @@ fn update_proxy_config(
     if let Some(value) = custom_openai_api_key {
         let trimmed = value.trim().to_string();
         cfg.custom_openai_api_key = if trimmed.is_empty() { None } else { Some(trimmed) };
+    }
+    if let Some(value) = enable_exact_cache {
+        cfg.enable_exact_cache = value;
+    }
+    if let Some(value) = exact_cache_ttl_minutes {
+        cfg.exact_cache_ttl_minutes = value.clamp(1, 24 * 60);
+    }
+    if let Some(value) = exact_cache_max_entries {
+        cfg.exact_cache_max_entries = value.clamp(100, 20_000);
+    }
+    if let Some(value) = enable_semantic_cache {
+        cfg.enable_semantic_cache = value;
+    }
+    if let Some(value) = semantic_cache_threshold {
+        cfg.semantic_cache_threshold = value.clamp(0.5, 0.9999);
+    }
+    if let Some(value) = vector_provider_mode {
+        let trimmed = value.trim().to_ascii_lowercase();
+        cfg.vector_provider_mode = if trimmed.is_empty() {
+            default_vector_provider_mode()
+        } else {
+            trimmed
+        };
+    }
+    if let Some(value) = vector_api_base_url {
+        let trimmed = value.trim().trim_end_matches('/').to_string();
+        cfg.vector_api_base_url = if trimmed.is_empty() { None } else { Some(trimmed) };
+    }
+    if let Some(value) = vector_api_key {
+        let trimmed = value.trim().to_string();
+        cfg.vector_api_key = if trimmed.is_empty() { None } else { Some(trimmed) };
+    }
+    if let Some(value) = vector_model {
+        let trimmed = value.trim().to_string();
+        cfg.vector_model = if trimmed.is_empty() { None } else { Some(trimmed) };
     }
     save_proxy_config(&cfg)?;
     let mut lock = proxy_config().lock().unwrap();
@@ -7819,7 +8756,7 @@ fn get_proxy_logs_filtered(
 fn get_proxy_log_detail(log_id: i64) -> Result<ProxyLogDetail, String> {
     let conn = proxy_log_db()?;
     let mut stmt = conn.prepare(
-        "SELECT id, timestamp, method, path, request_url, status, duration_ms, proxy_account_id, account_id, error, model, request_headers, response_headers, request_body, response_body, input_tokens, output_tokens FROM request_logs WHERE id = ?1",
+        "SELECT id, timestamp, method, path, request_url, status, duration_ms, proxy_account_id, account_id, error, model, request_headers, response_headers, request_body, response_body, input_tokens, output_tokens, cache_status, cache_key, cache_eligible, cache_bypass_reason, local_cached_input_tokens, provider_cached_input_tokens FROM request_logs WHERE id = ?1",
     ).map_err(|e| e.to_string())?;
     let log = stmt.query_row(params![log_id], |row| {
         Ok(ProxyLogDetail {
@@ -7840,6 +8777,12 @@ fn get_proxy_log_detail(log_id: i64) -> Result<ProxyLogDetail, String> {
             response_body: row.get(14)?,
             input_tokens: row.get(15)?,
             output_tokens: row.get(16)?,
+            cache_status: row.get(17)?,
+            cache_key: row.get(18)?,
+            cache_eligible: row.get::<_, Option<i64>>(19)?.map(|v| v != 0),
+            cache_bypass_reason: row.get(20)?,
+            local_cached_input_tokens: row.get(21)?,
+            provider_cached_input_tokens: row.get(22)?,
         })
     }).map_err(|e| {
         let msg = format!("日志详情查询失败 (id={log_id}): {e}");
@@ -7956,6 +8899,183 @@ fn get_proxy_token_stats(hours: Option<i64>) -> Result<ProxyTokenStats, String> 
         top_models,
         top_accounts,
     })
+}
+
+#[tauri::command]
+fn get_ai_cache_overview(hours: Option<i64>) -> Result<AICacheOverview, String> {
+    let hours = hours.unwrap_or(24).clamp(1, 24 * 30);
+    let conn = proxy_log_db()?;
+    let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let (
+        total_requests,
+        cache_eligible_requests,
+        local_hits,
+        local_misses,
+        bypassed_requests,
+        provider_cached_requests,
+        input_tokens,
+        output_tokens,
+        local_cached_input_tokens,
+        provider_cached_input_tokens,
+        avg_hit_duration_ms,
+        avg_miss_duration_ms,
+    ): (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, f64, f64) = conn
+        .query_row(
+            "SELECT
+                COUNT(*) as total_requests,
+                COALESCE(SUM(CASE WHEN cache_eligible = 1 THEN 1 ELSE 0 END), 0) as cache_eligible_requests,
+                COALESCE(SUM(CASE WHEN cache_status = 'local_hit' THEN 1 ELSE 0 END), 0) as local_hits,
+                COALESCE(SUM(CASE WHEN cache_status = 'miss' THEN 1 ELSE 0 END), 0) as local_misses,
+                COALESCE(SUM(CASE WHEN cache_status = 'bypass' THEN 1 ELSE 0 END), 0) as bypassed_requests,
+                COALESCE(SUM(CASE WHEN provider_cached_input_tokens > 0 THEN 1 ELSE 0 END), 0) as provider_cached_requests,
+                COALESCE(SUM(input_tokens), 0) as input_tokens,
+                COALESCE(SUM(output_tokens), 0) as output_tokens,
+                COALESCE(SUM(local_cached_input_tokens), 0) as local_cached_input_tokens,
+                COALESCE(SUM(provider_cached_input_tokens), 0) as provider_cached_input_tokens,
+                COALESCE(AVG(CASE WHEN cache_status = 'local_hit' THEN duration_ms END), 0) as avg_hit_duration_ms,
+                COALESCE(AVG(CASE WHEN cache_status = 'miss' THEN duration_ms END), 0) as avg_miss_duration_ms
+             FROM request_logs
+             WHERE timestamp >= ?1",
+            params![since],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    let local_hit_rate = if cache_eligible_requests > 0 {
+        local_hits as f64 / cache_eligible_requests as f64
+    } else {
+        0.0
+    };
+    Ok(AICacheOverview {
+        window_hours: hours,
+        total_requests,
+        cache_eligible_requests,
+        local_hits,
+        local_misses,
+        bypassed_requests,
+        provider_cached_requests,
+        local_hit_rate,
+        input_tokens,
+        output_tokens,
+        local_cached_input_tokens,
+        provider_cached_input_tokens,
+        total_cached_input_tokens: local_cached_input_tokens + provider_cached_input_tokens,
+        avg_hit_duration_ms,
+        avg_miss_duration_ms,
+    })
+}
+
+#[tauri::command]
+fn get_ai_cache_trend(hours: Option<i64>) -> Result<Vec<AICacheTrendPoint>, String> {
+    let hours = hours.unwrap_or(24).clamp(1, 24 * 30);
+    let conn = proxy_log_db()?;
+    let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let bucket_expr = if hours <= 48 {
+        "substr(timestamp, 1, 13) || ':00'"
+    } else {
+        "substr(timestamp, 1, 10)"
+    };
+    let sql = format!(
+        "SELECT
+            {bucket_expr} as bucket,
+            COUNT(*) as total_requests,
+            COALESCE(SUM(CASE WHEN cache_eligible = 1 THEN 1 ELSE 0 END), 0) as cache_eligible_requests,
+            COALESCE(SUM(CASE WHEN cache_status = 'local_hit' THEN 1 ELSE 0 END), 0) as local_hits,
+            COALESCE(SUM(provider_cached_input_tokens), 0) as provider_cached_input_tokens,
+            COALESCE(SUM(local_cached_input_tokens), 0) as local_cached_input_tokens,
+            COALESCE(SUM(input_tokens), 0) as input_tokens,
+            COALESCE(SUM(output_tokens), 0) as output_tokens
+         FROM request_logs
+         WHERE timestamp >= ?1
+         GROUP BY bucket
+         ORDER BY bucket DESC
+         LIMIT 120"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![since], |row| {
+            Ok(AICacheTrendPoint {
+                bucket: row.get(0)?,
+                total_requests: row.get(1)?,
+                cache_eligible_requests: row.get(2)?,
+                local_hits: row.get(3)?,
+                provider_cached_input_tokens: row.get(4)?,
+                local_cached_input_tokens: row.get(5)?,
+                input_tokens: row.get(6)?,
+                output_tokens: row.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(items)
+}
+
+#[tauri::command]
+fn list_ai_cache_entries(limit: Option<i64>, offset: Option<i64>) -> Result<Vec<AICacheEntrySummary>, String> {
+    let conn = proxy_log_db()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, cache_key, path, model, cache_type, hit_count, input_tokens, output_tokens,
+                    local_cached_input_tokens, provider_cached_input_tokens, created_at, last_hit_at, expires_at, response_preview
+             FROM ai_cache_entries
+             ORDER BY last_hit_at DESC, id DESC
+             LIMIT ?1 OFFSET ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![limit.unwrap_or(50).clamp(1, 200), offset.unwrap_or(0).max(0)], |row| {
+            Ok(AICacheEntrySummary {
+                id: row.get(0)?,
+                cache_key: row.get(1)?,
+                path: row.get(2)?,
+                model: row.get(3)?,
+                cache_type: row.get(4)?,
+                hit_count: row.get(5)?,
+                input_tokens: row.get(6)?,
+                output_tokens: row.get(7)?,
+                local_cached_input_tokens: row.get(8)?,
+                provider_cached_input_tokens: row.get(9)?,
+                created_at: row.get(10)?,
+                last_hit_at: row.get(11)?,
+                expires_at: row.get(12)?,
+                response_preview: row.get(13)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(items)
+}
+
+#[tauri::command]
+fn clear_ai_cache() -> Result<Value, String> {
+    let conn = proxy_log_db()?;
+    conn.execute("DELETE FROM ai_cache_entries", [])
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "success": true }))
 }
 
 // ─── Tauri commands: account usage ───────────────────────────────────────────
@@ -8308,6 +9428,10 @@ pub fn run() {
             get_proxy_logs_filtered,
             get_proxy_log_detail,
             get_proxy_token_stats,
+            get_ai_cache_overview,
+            get_ai_cache_trend,
+            list_ai_cache_entries,
+            clear_ai_cache,
             list_anthropic_keys,
             add_anthropic_key,
             delete_anthropic_key,

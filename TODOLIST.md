@@ -1,5 +1,35 @@
 # TODO List
 
+## AI 缓存方案落地进度
+
+### 已完成
+
+- 已提交稳定基线 commit：`e2bd7e7c`
+- 已完成本地 `exact cache` 第一版：
+  - 8520 / 8521 请求入口支持 exact cache 命中
+  - SQLite 新增 `ai_cache_entries`
+  - `request_logs` 已扩展缓存字段
+  - 已统计本地命中、provider cached token、缓存绕过原因
+- 已完成前端第一版 `AI缓存` 页面：
+  - 缓存设置
+  - 概览指标
+  - 趋势表
+  - 缓存条目表
+- 已预留语义缓存配置：
+  - 向量模型来源
+  - 向量 API 地址 / Key / 模型名
+  - 语义阈值
+
+### 待继续
+
+- 接入真正的语义缓存检索链路
+- 对接本地 / 远端 embedding 模型
+- 将 dashboard 指标拆分为：
+  - exact cache
+  - semantic cache
+  - provider cache
+- 视情况补缓存详情抽屉和手动失效单条缓存
+
 ## Claude Code `Error writing file` 问题跟踪
 
 ### 背景
