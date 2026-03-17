@@ -253,7 +253,7 @@ export default function AccountsPage() {
   const [switching, setSwitching] = useState<string | null>(null)
   const [deleting, setDeleting] = useState<string | null>(null)
   const [refreshingToken, setRefreshingToken] = useState<string | null>(null)
-  const [proxyPortInput, setProxyPortInput] = useState<number>(8080)
+  const [proxyPortInput, setProxyPortInput] = useState<number>(8520)
   const [proxyLoading, setProxyLoading] = useState(false)
   const [proxyConfig, setProxyConfig] = useState<ProxyConfig | null>(null)
   const [apiKeyInput, setApiKeyInput] = useState('')
@@ -821,7 +821,7 @@ export default function AccountsPage() {
               size="small"
               min={1024} max={65535}
               value={proxyPortInput}
-              onChange={(val) => setProxyPortInput(val || 8080)}
+              onChange={(val) => setProxyPortInput(val || 8520)}
               disabled={proxyStatus.running}
             />
             {proxyStatus.running && (

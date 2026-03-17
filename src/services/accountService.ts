@@ -135,7 +135,7 @@ export const accountService = {
 
   // Proxy
   startProxy: (port?: number) =>
-    invoke<{ success: boolean; port: number; account_count: number; base_url: string }>('start_api_proxy', { port: port ?? 8080 }),
+    invoke<{ success: boolean; port: number; account_count: number; base_url: string }>('start_api_proxy', { port: port ?? 8520 }),
   stopProxy: () => invoke<{ success: boolean; message: string }>('stop_api_proxy'),
   reloadProxy: () => invoke<{ success: boolean; account_count: number }>('reload_proxy_accounts'),
   getProxyStatus: () => invoke<ProxyStatus>('get_proxy_status'),
@@ -199,7 +199,7 @@ export const accountService = {
   startOpenAICompatProxy: (configId: string, port?: number) =>
     invoke<{ success: boolean; port: number; base_url: string; config_id: string; provider_name: string }>('start_openai_compat_proxy', {
       configId,
-      port: port ?? 8081,
+      port: port ?? 8521,
     }),
   stopOpenAICompatProxy: () => invoke<{ success: boolean }>('stop_openai_compat_proxy'),
   getOpenAICompatProxyStatus: () => invoke<OpenAICompatProxyStatus>('get_openai_compat_proxy_status'),

@@ -51,9 +51,9 @@ const emptyDraft = (): CompatDraft => ({
 
 export default function OpenAICompatProxyPage() {
   const [configs, setConfigs] = useState<OpenAICompatConfig[]>([])
-  const [status, setStatus] = useState<OpenAICompatProxyStatus>({ running: false, port: 8081, config_id: null, provider_name: null })
+  const [status, setStatus] = useState<OpenAICompatProxyStatus>({ running: false, port: 8521, config_id: null, provider_name: null })
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [port, setPort] = useState(8081)
+  const [port, setPort] = useState(8521)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
@@ -268,7 +268,7 @@ export default function OpenAICompatProxyPage() {
         title={
           <Space>
             <ApiOutlined className={status.running ? 'text-green-600' : 'text-gray-400'} />
-            <span className="font-semibold text-gray-800">OpenAI 兼容代理</span>
+            <span className="font-semibold text-gray-800">AI代理</span>
           </Space>
         }
         extra={
@@ -285,7 +285,7 @@ export default function OpenAICompatProxyPage() {
               min={1024}
               max={65535}
               value={port}
-              onChange={(value) => setPort(value || 8081)}
+              onChange={(value) => setPort(value || 8521)}
               disabled={status.running}
             />
             <Switch
@@ -299,7 +299,7 @@ export default function OpenAICompatProxyPage() {
       >
         <div className="flex items-center justify-between gap-4">
           <div>
-            <Text>独立端口默认 `8081`。此代理专门把 Codex 的 `Responses` 协议转换成 OpenAI 兼容上游的 `Chat Completions`。</Text>
+            <Text>独立端口默认 `8521`。此代理同时支持 OpenAI 兼容请求与 Anthropic Claude 协议请求，并统一转发到兼容上游。</Text>
             <div className="mt-2 text-xs text-gray-500">
               当前运行: {status.running ? `${status.provider_name ?? '--'} @ http://127.0.0.1:${status.port}` : '未启动'}
             </div>

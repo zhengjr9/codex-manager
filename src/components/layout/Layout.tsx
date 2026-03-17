@@ -23,7 +23,7 @@ export default function Layout() {
           onClick={({ key }) => navigate(key)}
           items={[
             { key: '/', icon: <CodeOutlined />, label: '账号与 Codex 代理' },
-            { key: '/openai-compat', icon: <ApiOutlined />, label: 'OpenAI 兼容代理' },
+            { key: '/openai-compat', icon: <ApiOutlined />, label: 'AI代理' },
           ]}
           style={{
             background: 'transparent',

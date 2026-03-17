@@ -1136,23 +1136,115 @@ fn build_short_name_map(names: &[String]) -> HashMap<String, String> {
     map
 }
 
+fn normalize_tool_schema_type(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Some(Value::Array(items)) => items.iter().find_map(|item| {
+            let ty = item.as_str()?.trim();
+            if ty.is_empty() || ty == "null" {
+                None
+            } else {
+                Some(ty.to_string())
+            }
+        }),
+        _ => None,
+    }
+}
+
 fn normalize_tool_parameters(value: &Value) -> Value {
-    let mut schema = if value.is_object() {
-        value.clone()
-    } else {
-        serde_json::json!({})
-    };
-    let schema_type = schema.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    if schema_type.is_empty() {
-        schema["type"] = Value::String("object".to_string());
+    fn normalize_schema(value: &Value) -> Value {
+        let mut schema = match value {
+            Value::Object(obj) => Value::Object(obj.clone()),
+            _ => serde_json::json!({}),
+        };
+
+        let inferred_type = normalize_tool_schema_type(schema.get("type")).or_else(|| {
+            if schema.get("properties").is_some() || schema.get("required").is_some() {
+                Some("object".to_string())
+            } else if schema.get("items").is_some() {
+                Some("array".to_string())
+            } else {
+                None
+            }
+        });
+
+        if let Some(obj) = schema.as_object_mut() {
+            obj.remove("$schema");
+
+            if let Some(schema_type) = inferred_type {
+                obj.insert("type".to_string(), Value::String(schema_type.clone()));
+
+                if schema_type == "object" {
+                    let properties = match obj.remove("properties") {
+                        Some(Value::Object(props)) => {
+                            let mut normalized = serde_json::Map::new();
+                            for (key, prop_schema) in props {
+                                normalized.insert(key, normalize_schema(&prop_schema));
+                            }
+                            Value::Object(normalized)
+                        }
+                        _ => serde_json::json!({}),
+                    };
+                    obj.insert("properties".to_string(), properties);
+
+                    if let Some(required) = obj.remove("required") {
+                        if let Value::Array(items) = required {
+                            let filtered: Vec<Value> = items
+                                .into_iter()
+                                .filter_map(|item| item.as_str().map(|s| Value::String(s.to_string())))
+                                .collect();
+                            if !filtered.is_empty() {
+                                obj.insert("required".to_string(), Value::Array(filtered));
+                            }
+                        }
+                    }
+
+                    if let Some(additional) = obj.remove("additionalProperties") {
+                        let normalized = match additional {
+                            Value::Object(_) => normalize_schema(&additional),
+                            Value::Bool(flag) => Value::Bool(flag),
+                            _ => Value::Bool(false),
+                        };
+                        obj.insert("additionalProperties".to_string(), normalized);
+                    }
+                } else {
+                    obj.remove("properties");
+                    obj.remove("required");
+                    obj.remove("additionalProperties");
+                }
+
+                if schema_type == "array" {
+                    let items = obj
+                        .remove("items")
+                        .map(|items| normalize_schema(&items))
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    obj.insert("items".to_string(), items);
+                } else {
+                    obj.remove("items");
+                }
+            } else {
+                obj.insert("type".to_string(), Value::String("object".to_string()));
+                obj.insert("properties".to_string(), serde_json::json!({}));
+                obj.remove("required");
+                obj.remove("additionalProperties");
+                obj.remove("items");
+            }
+
+            for key in ["anyOf", "oneOf", "allOf"] {
+                if let Some(Value::Array(items)) = obj.remove(key) {
+                    let normalized_items: Vec<Value> =
+                        items.into_iter().map(|item| normalize_schema(&item)).collect();
+                    if !normalized_items.is_empty() {
+                        obj.insert(key.to_string(), Value::Array(normalized_items));
+                    }
+                }
+            }
+        }
+
+        schema
     }
-    if schema.get("type").and_then(|v| v.as_str()) == Some("object") && !schema.get("properties").is_some() {
-        schema["properties"] = serde_json::json!({});
-    }
-    if let Some(obj) = schema.as_object_mut() {
-        obj.remove("$schema");
-    }
-    schema
+
+    normalize_schema(value)
 }
 
 fn build_reverse_tool_map(original: &Value) -> HashMap<String, String> {
@@ -1349,8 +1441,6 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
     }
 
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
-        template["tools"] = serde_json::json!([]);
-        template["tool_choice"] = serde_json::json!("auto");
         let mut out_tools: Vec<Value> = Vec::new();
         for tool in tools {
             if tool.get("type").and_then(|v| v.as_str()) == Some("web_search_20250305") {
@@ -1379,7 +1469,10 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
             }
             out_tools.push(entry);
         }
-        template["tools"] = Value::Array(out_tools);
+        if !out_tools.is_empty() {
+            template["tools"] = Value::Array(out_tools);
+            template["tool_choice"] = serde_json::json!("auto");
+        }
     }
 
     template["parallel_tool_calls"] = serde_json::json!(true);
@@ -1501,6 +1594,134 @@ fn openai_chat_usage(value: Option<&Value>) -> (Option<i64>, Option<i64>, Option
         .or_else(|| usage.get("output_tokens_details").and_then(|v| v.get("reasoning_tokens")))
         .and_then(|v| v.as_i64());
     (input, output, cached, reasoning)
+}
+
+fn normalize_tool_arguments_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => {
+            if s.trim().is_empty() {
+                "{}".to_string()
+            } else {
+                repair_tool_arguments_json(s).unwrap_or_else(|| s.clone())
+            }
+        }
+        Value::Object(_) | Value::Array(_) => {
+            serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+        }
+        Value::Null => "{}".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn repair_json_like_quotes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+
+    for ch in input.chars() {
+        if in_double {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+            continue;
+        }
+
+        if in_single {
+            if escaped {
+                escaped = false;
+                match ch {
+                    'n' | 'r' | 't' | 'b' | 'f' | '/' | '"' => {
+                        out.push('\\');
+                        out.push(ch);
+                    }
+                    '\\' => {
+                        out.push('\\');
+                        out.push('\\');
+                    }
+                    '\'' => out.push('\''),
+                    'u' => {
+                        out.push('\\');
+                        out.push('u');
+                    }
+                    _ => {
+                        out.push('\\');
+                        out.push(ch);
+                    }
+                }
+                continue;
+            }
+
+            match ch {
+                '\\' => {
+                    escaped = true;
+                }
+                '\'' => {
+                    out.push('"');
+                    in_single = false;
+                }
+                '"' => {
+                    out.push('\\');
+                    out.push('"');
+                }
+                _ => out.push(ch),
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_double = true;
+                out.push(ch);
+            }
+            '\'' => {
+                in_single = true;
+                out.push('"');
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    if in_single {
+        out.push('"');
+    }
+
+    out
+}
+
+fn repair_tool_arguments_json(args: &str) -> Option<String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Some("{}".to_string());
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return match value {
+            Value::Object(_) => serde_json::to_string(&value).ok(),
+            _ => None,
+        };
+    }
+
+    let repaired = repair_json_like_quotes(trimmed);
+    match serde_json::from_str::<Value>(&repaired) {
+        Ok(Value::Object(_)) => Some(repaired),
+        _ => None,
+    }
+}
+
+fn parse_tool_arguments_json(args: &str) -> Result<Value, String> {
+    let repaired = repair_tool_arguments_json(args).ok_or_else(|| {
+        format!(
+            "invalid tool arguments JSON: raw={}",
+            truncate_body(args.trim().as_bytes())
+        )
+    })?;
+    serde_json::from_str::<Value>(&repaired)
+        .map_err(|e| format!("invalid tool arguments JSON: {e}; raw={}", truncate_body(repaired.as_bytes())))
 }
 
 fn build_local_models_response(models: &[String]) -> Bytes {
@@ -1639,21 +1860,10 @@ fn convert_responses_request_to_chat_completions(
                         "function_call" => {
                             let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                             let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            let arguments = match item.get("arguments") {
-                                Some(Value::String(s)) => {
-                                    if s.trim().is_empty() {
-                                        "{}".to_string()
-                                    } else if serde_json::from_str::<Value>(s).is_ok() {
-                                        s.clone()
-                                    } else {
-                                        "{}".to_string()
-                                    }
-                                }
-                                Some(v @ Value::Object(_)) | Some(v @ Value::Array(_)) => {
-                                    serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string())
-                                }
-                                _ => "{}".to_string(),
-                            };
+                            let arguments = item
+                                .get("arguments")
+                                .map(normalize_tool_arguments_string)
+                                .unwrap_or_else(|| "{}".to_string());
                             if let Some(messages) = out.get_mut("messages").and_then(|v| v.as_array_mut()) {
                                 messages.push(serde_json::json!({
                                     "role": "assistant",
@@ -1697,15 +1907,7 @@ fn convert_responses_request_to_chat_completions(
         }
     }
 
-    if let Some(max_tokens) = body.get("max_output_tokens").and_then(|v| v.as_i64()) {
-        out["max_tokens"] = serde_json::json!(max_tokens);
-    }
-    if let Some(parallel_tool_calls) = body.get("parallel_tool_calls").and_then(|v| v.as_bool()) {
-        out["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
-    }
-    if let Some(tool_choice) = body.get("tool_choice") {
-        out["tool_choice"] = tool_choice.clone();
-    }
+    let mut has_chat_tools = false;
     if let Some(temperature) = body.get("temperature").and_then(|v| v.as_f64()) {
         out["temperature"] = serde_json::json!(temperature);
     }
@@ -1725,7 +1927,7 @@ fn convert_responses_request_to_chat_completions(
                 continue;
             }
             let description = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
-            let parameters = tool.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({}));
+            let parameters = normalize_tool_parameters(tool.get("parameters").unwrap_or(&Value::Null));
             chat_tools.push(serde_json::json!({
                 "type": "function",
                 "function": {
@@ -1737,6 +1939,18 @@ fn convert_responses_request_to_chat_completions(
         }
         if !chat_tools.is_empty() {
             out["tools"] = Value::Array(chat_tools);
+            has_chat_tools = true;
+        }
+    }
+    if let Some(max_tokens) = body.get("max_output_tokens").and_then(|v| v.as_i64()) {
+        out["max_tokens"] = serde_json::json!(max_tokens);
+    }
+    if has_chat_tools {
+        if let Some(parallel_tool_calls) = body.get("parallel_tool_calls").and_then(|v| v.as_bool()) {
+            out["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
+        }
+        if let Some(tool_choice) = body.get("tool_choice") {
+            out["tool_choice"] = tool_choice.clone();
         }
     }
 
@@ -1880,7 +2094,7 @@ fn convert_codex_non_stream_to_claude(
     resp: &Value,
     reverse_tool_map: &HashMap<String, String>,
     request_model: &str,
-) -> Value {
+) -> Result<Value, String> {
     let response = if resp.get("type").and_then(|v| v.as_str()) == Some("response.completed") {
         resp.get("response").cloned().unwrap_or_else(|| serde_json::json!({}))
     } else if resp.get("response").is_some() {
@@ -1980,9 +2194,7 @@ fn convert_codex_non_stream_to_claude(
                     }
                     let mut input_raw = serde_json::json!({});
                     if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
-                        if let Ok(json) = serde_json::from_str::<Value>(args) {
-                            input_raw = json;
-                        }
+                        input_raw = parse_tool_arguments_json(args)?;
                     }
                     if let Some(arr) = out["content"].as_array_mut() {
                         arr.push(serde_json::json!({
@@ -2011,7 +2223,7 @@ fn convert_codex_non_stream_to_claude(
         out["stop_sequence"] = stop_sequence.clone();
     }
 
-    out
+    Ok(out)
 }
 
 fn convert_codex_response_bytes_to_claude(
@@ -2020,7 +2232,7 @@ fn convert_codex_response_bytes_to_claude(
     request_model: &str,
 ) -> Result<(Bytes, Option<i64>, Option<i64>), String> {
     let resp_json: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    let claude = convert_codex_non_stream_to_claude(&resp_json, reverse_tool_map, request_model);
+    let claude = convert_codex_non_stream_to_claude(&resp_json, reverse_tool_map, request_model)?;
     let out_bytes = serde_json::to_vec(&claude).map_err(|e| e.to_string())?;
     let (input_tokens, output_tokens) = extract_usage(&out_bytes);
     Ok((Bytes::from(out_bytes), input_tokens, output_tokens))
@@ -2046,6 +2258,8 @@ struct CodexToClaudeStreamState {
     pending: std::collections::VecDeque<Bytes>,
     has_tool_call: bool,
     block_index: i64,
+    active_tool_block_index: Option<i64>,
+    active_tool_arguments: String,
     reverse_tool_map: HashMap<String, String>,
     usage_input: Option<i64>,
     usage_output: Option<i64>,
@@ -2156,6 +2370,8 @@ fn codex_event_to_claude(
                     if let Some(orig) = state.reverse_tool_map.get(&name) {
                         name = orig.clone();
                     }
+                    state.active_tool_block_index = Some(state.block_index);
+                    state.active_tool_arguments.clear();
                     let payload = serde_json::json!({
                         "type": "content_block_start",
                         "index": state.block_index,
@@ -2167,35 +2383,36 @@ fn codex_event_to_claude(
                         }
                     });
                     push_claude_sse(state, "content_block_start", &payload);
-                    let delta = serde_json::json!({
-                        "type": "content_block_delta",
-                        "index": state.block_index,
-                        "delta": { "type": "input_json_delta", "partial_json": "" }
-                    });
-                    push_claude_sse(state, "content_block_delta", &delta);
                 }
             }
         }
         "response.output_item.done" => {
             if let Some(item) = event.get("item") {
                 if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                    if let Some(active_index) = state.active_tool_block_index {
+                        let partial_json = repair_tool_arguments_json(&state.active_tool_arguments)
+                            .unwrap_or_else(|| state.active_tool_arguments.clone());
+                        let payload = serde_json::json!({
+                            "type": "content_block_delta",
+                            "index": active_index,
+                            "delta": { "type": "input_json_delta", "partial_json": partial_json }
+                        });
+                        push_claude_sse(state, "content_block_delta", &payload);
+                    }
                     let payload = serde_json::json!({
                         "type": "content_block_stop",
                         "index": state.block_index
                     });
                     push_claude_sse(state, "content_block_stop", &payload);
+                    state.active_tool_block_index = None;
+                    state.active_tool_arguments.clear();
                     state.block_index += 1;
                 }
             }
         }
         "response.function_call_arguments.delta" => {
             let delta = event.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-            let payload = serde_json::json!({
-                "type": "content_block_delta",
-                "index": state.block_index,
-                "delta": { "type": "input_json_delta", "partial_json": delta }
-            });
-            push_claude_sse(state, "content_block_delta", &payload);
+            state.active_tool_arguments.push_str(delta);
         }
         "response.completed" => {
             let stop_reason = event
@@ -2279,6 +2496,8 @@ async fn build_anthropic_stream_response(
         pending: std::collections::VecDeque::new(),
         has_tool_call: false,
         block_index: 0,
+        active_tool_block_index: None,
+        active_tool_arguments: String::new(),
         reverse_tool_map,
         usage_input: None,
         usage_output: None,
@@ -2950,6 +3169,368 @@ async fn build_custom_openai_stream_response(
                 }
                 None => {
                     finalize_custom_responses_stream(&mut state);
+                }
+            }
+        }
+    });
+
+    axum::response::Response::builder()
+        .status(status)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Headers", "*")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|_| {
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        })
+}
+
+struct OpenAIToClaudeStreamState {
+    buffer: String,
+    pending: std::collections::VecDeque<Bytes>,
+    captured: String,
+    log_entry: Option<ProxyLogEntry>,
+    reverse_tool_map: HashMap<String, String>,
+    started: bool,
+    done: bool,
+    has_tool_call: bool,
+    message_id: String,
+    model: String,
+    next_block_index: i64,
+    text_block_index: Option<i64>,
+    reasoning_block_index: Option<i64>,
+    tool_block_indexes: HashMap<i64, i64>,
+    tool_names: HashMap<i64, String>,
+    tool_ids: HashMap<i64, String>,
+    tool_arguments: HashMap<i64, String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_tokens: Option<i64>,
+}
+
+fn push_openai_to_claude_sse(state: &mut OpenAIToClaudeStreamState, event: &str, payload: &Value) {
+    let line = format!(
+        "event: {event}\ndata: {}\n\n",
+        serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string())
+    );
+    append_capture_text(&mut state.captured, &line);
+    state.pending.push_back(Bytes::from(line));
+}
+
+fn ensure_openai_claude_started(state: &mut OpenAIToClaudeStreamState, chunk: &Value) {
+    if state.started {
+        return;
+    }
+    state.message_id = chunk
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| synth_response_id("msg"));
+    state.model = chunk
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let payload = serde_json::json!({
+        "type": "message_start",
+        "message": {
+            "id": state.message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": state.model,
+            "stop_sequence": null,
+            "usage": { "input_tokens": 0, "output_tokens": 0 },
+            "content": [],
+            "stop_reason": null
+        }
+    });
+    push_openai_to_claude_sse(state, "message_start", &payload);
+    state.started = true;
+}
+
+fn stop_openai_claude_block(state: &mut OpenAIToClaudeStreamState, index: Option<i64>) {
+    if let Some(index) = index {
+        let payload = serde_json::json!({
+            "type": "content_block_stop",
+            "index": index,
+        });
+        push_openai_to_claude_sse(state, "content_block_stop", &payload);
+    }
+}
+
+fn finalize_openai_claude_stream(state: &mut OpenAIToClaudeStreamState, finish_reason: Option<&str>) {
+    if state.done {
+        return;
+    }
+    let reasoning_block_index = state.reasoning_block_index.take();
+    let text_block_index = state.text_block_index.take();
+    stop_openai_claude_block(state, reasoning_block_index);
+    stop_openai_claude_block(state, text_block_index);
+    let tool_indexes: Vec<i64> = state.tool_block_indexes.values().copied().collect();
+    let mut sorted_tool_indexes: Vec<i64> = state.tool_block_indexes.keys().copied().collect();
+    sorted_tool_indexes.sort_unstable();
+    for tool_index in sorted_tool_indexes {
+        if let Some(args) = state.tool_arguments.get(&tool_index).filter(|v| !v.is_empty()) {
+            let partial_json = repair_tool_arguments_json(args).unwrap_or_else(|| args.clone());
+            let payload = serde_json::json!({
+                "type": "content_block_delta",
+                "index": state.tool_block_indexes.get(&tool_index).copied().unwrap_or(0),
+                "delta": { "type": "input_json_delta", "partial_json": partial_json }
+            });
+            push_openai_to_claude_sse(state, "content_block_delta", &payload);
+        }
+    }
+    for index in tool_indexes {
+        stop_openai_claude_block(state, Some(index));
+    }
+    state.tool_block_indexes.clear();
+    state.tool_arguments.clear();
+
+    let mapped_reason = if state.has_tool_call {
+        "tool_use".to_string()
+    } else {
+        match finish_reason.unwrap_or("") {
+            "length" | "max_tokens" => "max_tokens".to_string(),
+            "stop" => "end_turn".to_string(),
+            _ => "end_turn".to_string(),
+        }
+    };
+    let mut usage_payload = serde_json::json!({
+        "input_tokens": state.input_tokens.unwrap_or(0),
+        "output_tokens": state.output_tokens.unwrap_or(0),
+    });
+    if let Some(cached) = state.cached_tokens {
+        usage_payload["cache_read_input_tokens"] = serde_json::json!(cached);
+    }
+    let delta_payload = serde_json::json!({
+        "type": "message_delta",
+        "delta": { "stop_reason": mapped_reason, "stop_sequence": null },
+        "usage": usage_payload,
+    });
+    push_openai_to_claude_sse(state, "message_delta", &delta_payload);
+    let stop_payload = serde_json::json!({ "type": "message_stop" });
+    push_openai_to_claude_sse(state, "message_stop", &stop_payload);
+    state.done = true;
+}
+
+fn process_openai_chat_to_claude_sse_chunk(state: &mut OpenAIToClaudeStreamState, chunk: &str) {
+    state.buffer.push_str(chunk);
+    loop {
+        let Some(pos) = state.buffer.find("\n\n") else { break; };
+        let raw = state.buffer[..pos].to_string();
+        state.buffer = state.buffer[pos + 2..].to_string();
+
+        let mut data_lines = Vec::new();
+        for line in raw.lines() {
+            if let Some(rest) = line.strip_prefix("data:") {
+                data_lines.push(rest.trim().to_string());
+            }
+        }
+        if data_lines.is_empty() {
+            continue;
+        }
+        let data = data_lines.join("\n");
+        if data == "[DONE]" {
+            finalize_openai_claude_stream(state, None);
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+
+        ensure_openai_claude_started(state, &event);
+        let (input_tokens, output_tokens, cached_tokens, _) = openai_chat_usage(event.get("usage"));
+        if input_tokens.is_some() {
+            state.input_tokens = input_tokens;
+        }
+        if output_tokens.is_some() {
+            state.output_tokens = output_tokens;
+        }
+        if cached_tokens.is_some() {
+            state.cached_tokens = cached_tokens;
+        }
+
+        if let Some(choices) = event.get("choices").and_then(|v| v.as_array()) {
+            for choice in choices {
+                let delta = choice.get("delta").unwrap_or(&Value::Null);
+                let reasoning_delta = delta
+                    .get("reasoning")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| delta.get("reasoning_content").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                if !reasoning_delta.is_empty() {
+                    if state.reasoning_block_index.is_none() {
+                        let block_index = state.next_block_index;
+                        state.next_block_index += 1;
+                        state.reasoning_block_index = Some(block_index);
+                        let payload = serde_json::json!({
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": { "type": "thinking", "thinking": "" }
+                        });
+                        push_openai_to_claude_sse(state, "content_block_start", &payload);
+                    }
+                    let payload = serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": state.reasoning_block_index.unwrap_or(0),
+                        "delta": { "type": "thinking_delta", "thinking": reasoning_delta }
+                    });
+                    push_openai_to_claude_sse(state, "content_block_delta", &payload);
+                }
+
+                if let Some(text_delta) = delta.get("content").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+                    let reasoning_block_index = state.reasoning_block_index.take();
+                    stop_openai_claude_block(state, reasoning_block_index);
+                    if state.text_block_index.is_none() {
+                        let block_index = state.next_block_index;
+                        state.next_block_index += 1;
+                        state.text_block_index = Some(block_index);
+                        let payload = serde_json::json!({
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": { "type": "text", "text": "" }
+                        });
+                        push_openai_to_claude_sse(state, "content_block_start", &payload);
+                    }
+                    let payload = serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": state.text_block_index.unwrap_or(0),
+                        "delta": { "type": "text_delta", "text": text_delta }
+                    });
+                    push_openai_to_claude_sse(state, "content_block_delta", &payload);
+                }
+
+                if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                    let reasoning_block_index = state.reasoning_block_index.take();
+                    let text_block_index = state.text_block_index.take();
+                    stop_openai_claude_block(state, reasoning_block_index);
+                    stop_openai_claude_block(state, text_block_index);
+                    for tool_call in tool_calls {
+                        let tool_index = tool_call.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                        if let Some(name) = tool_call
+                            .get("function")
+                            .and_then(|v| v.get("name"))
+                            .and_then(|v| v.as_str())
+                            .filter(|v| !v.is_empty())
+                        {
+                            let mapped_name = state
+                                .reverse_tool_map
+                                .get(name)
+                                .cloned()
+                                .unwrap_or_else(|| name.to_string());
+                            state.tool_names.insert(tool_index, mapped_name);
+                        }
+                        if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+                            state.tool_ids.insert(tool_index, id.to_string());
+                        }
+                        if !state.tool_block_indexes.contains_key(&tool_index) {
+                            let block_index = state.next_block_index;
+                            state.next_block_index += 1;
+                            state.tool_block_indexes.insert(tool_index, block_index);
+                            state.has_tool_call = true;
+                            let payload = serde_json::json!({
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": state.tool_ids.get(&tool_index).cloned().unwrap_or_default(),
+                                    "name": state.tool_names.get(&tool_index).cloned().unwrap_or_default(),
+                                    "input": {}
+                                }
+                            });
+                            push_openai_to_claude_sse(state, "content_block_start", &payload);
+                        }
+                        if let Some(arguments_delta) = tool_call
+                            .get("function")
+                            .and_then(|v| v.get("arguments"))
+                            .and_then(|v| v.as_str())
+                            .filter(|v| !v.is_empty())
+                        {
+                            state
+                                .tool_arguments
+                                .entry(tool_index)
+                                .or_default()
+                                .push_str(arguments_delta);
+                        }
+                    }
+                }
+
+                if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                    finalize_openai_claude_stream(state, Some(finish_reason));
+                }
+            }
+        }
+    }
+}
+
+async fn build_openai_chat_to_claude_stream_response(
+    upstream_resp: reqwest::Response,
+    reverse_tool_map: HashMap<String, String>,
+    log_entry: ProxyLogEntry,
+) -> axum::response::Response<axum::body::Body> {
+    let status = axum::http::StatusCode::from_u16(upstream_resp.status().as_u16())
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+    let state = OpenAIToClaudeStreamState {
+        buffer: String::new(),
+        pending: std::collections::VecDeque::new(),
+        captured: String::new(),
+        log_entry: Some(log_entry),
+        reverse_tool_map,
+        started: false,
+        done: false,
+        has_tool_call: false,
+        message_id: String::new(),
+        model: String::new(),
+        next_block_index: 0,
+        text_block_index: None,
+        reasoning_block_index: None,
+        tool_block_indexes: HashMap::new(),
+        tool_names: HashMap::new(),
+        tool_ids: HashMap::new(),
+        tool_arguments: HashMap::new(),
+        input_tokens: None,
+        output_tokens: None,
+        cached_tokens: None,
+    };
+
+    let mut upstream_stream = upstream_resp.bytes_stream();
+    let stream = futures_util::stream::unfold((upstream_stream, state), |(mut upstream_stream, mut state)| async move {
+        loop {
+            if let Some(bytes) = state.pending.pop_front() {
+                return Some((Ok::<Bytes, std::io::Error>(bytes), (upstream_stream, state)));
+            }
+            if state.done {
+                if let Some(mut entry) = state.log_entry.take() {
+                    if !state.captured.is_empty() {
+                        entry.response_body = Some(state.captured.clone());
+                    }
+                    entry.input_tokens = state.input_tokens;
+                    entry.output_tokens = state.output_tokens;
+                    let _ = insert_proxy_log(&entry);
+                }
+                return None;
+            }
+            match upstream_stream.next().await {
+                Some(Ok(chunk)) => {
+                    let chunk_text = String::from_utf8_lossy(&chunk);
+                    process_openai_chat_to_claude_sse_chunk(&mut state, &chunk_text);
+                }
+                Some(Err(err)) => {
+                    let payload = serde_json::json!({
+                        "type": "error",
+                        "error": { "type": "api_error", "message": err.to_string() }
+                    });
+                    push_openai_to_claude_sse(&mut state, "error", &payload);
+                    state.done = true;
+                }
+                None => {
+                    finalize_openai_claude_stream(&mut state, None);
                 }
             }
         }
@@ -4277,7 +4858,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         }
     }
 
-    let proxy_port = port.unwrap_or(8080);
+    let proxy_port = port.unwrap_or(8520);
     let cfg = proxy_config_snapshot();
     let accounts = match load_proxy_accounts() {
         Ok(accounts) => accounts,
@@ -6339,7 +6920,7 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
         .into_iter()
         .find(|cfg| cfg.id == config_id)
         .ok_or_else(|| "配置不存在".to_string())?;
-    let proxy_port = port.unwrap_or(8081);
+    let proxy_port = port.unwrap_or(8521);
 
     use axum::{
         body::Body,
@@ -6452,6 +7033,9 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
         };
         let mut request_model = extract_model(&body_bytes);
         let mut upstream_path = path.clone();
+        let is_anthropic = upstream_path == "/v1/messages" || upstream_path.starts_with("/v1/messages?");
+        let is_anthropic_count_tokens =
+            upstream_path == "/v1/messages/count_tokens" || upstream_path.starts_with("/v1/messages/count_tokens?");
         let custom_responses_path = upstream_path == "/v1/responses" || upstream_path.starts_with("/v1/responses?");
         let mut upstream_body_bytes = body_bytes.clone();
         let mut is_stream = req_headers
@@ -6460,8 +7044,121 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
             .map(|v| v.contains("text/event-stream"))
             .unwrap_or(false);
         let mut translated_request_json: Option<Value> = None;
+        let mut anthropic_reverse_tool_map: Option<HashMap<String, String>> = None;
 
-        if custom_responses_path {
+        if is_anthropic_count_tokens {
+            let body_json: Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Body::from(format!("Invalid JSON: {err}")))
+                        .unwrap();
+                }
+            };
+            let (codex_body, _, _) = match convert_claude_to_codex(&body_json) {
+                Ok(v) => v,
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Body::from(err))
+                        .unwrap();
+                }
+            };
+            let count = count_codex_input_tokens(&codex_body);
+            let response_body = serde_json::to_vec(&serde_json::json!({ "input_tokens": count }))
+                .unwrap_or_else(|_| b"{\"input_tokens\":0}".to_vec());
+            let entry = ProxyLogEntry {
+                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                method: method_label.clone(),
+                path: path.clone(),
+                request_url: Some("local:/v1/messages/count_tokens".to_string()),
+                status: StatusCode::OK.as_u16(),
+                duration_ms: started_at.elapsed().as_millis() as u64,
+                proxy_account_id: config.provider_name.clone(),
+                account_id: None,
+                error: None,
+                model: body_json.get("model").and_then(|v| v.as_str()).map(|v| v.to_string()),
+                request_headers: request_headers_json.clone(),
+                response_headers: headers_to_json_string(vec![
+                    ("content-type".to_string(), "application/json".to_string()),
+                ]),
+                request_body: request_body_text.clone(),
+                response_body: Some(truncate_body(&response_body)),
+                input_tokens: Some(count),
+                output_tokens: Some(0),
+            };
+            let _ = insert_proxy_log(&entry);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Access-Control-Allow-Headers", "*")
+                .body(Body::from(response_body))
+                .unwrap();
+        }
+
+        if is_anthropic {
+            if method != reqwest::Method::POST {
+                return Response::builder()
+                    .status(StatusCode::METHOD_NOT_ALLOWED)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(Body::from("Method not allowed"))
+                    .unwrap();
+            }
+            let body_json: Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Body::from(format!("Invalid JSON: {err}")))
+                        .unwrap();
+                }
+            };
+            let (mut responses_request, reverse_map, stream) = match convert_claude_to_codex(&body_json) {
+                Ok(v) => v,
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Body::from(err))
+                        .unwrap();
+                }
+            };
+            let mapped_model = map_openai_compat_model(
+                &config,
+                responses_request.get("model").and_then(|v| v.as_str()),
+            )
+            .ok_or_else(|| "请先配置默认模型或模型映射".to_string())
+            .unwrap_or_default();
+            let mut temp_cfg = proxy_config_snapshot();
+            temp_cfg.model_override = Some(mapped_model);
+            let (chat_request, _) = match convert_responses_request_to_chat_completions(&responses_request, &temp_cfg) {
+                Ok(v) => v,
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Body::from(err))
+                        .unwrap();
+                }
+            };
+            request_model = body_json.get("model").and_then(|v| v.as_str()).map(|v| v.to_string());
+            responses_request["model"] = serde_json::json!(
+                body_json.get("model").and_then(|v| v.as_str()).unwrap_or(
+                    config.default_model.as_deref().unwrap_or("")
+                )
+            );
+            request_body_text = Some(truncate_body(&serde_json::to_vec(&chat_request).unwrap_or_default()));
+            upstream_body_bytes = serde_json::to_vec(&chat_request).unwrap_or_default().into();
+            upstream_path = "/v1/chat/completions".to_string();
+            translated_request_json = Some(responses_request);
+            anthropic_reverse_tool_map = Some(reverse_map);
+            is_stream = stream;
+        } else if custom_responses_path {
             if method != reqwest::Method::POST {
                 return Response::builder()
                     .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -6574,6 +7271,35 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
         let upstream_status = upstream_resp.status();
         let response_headers_json = headers_to_json_string(sanitize_reqwest_headers(upstream_resp.headers()));
 
+        if is_anthropic && is_stream && upstream_status.is_success() {
+            let entry = ProxyLogEntry {
+                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                method: method_label.clone(),
+                path: path.clone(),
+                request_url,
+                status: upstream_status.as_u16(),
+                duration_ms: started_at.elapsed().as_millis() as u64,
+                proxy_account_id: config.provider_name.clone(),
+                account_id: None,
+                error: None,
+                model: request_model,
+                request_headers: request_headers_json,
+                response_headers: headers_to_json_string(vec![
+                    ("content-type".to_string(), "text/event-stream".to_string()),
+                ]),
+                request_body: request_body_text,
+                response_body: None,
+                input_tokens: None,
+                output_tokens: None,
+            };
+            return build_openai_chat_to_claude_stream_response(
+                upstream_resp,
+                anthropic_reverse_tool_map.unwrap_or_default(),
+                entry,
+            )
+            .await;
+        }
+
         if custom_responses_path && is_stream && upstream_status.is_success() {
             let entry = ProxyLogEntry {
                 timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -6605,6 +7331,82 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
 
         let headers = upstream_resp.headers().clone();
         let bytes = upstream_resp.bytes().await.unwrap_or_default();
+        if is_anthropic && upstream_status.is_success() {
+            let request_json = translated_request_json.unwrap_or_else(|| serde_json::json!({}));
+            match convert_chat_completions_non_stream_to_responses(&request_json, &bytes) {
+                Ok((responses_bytes, _, _, _)) => {
+                    match build_claude_response_body(
+                        &responses_bytes,
+                        &anthropic_reverse_tool_map.unwrap_or_default(),
+                        request_model.as_deref().unwrap_or("unknown"),
+                    ) {
+                        Ok((converted, input_tokens, output_tokens, response_body_text)) => {
+                            let entry = ProxyLogEntry {
+                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                method: method_label,
+                                path: path.clone(),
+                                request_url,
+                                status: upstream_status.as_u16(),
+                                duration_ms: started_at.elapsed().as_millis() as u64,
+                                proxy_account_id: config.provider_name.clone(),
+                                account_id: None,
+                                error: None,
+                                model: request_model,
+                                request_headers: request_headers_json,
+                                response_headers: headers_to_json_string(vec![
+                                    ("content-type".to_string(), "application/json".to_string()),
+                                ]),
+                                request_body: request_body_text,
+                                response_body: response_body_text,
+                                input_tokens,
+                                output_tokens,
+                            };
+                            let _ = insert_proxy_log(&entry);
+                            return Response::builder()
+                                .status(axum::http::StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::OK))
+                                .header("Content-Type", "application/json")
+                                .header("Access-Control-Allow-Origin", "*")
+                                .header("Access-Control-Allow-Headers", "*")
+                                .body(Body::from(converted))
+                                .unwrap();
+                        }
+                        Err(err) => {
+                            let entry = ProxyLogEntry {
+                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                method: method_label,
+                                path: path.clone(),
+                                request_url,
+                                status: StatusCode::BAD_GATEWAY.as_u16(),
+                                duration_ms: started_at.elapsed().as_millis() as u64,
+                                proxy_account_id: config.provider_name.clone(),
+                                account_id: None,
+                                error: Some(err.clone()),
+                                model: request_model,
+                                request_headers: request_headers_json,
+                                response_headers: response_headers_json,
+                                request_body: request_body_text,
+                                response_body: Some(truncate_body(&bytes)),
+                                input_tokens: None,
+                                output_tokens: None,
+                            };
+                            let _ = insert_proxy_log(&entry);
+                            return Response::builder()
+                                .status(StatusCode::BAD_GATEWAY)
+                                .header("Access-Control-Allow-Origin", "*")
+                                .body(Body::from(err))
+                                .unwrap();
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Body::from(err))
+                        .unwrap();
+                }
+            }
+        }
         if custom_responses_path && upstream_status.is_success() {
             let request_json = translated_request_json.unwrap_or_else(|| serde_json::json!({}));
             match convert_chat_completions_non_stream_to_responses(&request_json, &bytes) {
