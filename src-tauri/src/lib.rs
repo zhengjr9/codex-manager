@@ -408,6 +408,29 @@ struct ProxyLogDetail {
     output_tokens: Option<i64>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct ProxyTokenStatsItem {
+    name: String,
+    requests: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ProxyTokenStats {
+    window_hours: i64,
+    total_requests: i64,
+    success_requests: i64,
+    error_requests: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+    avg_duration_ms: f64,
+    top_models: Vec<ProxyTokenStatsItem>,
+    top_accounts: Vec<ProxyTokenStatsItem>,
+}
+
 struct ProxyLogEntry {
     timestamp: String,
     method: String,
@@ -1616,7 +1639,21 @@ fn convert_responses_request_to_chat_completions(
                         "function_call" => {
                             let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                             let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            let arguments = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+                            let arguments = match item.get("arguments") {
+                                Some(Value::String(s)) => {
+                                    if s.trim().is_empty() {
+                                        "{}".to_string()
+                                    } else if serde_json::from_str::<Value>(s).is_ok() {
+                                        s.clone()
+                                    } else {
+                                        "{}".to_string()
+                                    }
+                                }
+                                Some(v @ Value::Object(_)) | Some(v @ Value::Array(_)) => {
+                                    serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string())
+                                }
+                                _ => "{}".to_string(),
+                            };
                             if let Some(messages) = out.get_mut("messages").and_then(|v| v.as_array_mut()) {
                                 messages.push(serde_json::json!({
                                     "role": "assistant",
@@ -7010,6 +7047,115 @@ fn get_proxy_log_detail(log_id: i64) -> Result<ProxyLogDetail, String> {
     Ok(log)
 }
 
+#[tauri::command]
+fn get_proxy_token_stats(hours: Option<i64>) -> Result<ProxyTokenStats, String> {
+    let hours = hours.unwrap_or(24).clamp(1, 24 * 30);
+    let conn = proxy_log_db()?;
+    let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+
+    let (total_requests, success_requests, error_requests, input_tokens, output_tokens, avg_duration_ms): (i64, i64, i64, i64, i64, f64) = conn
+        .query_row(
+            "SELECT
+                COUNT(*) as total_requests,
+                COALESCE(SUM(CASE WHEN status >= 200 AND status < 400 THEN 1 ELSE 0 END), 0) as success_requests,
+                COALESCE(SUM(CASE WHEN status < 200 OR status >= 400 THEN 1 ELSE 0 END), 0) as error_requests,
+                COALESCE(SUM(input_tokens), 0) as input_tokens,
+                COALESCE(SUM(output_tokens), 0) as output_tokens,
+                COALESCE(AVG(duration_ms), 0) as avg_duration_ms
+             FROM request_logs
+             WHERE timestamp >= ?1",
+            params![since],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut top_models_stmt = conn
+        .prepare(
+            "SELECT
+                model,
+                COUNT(*) as requests,
+                COALESCE(SUM(input_tokens), 0) as input_tokens,
+                COALESCE(SUM(output_tokens), 0) as output_tokens,
+                COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) as total_tokens
+             FROM request_logs
+             WHERE timestamp >= ?1 AND model IS NOT NULL AND model != ''
+             GROUP BY model
+             ORDER BY total_tokens DESC, requests DESC
+             LIMIT 8",
+        )
+        .map_err(|e| e.to_string())?;
+    let top_models_iter = top_models_stmt
+        .query_map(params![since], |row| {
+            Ok(ProxyTokenStatsItem {
+                name: row.get(0)?,
+                requests: row.get(1)?,
+                input_tokens: row.get(2)?,
+                output_tokens: row.get(3)?,
+                total_tokens: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut top_models = Vec::new();
+    for item in top_models_iter {
+        top_models.push(item.map_err(|e| e.to_string())?);
+    }
+
+    let mut top_accounts_stmt = conn
+        .prepare(
+            "SELECT
+                COALESCE(NULLIF(account_id, ''), proxy_account_id) as account_name,
+                COUNT(*) as requests,
+                COALESCE(SUM(input_tokens), 0) as input_tokens,
+                COALESCE(SUM(output_tokens), 0) as output_tokens,
+                COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) as total_tokens
+             FROM request_logs
+             WHERE timestamp >= ?1
+             GROUP BY account_name
+             ORDER BY total_tokens DESC, requests DESC
+             LIMIT 8",
+        )
+        .map_err(|e| e.to_string())?;
+    let top_accounts_iter = top_accounts_stmt
+        .query_map(params![since], |row| {
+            Ok(ProxyTokenStatsItem {
+                name: row.get(0)?,
+                requests: row.get(1)?,
+                input_tokens: row.get(2)?,
+                output_tokens: row.get(3)?,
+                total_tokens: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut top_accounts = Vec::new();
+    for item in top_accounts_iter {
+        top_accounts.push(item.map_err(|e| e.to_string())?);
+    }
+
+    Ok(ProxyTokenStats {
+        window_hours: hours,
+        total_requests,
+        success_requests,
+        error_requests,
+        input_tokens,
+        output_tokens,
+        total_tokens: input_tokens + output_tokens,
+        avg_duration_ms,
+        top_models,
+        top_accounts,
+    })
+}
+
 // ─── Tauri commands: account usage ───────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -7359,6 +7505,7 @@ pub fn run() {
             get_proxy_logs_count_filtered,
             get_proxy_logs_filtered,
             get_proxy_log_detail,
+            get_proxy_token_stats,
             list_anthropic_keys,
             add_anthropic_key,
             delete_anthropic_key,

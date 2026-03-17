@@ -83,6 +83,27 @@ export interface ProxyLogDetail extends ProxyRequestLog {
   output_tokens: number | null
 }
 
+export interface ProxyTokenStatsItem {
+  name: string
+  requests: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+}
+
+export interface ProxyTokenStats {
+  window_hours: number
+  total_requests: number
+  success_requests: number
+  error_requests: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  avg_duration_ms: number
+  top_models: ProxyTokenStatsItem[]
+  top_accounts: ProxyTokenStatsItem[]
+}
+
 export interface AnthropicKeyEntry {
   id: string
   label: string | null
@@ -137,7 +158,9 @@ export const accountService = {
     invoke<number>('get_proxy_logs_count_filtered', payload ?? {}),
   getProxyLogs: (payload?: { filter?: string; errors_only?: boolean; limit?: number; offset?: number }) =>
     invoke<ProxyRequestLog[]>('get_proxy_logs_filtered', payload ?? {}),
-  getProxyLogDetail: (logId: number) => invoke<ProxyLogDetail>('get_proxy_log_detail', { log_id: logId }),
+  getProxyLogDetail: (logId: number) => invoke<ProxyLogDetail>('get_proxy_log_detail', { logId }),
+  getProxyTokenStats: (hours?: number) =>
+    invoke<ProxyTokenStats>('get_proxy_token_stats', { hours: hours ?? 24 }),
   listCodexModels: () => invoke<string[]>('list_codex_models'),
 
   // OpenAI Compat Proxy
@@ -148,7 +171,13 @@ export const accountService = {
     api_key: string
     default_model?: string | null
     model_mappings?: OpenAICompatModelMapping[]
-  }) => invoke<OpenAICompatConfig>('create_openai_compat_config', payload),
+  }) => invoke<OpenAICompatConfig>('create_openai_compat_config', {
+    providerName: payload.provider_name,
+    baseUrl: payload.base_url,
+    apiKey: payload.api_key,
+    defaultModel: payload.default_model ?? null,
+    modelMappings: payload.model_mappings ?? [],
+  }),
   updateOpenAICompatConfig: (payload: {
     id: string
     provider_name: string
@@ -156,13 +185,20 @@ export const accountService = {
     api_key: string
     default_model?: string | null
     model_mappings?: OpenAICompatModelMapping[]
-  }) => invoke<OpenAICompatConfig>('update_openai_compat_config', payload),
+  }) => invoke<OpenAICompatConfig>('update_openai_compat_config', {
+    id: payload.id,
+    providerName: payload.provider_name,
+    baseUrl: payload.base_url,
+    apiKey: payload.api_key,
+    defaultModel: payload.default_model ?? null,
+    modelMappings: payload.model_mappings ?? [],
+  }),
   deleteOpenAICompatConfig: (id: string) => invoke<boolean>('delete_openai_compat_config', { id }),
   listOpenAICompatProviderModels: (configId: string) =>
-    invoke<string[]>('list_openai_compat_provider_models', { config_id: configId }),
+    invoke<string[]>('list_openai_compat_provider_models', { configId }),
   startOpenAICompatProxy: (configId: string, port?: number) =>
     invoke<{ success: boolean; port: number; base_url: string; config_id: string; provider_name: string }>('start_openai_compat_proxy', {
-      config_id: configId,
+      configId,
       port: port ?? 8081,
     }),
   stopOpenAICompatProxy: () => invoke<{ success: boolean }>('stop_openai_compat_proxy'),

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Button,
   Card,
@@ -58,13 +58,23 @@ export default function OpenAICompatProxyPage() {
   const [saving, setSaving] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
   const [draft, setDraft] = useState<CompatDraft>(emptyDraft())
+  const [saveError, setSaveError] = useState<string | null>(null)
   const [providerModels, setProviderModels] = useState<string[]>([])
   const [providerModelsLoading, setProviderModelsLoading] = useState(false)
+  const detailCardRef = useRef<HTMLDivElement | null>(null)
+  const activeSelectedId = selectedId ?? status.config_id ?? null
 
   const selectedConfig = useMemo(
-    () => configs.find(item => item.id === (selectedId ?? status.config_id ?? '')) ?? null,
-    [configs, selectedId, status.config_id],
+    () => configs.find(item => item.id === (activeSelectedId ?? '')) ?? null,
+    [configs, activeSelectedId],
   )
+
+  function handleSelectConfig(id: string) {
+    setSelectedId(id)
+    requestAnimationFrame(() => {
+      detailCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }
 
   async function refresh() {
     setLoading(true)
@@ -108,6 +118,7 @@ export default function OpenAICompatProxyPage() {
 
   function openCreateModal() {
     setDraft(emptyDraft())
+    setSaveError(null)
     setModalOpen(true)
   }
 
@@ -120,22 +131,27 @@ export default function OpenAICompatProxyPage() {
       default_model: config.default_model ?? '',
       model_mappings: config.model_mappings.length > 0 ? config.model_mappings : [{ alias: '', provider_model: '' }],
     })
+    setSaveError(null)
     setModalOpen(true)
   }
 
   async function saveDraft() {
     if (!draft.provider_name.trim()) {
+      setSaveError('请填写 Provider 命名')
       message.error('请填写 Provider 命名')
       return
     }
     if (!draft.base_url.trim()) {
+      setSaveError('请填写兼容地址')
       message.error('请填写兼容地址')
       return
     }
     if (!draft.api_key.trim()) {
+      setSaveError('请填写兼容 API Key')
       message.error('请填写兼容 API Key')
       return
     }
+    setSaveError(null)
     setSaving(true)
     try {
       const payload = {
@@ -151,10 +167,13 @@ export default function OpenAICompatProxyPage() {
       setModalOpen(false)
       setSelectedId(result.id)
       await refresh()
+      setSaveError(null)
       message.success(draft.id ? '配置已更新' : '配置已创建')
     } catch (e) {
       console.error('save openai compat config failed', e)
-      message.error(String(e))
+      const errorText = e instanceof Error ? e.message : String(e)
+      setSaveError(errorText)
+      message.error(errorText)
     } finally {
       setSaving(false)
     }
@@ -163,7 +182,7 @@ export default function OpenAICompatProxyPage() {
   async function toggleProxy(checked: boolean) {
     try {
       if (checked) {
-        const configId = selectedId ?? configs[0]?.id
+        const configId = activeSelectedId ?? configs[0]?.id
         if (!configId) {
           throw new Error('请先创建一个 Provider 配置')
         }
@@ -227,7 +246,7 @@ export default function OpenAICompatProxyPage() {
       width: 210,
       render: (_: unknown, record: OpenAICompatConfig) => (
         <Space>
-          <Button size="small" type={selectedId === record.id ? 'primary' : 'default'} onClick={() => setSelectedId(record.id)}>
+          <Button size="small" type={activeSelectedId === record.id ? 'primary' : 'default'} onClick={() => handleSelectConfig(record.id)}>
             查看
           </Button>
           <Button size="small" icon={<EditOutlined />} onClick={() => openEditModal(record)}>
@@ -256,8 +275,8 @@ export default function OpenAICompatProxyPage() {
           <Space>
             <Select
               placeholder="选择 Provider"
-              value={selectedId ?? undefined}
-              onChange={setSelectedId}
+              value={activeSelectedId ?? undefined}
+              onChange={handleSelectConfig}
               className="w-64"
               options={configs.map(item => ({ label: item.provider_name, value: item.id }))}
               disabled={status.running}
@@ -302,12 +321,17 @@ export default function OpenAICompatProxyPage() {
           loading={loading}
           columns={columns}
           dataSource={configs}
+          onRow={(record) => ({
+            onClick: () => handleSelectConfig(record.id),
+          })}
+          rowClassName={(record) => (activeSelectedId === record.id ? 'bg-blue-50' : '')}
           pagination={{ pageSize: 8, hideOnSinglePage: true }}
           locale={{ emptyText: <Empty description="暂无 Provider 配置" /> }}
         />
       </Card>
 
       <Card
+        ref={detailCardRef}
         size="small"
         title="配置查看"
         className="border-gray-200 shadow-sm"
@@ -371,6 +395,7 @@ export default function OpenAICompatProxyPage() {
         width={760}
       >
         <Form layout="vertical">
+          {saveError ? <Text type="danger">{saveError}</Text> : null}
           <Form.Item label="Provider 命名" required>
             <Input
               placeholder="例如 Midea GLM"

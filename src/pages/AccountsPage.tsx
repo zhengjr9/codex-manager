@@ -11,7 +11,14 @@ import {
 } from '@ant-design/icons'
 import { useAccountStore } from '../stores/useAccountStore'
 import type { CodexAccount } from '../types/account'
-import { accountService, type AccountUsage, type ProxyConfig, type ProxyRequestLog, type ProxyLogDetail } from '../services/accountService'
+import {
+  accountService,
+  type AccountUsage,
+  type ProxyConfig,
+  type ProxyRequestLog,
+  type ProxyLogDetail,
+  type ProxyTokenStats,
+} from '../services/accountService'
 import PlanBadge from '../components/accounts/PlanBadge'
 import AccountLabelEditor from '../components/accounts/AccountLabelEditor'
 import AddAccountDialog from '../components/accounts/AddAccountDialog'
@@ -63,6 +70,66 @@ function formatCapturedAt(ts: number): string {
   if (mins < 1) return '刚刚'
   if (mins < 60) return `${mins}分钟前`
   return `${Math.floor(mins / 60)}小时前`
+}
+
+function prettyJson(raw?: string | null): string {
+  if (!raw) return '--'
+  const text = raw.trim()
+  if (!text) return '--'
+  try {
+    const parsed = JSON.parse(text) as unknown
+    if (Array.isArray(parsed) && parsed.every((item) => Array.isArray(item) && item.length === 2)) {
+      const headersObj: Record<string, string> = {}
+      parsed.forEach((item) => {
+        const [k, v] = item as [unknown, unknown]
+        if (typeof k === 'string') headersObj[k] = String(v ?? '')
+      })
+      return JSON.stringify(headersObj, null, 2)
+    }
+    return JSON.stringify(parsed, null, 2)
+  } catch {
+    return raw
+  }
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+function highlightJson(jsonText: string): string {
+  const escaped = escapeHtml(jsonText)
+  return escaped.replace(
+    /("(?:\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*")(\s*:)?|\b(true|false)\b|\bnull\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g,
+    (match, quoted, isKey, boolValue) => {
+      if (quoted) {
+        if (isKey) {
+          return `<span style="color:#1d4ed8;font-weight:600;">${quoted}</span>${isKey}`
+        }
+        return `<span style="color:#15803d;">${quoted}</span>`
+      }
+      if (boolValue) {
+        return `<span style="color:#b45309;font-weight:600;">${match}</span>`
+      }
+      if (match === 'null') {
+        return `<span style="color:#6b7280;font-style:italic;">null</span>`
+      }
+      return `<span style="color:#7c3aed;">${match}</span>`
+    },
+  )
+}
+
+function JsonViewer({ value, small }: { value?: string | null; small?: boolean }) {
+  const content = prettyJson(value)
+  const highlighted = highlightJson(content)
+  return (
+    <pre
+      className={`text-xs bg-gray-50 p-2 rounded border border-gray-200 overflow-auto whitespace-pre-wrap break-all font-mono ${small ? 'max-h-24' : 'max-h-48'}`}
+      dangerouslySetInnerHTML={{ __html: highlighted }}
+    />
+  )
 }
 
 function UsageCell({ usage, loading }: { usage: AccountUsage | undefined; loading: boolean }) {
@@ -207,6 +274,9 @@ export default function AccountsPage() {
   const [expandedRowData, setExpandedRowData] = useState<Record<number, ProxyLogDetail>>({})
   const [expandedRowLoading, setExpandedRowLoading] = useState<Set<number>>(new Set())
   const [expandedRowError, setExpandedRowError] = useState<Record<number, string>>({})
+  const [tokenStats, setTokenStats] = useState<ProxyTokenStats | null>(null)
+  const [tokenStatsLoading, setTokenStatsLoading] = useState(false)
+  const [tokenStatsHours, setTokenStatsHours] = useState(24)
 
   // 初始加载账号
   useEffect(() => {
@@ -286,6 +356,22 @@ export default function AccountsPage() {
     refreshProxyLogs()
   }, [logsFilter, logsErrorsOnly, logsPage, logsPageSize])
 
+  async function refreshProxyTokenStats(hours = tokenStatsHours) {
+    setTokenStatsLoading(true)
+    try {
+      const stats = await accountService.getProxyTokenStats(hours)
+      setTokenStats(stats)
+    } catch {
+      setTokenStats(null)
+    } finally {
+      setTokenStatsLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    refreshProxyTokenStats(tokenStatsHours)
+  }, [tokenStatsHours])
+
   async function handleSwitch(id: string) {
     setSwitching(id)
     try {
@@ -363,6 +449,7 @@ export default function AccountsPage() {
       await accountService.clearProxyLogs()
       setLogs([])
       setLogsTotal(0)
+      await refreshProxyTokenStats()
       message.success('日志已清空')
     } catch (e) {
       message.error(String(e))
@@ -415,15 +502,11 @@ export default function AccountsPage() {
     }
   }
 
-  function formatHeaders(raw?: string | null) {
-    if (!raw) return '--'
-    try {
-      const parsed = JSON.parse(raw) as Array<[string, string]>
-      if (Array.isArray(parsed)) {
-        return parsed.map(([k, v]) => `${k}: ${v}`).join('\n')
-      }
-    } catch {}
-    return raw
+  function formatTokenCount(v?: number | null) {
+    if (!v) return '0'
+    if (Math.abs(v) >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`
+    if (Math.abs(v) >= 1_000) return `${(v / 1_000).toFixed(1)}k`
+    return String(v)
   }
 
   async function handleRefreshAll() {
@@ -884,6 +967,14 @@ export default function AccountsPage() {
             <Button size="small" icon={<ReloadOutlined />} onClick={() => refreshProxyLogs()}>
               刷新
             </Button>
+            <Button
+              size="small"
+              icon={<ReloadOutlined />}
+              onClick={() => refreshProxyTokenStats()}
+              loading={tokenStatsLoading}
+            >
+              刷新统计
+            </Button>
             <Popconfirm title="确认清空日志？" onConfirm={handleClearLogs}>
               <Button size="small" danger>清空</Button>
             </Popconfirm>
@@ -899,6 +990,61 @@ export default function AccountsPage() {
       >
         {!logsCollapsed && (
           <div>
+            <Card
+              size="small"
+              className="mb-3 border-gray-200"
+              title="Token 统计"
+              extra={(
+                <Select
+                  size="small"
+                  value={tokenStatsHours}
+                  onChange={setTokenStatsHours}
+                  className="w-28"
+                  options={[
+                    { label: '近 1 小时', value: 1 },
+                    { label: '近 24 小时', value: 24 },
+                    { label: '近 7 天', value: 24 * 7 },
+                  ]}
+                />
+              )}
+            >
+              <Spin spinning={tokenStatsLoading}>
+                <Row gutter={12}>
+                  <Col span={4}><Statistic title="请求" value={tokenStats?.total_requests ?? 0} /></Col>
+                  <Col span={4}><Statistic title="成功" value={tokenStats?.success_requests ?? 0} /></Col>
+                  <Col span={4}><Statistic title="错误" value={tokenStats?.error_requests ?? 0} /></Col>
+                  <Col span={4}><Statistic title="输入 Token" value={formatTokenCount(tokenStats?.input_tokens)} /></Col>
+                  <Col span={4}><Statistic title="输出 Token" value={formatTokenCount(tokenStats?.output_tokens)} /></Col>
+                  <Col span={4}><Statistic title="总 Token" value={formatTokenCount(tokenStats?.total_tokens)} /></Col>
+                </Row>
+                <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div>
+                    <Text strong className="text-xs">Top 模型</Text>
+                    <div className="mt-1 flex flex-wrap gap-2">
+                      {(tokenStats?.top_models ?? []).length > 0
+                        ? (tokenStats?.top_models ?? []).map((item) => (
+                          <Tag key={`model-${item.name}`} color="blue">
+                            {item.name} · {formatTokenCount(item.total_tokens)}
+                          </Tag>
+                        ))
+                        : <Text type="secondary" className="text-xs">暂无</Text>}
+                    </div>
+                  </div>
+                  <div>
+                    <Text strong className="text-xs">Top 账号</Text>
+                    <div className="mt-1 flex flex-wrap gap-2">
+                      {(tokenStats?.top_accounts ?? []).length > 0
+                        ? (tokenStats?.top_accounts ?? []).map((item) => (
+                          <Tag key={`account-${item.name}`} color="geekblue">
+                            {item.name} · {formatTokenCount(item.total_tokens)}
+                          </Tag>
+                        ))
+                        : <Text type="secondary" className="text-xs">暂无</Text>}
+                    </div>
+                  </div>
+                </div>
+              </Spin>
+            </Card>
             <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between mb-3">
               <Input
                 placeholder="搜索路径/状态/账号"
@@ -956,9 +1102,7 @@ export default function AccountsPage() {
                       <Text strong className="text-xs">请求地址</Text>
                       <Button size="small" onClick={() => copyText('请求地址', detail.request_url)}>复制</Button>
                     </div>
-                    <pre className="text-xs bg-gray-50 p-2 rounded border border-gray-200 overflow-auto max-h-24 whitespace-pre-wrap break-all">
-                      {detail.request_url || '--'}
-                    </pre>
+                    <JsonViewer value={detail.request_url} small />
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     <div className="space-y-1">
@@ -966,18 +1110,14 @@ export default function AccountsPage() {
                         <Text strong className="text-xs">请求头</Text>
                         <Button size="small" onClick={() => copyText('请求头', detail.request_headers)}>复制</Button>
                       </div>
-                      <pre className="text-xs bg-gray-50 p-2 rounded border border-gray-200 overflow-auto max-h-32 whitespace-pre-wrap break-all">
-                        {formatHeaders(detail.request_headers)}
-                      </pre>
+                      <JsonViewer value={detail.request_headers} />
                     </div>
                     <div className="space-y-1">
                       <div className="flex items-center justify-between">
                         <Text strong className="text-xs">响应头</Text>
                         <Button size="small" onClick={() => copyText('响应头', detail.response_headers)}>复制</Button>
                       </div>
-                      <pre className="text-xs bg-gray-50 p-2 rounded border border-gray-200 overflow-auto max-h-32 whitespace-pre-wrap break-all">
-                        {formatHeaders(detail.response_headers)}
-                      </pre>
+                      <JsonViewer value={detail.response_headers} />
                     </div>
                   </div>
                   <div className="grid grid-cols-2 gap-3">
@@ -986,18 +1126,14 @@ export default function AccountsPage() {
                         <Text strong className="text-xs">请求体</Text>
                         <Button size="small" onClick={() => copyText('请求体', detail.request_body)}>复制</Button>
                       </div>
-                      <pre className="text-xs bg-gray-50 p-2 rounded border border-gray-200 overflow-auto max-h-48 whitespace-pre-wrap break-all">
-                        {detail.request_body || '--'}
-                      </pre>
+                      <JsonViewer value={detail.request_body} />
                     </div>
                     <div className="space-y-1">
                       <div className="flex items-center justify-between">
                         <Text strong className="text-xs">响应体</Text>
                         <Button size="small" onClick={() => copyText('响应体', detail.response_body)}>复制</Button>
                       </div>
-                      <pre className="text-xs bg-gray-50 p-2 rounded border border-gray-200 overflow-auto max-h-48 whitespace-pre-wrap break-all">
-                        {detail.response_body || '--'}
-                      </pre>
+                      <JsonViewer value={detail.response_body} />
                     </div>
                   </div>
                   {detail.error && (
