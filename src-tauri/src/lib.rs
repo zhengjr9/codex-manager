@@ -2422,12 +2422,24 @@ fn convert_responses_request_to_chat_completions(
                             }
                         }
                         "function_call" => {
-                            let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(|v| v.as_str())
+                                .map(unwrap_client_tool_call_id)
+                                .unwrap_or_default();
                             let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                             let arguments = item
                                 .get("arguments")
                                 .map(normalize_tool_arguments_string)
                                 .unwrap_or_else(|| "{}".to_string());
+                            if !call_id.is_empty() || !name.is_empty() {
+                                log_proxy(&format!(
+                                    "responses->chat tool_call call_id={} name={} args_len={}",
+                                    call_id,
+                                    name,
+                                    arguments.len()
+                                ));
+                            }
                             if let Some(messages) = out.get_mut("messages").and_then(|v| v.as_array_mut()) {
                                 messages.push(serde_json::json!({
                                     "role": "assistant",
@@ -2444,7 +2456,11 @@ fn convert_responses_request_to_chat_completions(
                             }
                         }
                         "function_call_output" => {
-                            let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(|v| v.as_str())
+                                .map(unwrap_client_tool_call_id)
+                                .unwrap_or_default();
                             let output = item
                                 .get("output")
                                 .map(|v| {
@@ -2455,6 +2471,13 @@ fn convert_responses_request_to_chat_completions(
                                     }
                                 })
                                 .unwrap_or_default();
+                            if !call_id.is_empty() {
+                                log_proxy(&format!(
+                                    "responses->chat tool_output call_id={} output_len={}",
+                                    call_id,
+                                    output.len()
+                                ));
+                            }
                             if let Some(messages) = out.get_mut("messages").and_then(|v| v.as_array_mut()) {
                                 messages.push(serde_json::json!({
                                     "role": "tool",
@@ -3134,8 +3157,17 @@ struct CustomResponsesStreamState {
     started: bool,
     done: bool,
     seq: i64,
+    next_output_index: i64,
     response_id: String,
     created_at: i64,
+    // OpenAI Chat `choice.index` -> Responses `output_index`
+    message_output_index: HashMap<i64, i64>,
+    // OpenAI Chat `choice.index` -> Responses `output_index`
+    reasoning_output_index: HashMap<i64, i64>,
+    // key = "{choice_index}:{tool_index}" -> Responses `output_index`
+    tool_output_index: HashMap<String, i64>,
+    // OpenAI Chat `tool_call.id` -> Responses `output_index` (preferred when available)
+    tool_output_index_by_call_id: HashMap<String, i64>,
     message_text: HashMap<i64, String>,
     message_added: HashSet<i64>,
     message_content_added: HashSet<i64>,
@@ -3152,6 +3184,40 @@ struct CustomResponsesStreamState {
     cached_tokens: Option<i64>,
     reasoning_tokens: Option<i64>,
     total_tokens: Option<i64>,
+}
+
+fn alloc_custom_output_index(state: &mut CustomResponsesStreamState) -> i64 {
+    let idx = state.next_output_index;
+    state.next_output_index += 1;
+    idx
+}
+
+fn wrap_client_tool_call_id(upstream_call_id: &str) -> String {
+    // Codex core (and some OpenAI client stacks) expect tool call ids to look like
+    // `chatcmpl-tool-*`. Make it reversible without shared state by embedding the
+    // upstream id when it starts with `call_`.
+    let upstream_call_id = upstream_call_id.trim();
+    if upstream_call_id.is_empty() {
+        return String::new();
+    }
+    if upstream_call_id.starts_with("chatcmpl-tool-") {
+        return upstream_call_id.to_string();
+    }
+    if upstream_call_id.starts_with("call_") {
+        return format!("chatcmpl-tool-{upstream_call_id}");
+    }
+    upstream_call_id.to_string()
+}
+
+fn unwrap_client_tool_call_id(call_id: &str) -> String {
+    let call_id = call_id.trim();
+    if let Some(rest) = call_id.strip_prefix("chatcmpl-tool-") {
+        // Only unwrap ids we wrapped (the embedded upstream id starts with `call_`).
+        if rest.starts_with("call_") {
+            return rest.to_string();
+        }
+    }
+    call_id.to_string()
 }
 
 fn push_custom_responses_sse(state: &mut CustomResponsesStreamState, event: &str, payload: &Value) {
@@ -3342,6 +3408,9 @@ fn finalize_custom_message(state: &mut CustomResponsesStreamState, output_index:
 
 fn finalize_custom_tool_call(state: &mut CustomResponsesStreamState, output_index: i64) {
     let Some(call_id) = state.tool_call_ids.get(&output_index).cloned() else {
+        log_proxy(&format!(
+            "custom_responses: missing tool call_id for output_index={output_index}"
+        ));
         return;
     };
     if state.tool_done.contains(&output_index) {
@@ -3399,50 +3468,65 @@ fn finalize_custom_responses_stream(state: &mut CustomResponsesStreamState) {
         finalize_custom_tool_call(state, idx);
     }
 
-    let mut output = Vec::new();
+    // Important: `output_index` must uniquely identify a slot in `response.output`.
+    // Build a unified list and sort by `output_index` so the final `output` order matches.
+    let mut output_items: Vec<(i64, Value)> = Vec::new();
+
     let mut reasoning_items = state.completed_reasoning.clone();
     reasoning_items.sort_by_key(|(idx, _, _)| *idx);
-    for (_, reasoning_id, text) in reasoning_items {
-        output.push(serde_json::json!({
-            "id": reasoning_id,
-            "type": "reasoning",
-            "summary": [{
-                "type": "summary_text",
-                "text": text,
-            }],
-        }));
+    for (idx, reasoning_id, text) in reasoning_items {
+        output_items.push((
+            idx,
+            serde_json::json!({
+                "id": reasoning_id,
+                "type": "reasoning",
+                "summary": [{
+                    "type": "summary_text",
+                    "text": text,
+                }],
+            }),
+        ));
     }
 
     let mut msg_indexes: Vec<i64> = state.message_added.iter().copied().collect();
     msg_indexes.sort_unstable();
     for idx in msg_indexes {
-        output.push(serde_json::json!({
-            "id": format!("msg_{}_{}", state.response_id, idx),
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "annotations": [],
-                "logprobs": [],
-                "text": state.message_text.get(&idx).cloned().unwrap_or_default(),
-            }],
-        }));
+        output_items.push((
+            idx,
+            serde_json::json!({
+                "id": format!("msg_{}_{}", state.response_id, idx),
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "annotations": [],
+                    "logprobs": [],
+                    "text": state.message_text.get(&idx).cloned().unwrap_or_default(),
+                }],
+            }),
+        ));
     }
 
     let mut tool_indexes: Vec<i64> = state.tool_call_ids.keys().copied().collect();
     tool_indexes.sort_unstable();
     for idx in tool_indexes {
         let call_id = state.tool_call_ids.get(&idx).cloned().unwrap_or_default();
-        output.push(serde_json::json!({
-            "id": format!("fc_{call_id}"),
-            "type": "function_call",
-            "status": "completed",
-            "arguments": state.tool_args.get(&idx).cloned().unwrap_or_else(|| "{}".to_string()),
-            "call_id": call_id,
-            "name": state.tool_names.get(&idx).cloned().unwrap_or_default(),
-        }));
+        output_items.push((
+            idx,
+            serde_json::json!({
+                "id": format!("fc_{call_id}"),
+                "type": "function_call",
+                "status": "completed",
+                "arguments": state.tool_args.get(&idx).cloned().unwrap_or_else(|| "{}".to_string()),
+                "call_id": call_id,
+                "name": state.tool_names.get(&idx).cloned().unwrap_or_default(),
+            }),
+        ));
     }
+
+    output_items.sort_by_key(|(idx, _)| *idx);
+    let output: Vec<Value> = output_items.into_iter().map(|(_, item)| item).collect();
 
     let mut response = serde_json::json!({
         "id": state.response_id.clone(),
@@ -3529,7 +3613,7 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
 
         if let Some(choices) = event.get("choices").and_then(|v| v.as_array()) {
             for choice in choices {
-                let output_index = choice.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                let choice_index = choice.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
                 let delta = choice.get("delta").unwrap_or(&Value::Null);
                 let reasoning_delta = delta
                     .get("reasoning")
@@ -3537,13 +3621,24 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                     .or_else(|| delta.get("reasoning_content").and_then(|v| v.as_str()))
                     .unwrap_or("");
                 if !reasoning_delta.is_empty() {
-                    if !state.active_reasoning_ids.contains_key(&output_index) {
-                        let reasoning_id = format!("rs_{}_{}", state.response_id, output_index);
-                        state.active_reasoning_ids.insert(output_index, reasoning_id.clone());
+                    let reasoning_output_index = if let Some(idx) =
+                        state.reasoning_output_index.get(&choice_index).copied()
+                    {
+                        idx
+                    } else {
+                        let idx = alloc_custom_output_index(state);
+                        state.reasoning_output_index.insert(choice_index, idx);
+                        idx
+                    };
+                    if !state.active_reasoning_ids.contains_key(&reasoning_output_index) {
+                        let reasoning_id = format!("rs_{}_{}", state.response_id, reasoning_output_index);
+                        state
+                            .active_reasoning_ids
+                            .insert(reasoning_output_index, reasoning_id.clone());
                         let added = serde_json::json!({
                             "type": "response.output_item.added",
                             "sequence_number": next_custom_responses_seq(state),
-                            "output_index": output_index,
+                            "output_index": reasoning_output_index,
                             "item": {
                                 "id": reasoning_id,
                                 "type": "reasoning",
@@ -3555,8 +3650,8 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                         let part_added = serde_json::json!({
                             "type": "response.reasoning_summary_part.added",
                             "sequence_number": next_custom_responses_seq(state),
-                            "item_id": state.active_reasoning_ids.get(&output_index).cloned().unwrap_or_default(),
-                            "output_index": output_index,
+                            "item_id": state.active_reasoning_ids.get(&reasoning_output_index).cloned().unwrap_or_default(),
+                            "output_index": reasoning_output_index,
                             "summary_index": 0,
                             "part": {
                                 "type": "summary_text",
@@ -3567,14 +3662,14 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                     }
                     state
                         .active_reasoning_text
-                        .entry(output_index)
+                        .entry(reasoning_output_index)
                         .or_default()
                         .push_str(reasoning_delta);
                     let payload = serde_json::json!({
                         "type": "response.reasoning_summary_text.delta",
                         "sequence_number": next_custom_responses_seq(state),
-                        "item_id": state.active_reasoning_ids.get(&output_index).cloned().unwrap_or_default(),
-                        "output_index": output_index,
+                        "item_id": state.active_reasoning_ids.get(&reasoning_output_index).cloned().unwrap_or_default(),
+                        "output_index": reasoning_output_index,
                         "summary_index": 0,
                         "delta": reasoning_delta,
                     });
@@ -3582,49 +3677,110 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                 }
 
                 if let Some(text_delta) = delta.get("content").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
-                    finalize_custom_reasoning(state, output_index);
-                    ensure_custom_message_started(state, output_index);
+                    if let Some(reasoning_output_index) = state.reasoning_output_index.get(&choice_index).copied() {
+                        finalize_custom_reasoning(state, reasoning_output_index);
+                    }
+                    let message_output_index = if let Some(idx) =
+                        state.message_output_index.get(&choice_index).copied()
+                    {
+                        idx
+                    } else {
+                        let idx = alloc_custom_output_index(state);
+                        state.message_output_index.insert(choice_index, idx);
+                        idx
+                    };
+                    ensure_custom_message_started(state, message_output_index);
                     let payload = serde_json::json!({
                         "type": "response.output_text.delta",
                         "sequence_number": next_custom_responses_seq(state),
-                        "item_id": format!("msg_{}_{}", state.response_id, output_index),
-                        "output_index": output_index,
+                        "item_id": format!("msg_{}_{}", state.response_id, message_output_index),
+                        "output_index": message_output_index,
                         "content_index": 0,
                         "delta": text_delta,
                         "logprobs": [],
                     });
                     push_custom_responses_sse(state, "response.output_text.delta", &payload);
-                    state.message_text.entry(output_index).or_default().push_str(text_delta);
+                    state
+                        .message_text
+                        .entry(message_output_index)
+                        .or_default()
+                        .push_str(text_delta);
                 }
 
                 if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                    finalize_custom_reasoning(state, output_index);
-                    finalize_custom_message(state, output_index);
-                    for tool_call in tool_calls {
-                        let tool_index = tool_call.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                    if let Some(reasoning_output_index) = state.reasoning_output_index.get(&choice_index).copied() {
+                        finalize_custom_reasoning(state, reasoning_output_index);
+                    }
+                    if let Some(message_output_index) = state.message_output_index.get(&choice_index).copied() {
+                        finalize_custom_message(state, message_output_index);
+                    }
+                    for (pos, tool_call) in tool_calls.iter().enumerate() {
+                        // Some upstreams omit `tool_call.index`. Use array position as a stable fallback.
+                        let tool_index = tool_call
+                            .get("index")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(pos as i64);
+                        let tool_key = format!("{choice_index}:{tool_index}");
+                        let fallback_output_index = if let Some(idx) = state.tool_output_index.get(&tool_key).copied() {
+                            idx
+                        } else {
+                            let idx = alloc_custom_output_index(state);
+                            state.tool_output_index.insert(tool_key, idx);
+                            idx
+                        };
+
+                        let upstream_call_id =
+                            tool_call.get("id").and_then(|v| v.as_str()).filter(|v| !v.is_empty());
+                        let client_call_id = upstream_call_id.map(wrap_client_tool_call_id);
+                        let tool_output_index = if let Some(call_id) = client_call_id.as_ref() {
+                            if let Some(existing) = state.tool_output_index_by_call_id.get(call_id).copied() {
+                                if existing != fallback_output_index {
+                                    log_proxy(&format!(
+                                        "custom_responses: tool output_index mismatch call_id={} existing={} fallback={} choice_index={} tool_index={}",
+                                        call_id, existing, fallback_output_index, choice_index, tool_index
+                                    ));
+                                }
+                                existing
+                            } else {
+                                state.tool_output_index_by_call_id.insert(
+                                    call_id.to_string(),
+                                    fallback_output_index,
+                                );
+                                fallback_output_index
+                            }
+                        } else {
+                            fallback_output_index
+                        };
                         if let Some(name) = tool_call
                             .get("function")
                             .and_then(|v| v.get("name"))
                             .and_then(|v| v.as_str())
                             .filter(|v| !v.is_empty())
                         {
-                            state.tool_names.insert(tool_index, name.to_string());
+                            state.tool_names.insert(tool_output_index, name.to_string());
                         }
-                        if let Some(call_id) = tool_call.get("id").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
-                            let is_new = !state.tool_call_ids.contains_key(&tool_index);
-                            state.tool_call_ids.insert(tool_index, call_id.to_string());
+                        if let Some(call_id) = client_call_id.as_ref() {
+                            let is_new = !state.tool_call_ids.contains_key(&tool_output_index);
+                            state.tool_call_ids.insert(tool_output_index, call_id.to_string());
                             if is_new {
+                                log_proxy(&format!(
+                                    "custom_responses: tool_call_added output_index={} call_id={} choice_index={} tool_index={}",
+                                    tool_output_index,
+                                    call_id,
+                                    choice_index,
+                                    tool_index
+                                ));
                                 let payload = serde_json::json!({
                                     "type": "response.output_item.added",
                                     "sequence_number": next_custom_responses_seq(state),
-                                    "output_index": tool_index,
+                                    "output_index": tool_output_index,
                                     "item": {
                                         "id": format!("fc_{call_id}"),
                                         "type": "function_call",
                                         "status": "in_progress",
                                         "arguments": "",
                                         "call_id": call_id,
-                                        "name": state.tool_names.get(&tool_index).cloned().unwrap_or_default(),
+                                        "name": state.tool_names.get(&tool_output_index).cloned().unwrap_or_default(),
                                     }
                                 });
                                 push_custom_responses_sse(state, "response.output_item.added", &payload);
@@ -3636,13 +3792,17 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                             .and_then(|v| v.as_str())
                             .filter(|v| !v.is_empty())
                         {
-                            state.tool_args.entry(tool_index).or_default().push_str(arguments_delta);
-                            if let Some(call_id) = state.tool_call_ids.get(&tool_index).cloned() {
+                            state
+                                .tool_args
+                                .entry(tool_output_index)
+                                .or_default()
+                                .push_str(arguments_delta);
+                            if let Some(call_id) = state.tool_call_ids.get(&tool_output_index).cloned() {
                                 let payload = serde_json::json!({
                                     "type": "response.function_call_arguments.delta",
                                     "sequence_number": next_custom_responses_seq(state),
                                     "item_id": format!("fc_{call_id}"),
-                                    "output_index": tool_index,
+                                    "output_index": tool_output_index,
                                     "delta": arguments_delta,
                                 });
                                 push_custom_responses_sse(state, "response.function_call_arguments.delta", &payload);
@@ -3652,8 +3812,12 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                 }
 
                 if choice.get("finish_reason").and_then(|v| v.as_str()).is_some() {
-                    finalize_custom_reasoning(state, output_index);
-                    finalize_custom_message(state, output_index);
+                    if let Some(reasoning_output_index) = state.reasoning_output_index.get(&choice_index).copied() {
+                        finalize_custom_reasoning(state, reasoning_output_index);
+                    }
+                    if let Some(message_output_index) = state.message_output_index.get(&choice_index).copied() {
+                        finalize_custom_message(state, message_output_index);
+                    }
                 }
             }
         }
@@ -3677,8 +3841,13 @@ async fn build_custom_openai_stream_response(
         started: false,
         done: false,
         seq: 0,
+        next_output_index: 0,
         response_id: String::new(),
         created_at: 0,
+        message_output_index: HashMap::new(),
+        reasoning_output_index: HashMap::new(),
+        tool_output_index: HashMap::new(),
+        tool_output_index_by_call_id: HashMap::new(),
         message_text: HashMap::new(),
         message_added: HashSet::new(),
         message_content_added: HashSet::new(),
