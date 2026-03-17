@@ -6181,6 +6181,10 @@ fn create_openai_compat_config(
         model_mappings,
         None,
     )?;
+    log_proxy(&format!(
+        "openai compat config create provider={} base_url={}",
+        config.provider_name, config.base_url
+    ));
     configs.push(config.clone());
     save_openai_compat_configs(&configs)?;
     Ok(config)
@@ -6210,6 +6214,10 @@ fn update_openai_compat_config(
         model_mappings,
         Some(created_at),
     )?;
+    log_proxy(&format!(
+        "openai compat config update id={} provider={} base_url={}",
+        config.id, config.provider_name, config.base_url
+    ));
     configs[idx] = config.clone();
     save_openai_compat_configs(&configs)?;
     if let Some(state) = OPENAI_COMPAT_PROXY_STATE.lock().unwrap().clone() {

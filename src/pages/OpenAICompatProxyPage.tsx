@@ -124,6 +124,18 @@ export default function OpenAICompatProxyPage() {
   }
 
   async function saveDraft() {
+    if (!draft.provider_name.trim()) {
+      message.error('请填写 Provider 命名')
+      return
+    }
+    if (!draft.base_url.trim()) {
+      message.error('请填写兼容地址')
+      return
+    }
+    if (!draft.api_key.trim()) {
+      message.error('请填写兼容 API Key')
+      return
+    }
     setSaving(true)
     try {
       const payload = {
@@ -141,6 +153,7 @@ export default function OpenAICompatProxyPage() {
       await refresh()
       message.success(draft.id ? '配置已更新' : '配置已创建')
     } catch (e) {
+      console.error('save openai compat config failed', e)
       message.error(String(e))
     } finally {
       setSaving(false)
@@ -354,6 +367,7 @@ export default function OpenAICompatProxyPage() {
         onCancel={() => setModalOpen(false)}
         onOk={saveDraft}
         confirmLoading={saving}
+        destroyOnClose
         width={760}
       >
         <Form layout="vertical">

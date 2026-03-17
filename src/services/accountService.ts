@@ -159,10 +159,10 @@ export const accountService = {
   }) => invoke<OpenAICompatConfig>('update_openai_compat_config', payload),
   deleteOpenAICompatConfig: (id: string) => invoke<boolean>('delete_openai_compat_config', { id }),
   listOpenAICompatProviderModels: (configId: string) =>
-    invoke<string[]>('list_openai_compat_provider_models', { configId }),
+    invoke<string[]>('list_openai_compat_provider_models', { config_id: configId }),
   startOpenAICompatProxy: (configId: string, port?: number) =>
     invoke<{ success: boolean; port: number; base_url: string; config_id: string; provider_name: string }>('start_openai_compat_proxy', {
-      configId,
+      config_id: configId,
       port: port ?? 8081,
     }),
   stopOpenAICompatProxy: () => invoke<{ success: boolean }>('stop_openai_compat_proxy'),
