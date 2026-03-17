@@ -16,6 +16,55 @@ use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tauri::Emitter;
 
+static TOOL_CALL_ID_MAP: OnceLock<Mutex<HashMap<String, (String, i64)>>> = OnceLock::new();
+
+fn tool_call_id_map() -> &'static Mutex<HashMap<String, (String, i64)>> {
+    TOOL_CALL_ID_MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_tool_call_id_mapping(client_call_id: &str, upstream_call_id: &str) {
+    let client_call_id = client_call_id.trim();
+    let upstream_call_id = upstream_call_id.trim();
+    if client_call_id.is_empty() || upstream_call_id.is_empty() {
+        return;
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let mut map = tool_call_id_map().lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(client_call_id.to_string(), (upstream_call_id.to_string(), now));
+
+    // Best-effort TTL + size cap to avoid unbounded growth.
+    const TTL_SECS: i64 = 60 * 60;
+    const MAX: usize = 20_000;
+    map.retain(|_, (_, ts)| now.saturating_sub(*ts) <= TTL_SECS);
+    if map.len() > MAX {
+        // Drop arbitrary extra keys (hashmap iteration order is fine for a cap).
+        let extra = map.len() - MAX;
+        let keys: Vec<String> = map.keys().take(extra).cloned().collect();
+        for k in keys {
+            map.remove(&k);
+        }
+    }
+}
+
+fn resolve_upstream_tool_call_id(call_id: &str) -> String {
+    let call_id = call_id.trim();
+    if call_id.is_empty() {
+        return String::new();
+    }
+    let unwrapped = unwrap_client_tool_call_id(call_id);
+    if unwrapped != call_id {
+        return unwrapped;
+    }
+    if !call_id.starts_with("chatcmpl-tool-") {
+        return call_id.to_string();
+    }
+    let map = tool_call_id_map().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(call_id)
+        .map(|(upstream, _)| upstream.clone())
+        .unwrap_or_else(|| call_id.to_string())
+}
+
 // ─── paths ───────────────────────────────────────────────────────────────────
 
 fn codex_dir() -> PathBuf {
@@ -2425,7 +2474,7 @@ fn convert_responses_request_to_chat_completions(
                             let call_id = item
                                 .get("call_id")
                                 .and_then(|v| v.as_str())
-                                .map(unwrap_client_tool_call_id)
+                                .map(resolve_upstream_tool_call_id)
                                 .unwrap_or_default();
                             let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                             let arguments = item
@@ -2459,7 +2508,7 @@ fn convert_responses_request_to_chat_completions(
                             let call_id = item
                                 .get("call_id")
                                 .and_then(|v| v.as_str())
-                                .map(unwrap_client_tool_call_id)
+                                .map(resolve_upstream_tool_call_id)
                                 .unwrap_or_default();
                             let output = item
                                 .get("output")
@@ -3178,6 +3227,7 @@ struct CustomResponsesStreamState {
     tool_call_ids: HashMap<i64, String>,
     tool_names: HashMap<i64, String>,
     tool_args: HashMap<i64, String>,
+    tool_added: HashSet<i64>,
     tool_done: HashSet<i64>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
@@ -3218,6 +3268,19 @@ fn unwrap_client_tool_call_id(call_id: &str) -> String {
         }
     }
     call_id.to_string()
+}
+
+fn synth_client_tool_call_id(response_id: &str, choice_index: i64, tool_index: i64) -> String {
+    // Stable across streaming deltas even if upstream omits/changes ids.
+    let mut hasher = Sha256::new();
+    hasher.update(response_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(choice_index.to_string().as_bytes());
+    hasher.update(b":");
+    hasher.update(tool_index.to_string().as_bytes());
+    let digest = hasher.finalize();
+    let token = URL_SAFE_NO_PAD.encode(&digest[..9]); // short + urlsafe
+    format!("chatcmpl-tool-synth_{token}")
 }
 
 fn push_custom_responses_sse(state: &mut CustomResponsesStreamState, event: &str, payload: &Value) {
@@ -3731,8 +3794,15 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
 
                         let upstream_call_id =
                             tool_call.get("id").and_then(|v| v.as_str()).filter(|v| !v.is_empty());
-                        let client_call_id = upstream_call_id.map(wrap_client_tool_call_id);
-                        let tool_output_index = if let Some(call_id) = client_call_id.as_ref() {
+                        let client_call_id = upstream_call_id
+                            .map(wrap_client_tool_call_id)
+                            .unwrap_or_else(|| synth_client_tool_call_id(&state.response_id, choice_index, tool_index));
+                        if let Some(upstream_call_id) = upstream_call_id {
+                            store_tool_call_id_mapping(&client_call_id, upstream_call_id);
+                        }
+
+                        let tool_output_index = if !client_call_id.is_empty() {
+                            let call_id = &client_call_id;
                             if let Some(existing) = state.tool_output_index_by_call_id.get(call_id).copied() {
                                 if existing != fallback_output_index {
                                     log_proxy(&format!(
@@ -3759,27 +3829,42 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                         {
                             state.tool_names.insert(tool_output_index, name.to_string());
                         }
-                        if let Some(call_id) = client_call_id.as_ref() {
-                            let is_new = !state.tool_call_ids.contains_key(&tool_output_index);
-                            state.tool_call_ids.insert(tool_output_index, call_id.to_string());
-                            if is_new {
+                        if !client_call_id.is_empty() {
+                            match state.tool_call_ids.get(&tool_output_index).cloned() {
+                                Some(existing) if existing != client_call_id => {
+                                    // Never overwrite: Codex needs a stable id to match tool output.
+                                    log_proxy(&format!(
+                                        "custom_responses: tool_call_id changed output_index={} existing={} new={} choice_index={} tool_index={}",
+                                        tool_output_index, existing, client_call_id, choice_index, tool_index
+                                    ));
+                                }
+                                Some(_) => {}
+                                None => {
+                                    state
+                                        .tool_call_ids
+                                        .insert(tool_output_index, client_call_id.clone());
+                                }
+                            }
+                            if !state.tool_added.contains(&tool_output_index) {
                                 log_proxy(&format!(
-                                    "custom_responses: tool_call_added output_index={} call_id={} choice_index={} tool_index={}",
+                                    "custom_responses: tool_call_added output_index={} call_id={} upstream_call_id={} choice_index={} tool_index={}",
                                     tool_output_index,
-                                    call_id,
+                                    client_call_id,
+                                    upstream_call_id.unwrap_or(""),
                                     choice_index,
                                     tool_index
                                 ));
+                                state.tool_added.insert(tool_output_index);
                                 let payload = serde_json::json!({
                                     "type": "response.output_item.added",
                                     "sequence_number": next_custom_responses_seq(state),
                                     "output_index": tool_output_index,
                                     "item": {
-                                        "id": format!("fc_{call_id}"),
+                                        "id": format!("fc_{}", client_call_id),
                                         "type": "function_call",
                                         "status": "in_progress",
                                         "arguments": "",
-                                        "call_id": call_id,
+                                        "call_id": client_call_id,
                                         "name": state.tool_names.get(&tool_output_index).cloned().unwrap_or_default(),
                                     }
                                 });
@@ -3858,6 +3943,7 @@ async fn build_custom_openai_stream_response(
         tool_call_ids: HashMap::new(),
         tool_names: HashMap::new(),
         tool_args: HashMap::new(),
+        tool_added: HashSet::new(),
         tool_done: HashSet::new(),
         input_tokens: None,
         output_tokens: None,
