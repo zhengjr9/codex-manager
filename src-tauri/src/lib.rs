@@ -3484,6 +3484,7 @@ fn finalize_custom_tool_call(state: &mut CustomResponsesStreamState, output_inde
         .get(&output_index)
         .cloned()
         .filter(|v| !v.is_empty())
+        .and_then(|v| repair_tool_arguments_json(&v).or(Some(v)))
         .unwrap_or_else(|| "{}".to_string());
     let name = state.tool_names.get(&output_index).cloned().unwrap_or_default();
     let args_done = serde_json::json!({
@@ -3509,6 +3510,39 @@ fn finalize_custom_tool_call(state: &mut CustomResponsesStreamState, output_inde
     });
     push_custom_responses_sse(state, "response.output_item.done", &item_done);
     state.tool_done.insert(output_index);
+}
+
+fn merge_custom_tool_arguments(existing: &str, incoming: &str) -> (String, Option<String>) {
+    let incoming = incoming.trim();
+    if incoming.is_empty() {
+        return (existing.to_string(), None);
+    }
+
+    if existing.is_empty() {
+        return (incoming.to_string(), Some(incoming.to_string()));
+    }
+
+    if incoming == existing {
+        return (existing.to_string(), None);
+    }
+
+    let repaired_existing = repair_tool_arguments_json(existing);
+    let repaired_incoming = repair_tool_arguments_json(incoming);
+
+    if let Some(incoming_json) = repaired_incoming.as_ref() {
+        if repaired_existing.as_ref() == Some(incoming_json) {
+            return (incoming_json.clone(), None);
+        }
+
+        // Some providers first stream partial fragments and then emit a full JSON object.
+        // Replacing the buffer avoids corrupt concatenation like `{..."{...}`.
+        return (incoming_json.clone(), None);
+    }
+
+    let mut merged = String::with_capacity(existing.len() + incoming.len());
+    merged.push_str(existing);
+    merged.push_str(incoming);
+    (merged, Some(incoming.to_string()))
 }
 
 fn finalize_custom_responses_stream(state: &mut CustomResponsesStreamState) {
@@ -3581,7 +3615,13 @@ fn finalize_custom_responses_stream(state: &mut CustomResponsesStreamState) {
                 "id": format!("fc_{call_id}"),
                 "type": "function_call",
                 "status": "completed",
-                "arguments": state.tool_args.get(&idx).cloned().unwrap_or_else(|| "{}".to_string()),
+                "arguments": state
+                    .tool_args
+                    .get(&idx)
+                    .cloned()
+                    .filter(|v| !v.is_empty())
+                    .and_then(|v| repair_tool_arguments_json(&v).or(Some(v)))
+                    .unwrap_or_else(|| "{}".to_string()),
                 "call_id": call_id,
                 "name": state.tool_names.get(&idx).cloned().unwrap_or_default(),
             }),
@@ -3877,20 +3917,30 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                             .and_then(|v| v.as_str())
                             .filter(|v| !v.is_empty())
                         {
-                            state
+                            let existing_arguments = state
                                 .tool_args
-                                .entry(tool_output_index)
-                                .or_default()
-                                .push_str(arguments_delta);
+                                .get(&tool_output_index)
+                                .cloned()
+                                .unwrap_or_default();
+                            let (merged_arguments, emitted_delta) =
+                                merge_custom_tool_arguments(&existing_arguments, arguments_delta);
+                            state.tool_args.insert(tool_output_index, merged_arguments);
                             if let Some(call_id) = state.tool_call_ids.get(&tool_output_index).cloned() {
-                                let payload = serde_json::json!({
-                                    "type": "response.function_call_arguments.delta",
-                                    "sequence_number": next_custom_responses_seq(state),
-                                    "item_id": format!("fc_{call_id}"),
-                                    "output_index": tool_output_index,
-                                    "delta": arguments_delta,
-                                });
-                                push_custom_responses_sse(state, "response.function_call_arguments.delta", &payload);
+                                if let Some(delta_to_emit) = emitted_delta {
+                                    let payload = serde_json::json!({
+                                        "type": "response.function_call_arguments.delta",
+                                        "sequence_number": next_custom_responses_seq(state),
+                                        "item_id": format!("fc_{call_id}"),
+                                        "output_index": tool_output_index,
+                                        "delta": delta_to_emit,
+                                    });
+                                    push_custom_responses_sse(state, "response.function_call_arguments.delta", &payload);
+                                } else if repair_tool_arguments_json(arguments_delta).is_some() {
+                                    log_proxy(&format!(
+                                        "custom_responses: replaced tool arguments with full JSON output_index={} call_id={}",
+                                        tool_output_index, call_id
+                                    ));
+                                }
                             }
                         }
                     }
