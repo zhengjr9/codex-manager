@@ -2306,6 +2306,43 @@ fn extract_balanced_json_object(input: &str) -> Option<String> {
         .max_by_key(|candidate| candidate.len())
 }
 
+fn extract_any_valid_json_object(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut best: Option<(usize, String)> = None;
+    let mut starts = Vec::new();
+
+    for (idx, byte) in bytes.iter().enumerate() {
+        if *byte == b'{' {
+            starts.push(idx);
+        }
+    }
+
+    for start in starts {
+        for end in (start + 1)..bytes.len() {
+            if bytes[end] != b'}' {
+                continue;
+            }
+            let Some(slice) = input.get(start..=end) else {
+                continue;
+            };
+            let Ok(Value::Object(_)) = serde_json::from_str::<Value>(slice) else {
+                continue;
+            };
+            let replace = match best.as_ref() {
+                Some((best_start, best_slice)) => {
+                    start > *best_start || (start == *best_start && slice.len() > best_slice.len())
+                }
+                None => true,
+            };
+            if replace {
+                best = Some((start, slice.to_string()));
+            }
+        }
+    }
+
+    best.map(|(_, slice)| slice)
+}
+
 fn repair_tool_arguments_json(args: &str) -> Option<String> {
     let trimmed = args.trim();
     if trimmed.is_empty() {
@@ -2322,7 +2359,9 @@ fn repair_tool_arguments_json(args: &str) -> Option<String> {
     match serde_json::from_str::<Value>(&repaired) {
         Ok(Value::Object(_)) => Some(repaired),
         _ => extract_balanced_json_object(trimmed)
-            .or_else(|| extract_balanced_json_object(&repaired)),
+            .or_else(|| extract_balanced_json_object(&repaired))
+            .or_else(|| extract_any_valid_json_object(trimmed))
+            .or_else(|| extract_any_valid_json_object(&repaired)),
     }
 }
 
