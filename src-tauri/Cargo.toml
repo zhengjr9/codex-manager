@@ -2,6 +2,7 @@
 name = "codex-manager"
 version = "1.0.0"
 edition = "2021"
+default-run = "codex-manager"
 
 [lib]
 name = "codex_manager_lib"
