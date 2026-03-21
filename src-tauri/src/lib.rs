@@ -4380,6 +4380,7 @@ fn build_claude_response_or_error_body(
     bytes: &Bytes,
     reverse_tool_map: &HashMap<String, String>,
     request_model: &str,
+    streamed_upstream: bool,
 ) -> Result<
     (
         Bytes,
@@ -4392,7 +4393,7 @@ fn build_claude_response_or_error_body(
 > {
     if status.is_success() {
         let (converted, input_tokens, output_tokens, response_body_text) =
-            build_claude_response_body(bytes, reverse_tool_map, request_model)?;
+            build_claude_response_body(bytes, reverse_tool_map, request_model, streamed_upstream)?;
         Ok((
             converted,
             input_tokens,
@@ -4564,13 +4565,53 @@ fn convert_codex_response_bytes_to_claude(
     Ok((Bytes::from(out_bytes), input_tokens, output_tokens))
 }
 
+fn extract_codex_completed_response_from_sse_bytes(bytes: &[u8]) -> Result<Value, String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+    for raw in text.split("\n\n") {
+        let mut data_lines = Vec::new();
+        for line in raw.lines() {
+            if let Some(rest) = line.strip_prefix("data:") {
+                data_lines.push(rest.trim().to_string());
+            }
+        }
+        if data_lines.is_empty() {
+            continue;
+        }
+        let payload = data_lines.join("\n");
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let event: Value = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+        if event.get("type").and_then(|v| v.as_str()) == Some("response.completed") {
+            return Ok(event);
+        }
+    }
+    Err("missing response.completed in streamed upstream response".to_string())
+}
+
+fn convert_codex_stream_response_bytes_to_claude(
+    bytes: &[u8],
+    reverse_tool_map: &HashMap<String, String>,
+    request_model: &str,
+) -> Result<(Bytes, Option<i64>, Option<i64>), String> {
+    let resp_json = extract_codex_completed_response_from_sse_bytes(bytes)?;
+    let claude = convert_codex_non_stream_to_claude(&resp_json, reverse_tool_map, request_model)?;
+    let out_bytes = serde_json::to_vec(&claude).map_err(|e| e.to_string())?;
+    let (input_tokens, output_tokens) = extract_usage(&out_bytes);
+    Ok((Bytes::from(out_bytes), input_tokens, output_tokens))
+}
+
 fn build_claude_response_body(
     bytes: &Bytes,
     reverse_tool_map: &HashMap<String, String>,
     request_model: &str,
+    streamed_upstream: bool,
 ) -> Result<(Bytes, Option<i64>, Option<i64>, Option<String>), String> {
-    let (converted, input_tokens, output_tokens) =
-        convert_codex_response_bytes_to_claude(bytes, reverse_tool_map, request_model)?;
+    let (converted, input_tokens, output_tokens) = if streamed_upstream {
+        convert_codex_stream_response_bytes_to_claude(bytes, reverse_tool_map, request_model)?
+    } else {
+        convert_codex_response_bytes_to_claude(bytes, reverse_tool_map, request_model)?
+    };
     let response_body_text = if converted.is_empty() {
         None
     } else {
@@ -7732,6 +7773,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         &bytes,
                         &reverse_map,
                         &model_name,
+                        is_stream,
                     ) {
                         Ok(v) => v,
                         Err(err) => {
@@ -8167,7 +8209,8 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 .map(|s| s.to_string());
             if !is_count_tokens {
                 match convert_claude_to_codex(&body_json) {
-                    Ok((codex_body, reverse_map, stream)) => {
+                    Ok((mut codex_body, reverse_map, stream)) => {
+                        codex_body["stream"] = serde_json::json!(true);
                         estimated_input_tokens = Some(count_codex_input_tokens(&codex_body));
                         request_model = codex_body
                             .get("model")
@@ -8747,6 +8790,8 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         if let Some(stream) = anthropic_stream {
             is_stream = stream;
         }
+        let upstream_stream =
+            if is_anthropic && anthropic_reverse_tool_map.is_some() { true } else { is_stream };
         let mut upstream_headers = forward_headers.clone();
         apply_upstream_headers(
             &mut upstream_headers,
@@ -8754,7 +8799,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             chosen_account_id.as_deref(),
             &req_headers,
             !upstream_body_bytes.is_empty(),
-            is_stream,
+            upstream_stream,
         );
 
         let upstream_result = state
@@ -8808,7 +8853,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             upstream_status.as_u16()
         ));
 
-        if is_stream && upstream_status == reqwest::StatusCode::BAD_REQUEST {
+        if upstream_stream && upstream_status == reqwest::StatusCode::BAD_REQUEST {
             let headers = upstream_resp.headers().clone();
             let bytes = upstream_resp.bytes().await.unwrap_or_default();
             if let Some((resets_at, resets_in_seconds)) = parse_usage_limit_error(&bytes) {
@@ -8824,7 +8869,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     &forward_headers,
                     &req_headers,
                     &upstream_body_bytes,
-                    is_stream,
+                    upstream_stream,
                     is_anthropic,
                     &request_model,
                     estimated_input_tokens,
@@ -8864,7 +8909,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         chosen_account_id.as_deref(),
                         &req_headers,
                         !upstream_body_bytes.is_empty(),
-                        is_stream,
+                        upstream_stream,
                     );
                     if let Ok(retry_resp) = state
                         .client
@@ -8931,6 +8976,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                         &bytes,
                                         &reverse_map,
                                         &model_name,
+                                        upstream_stream,
                                     ) {
                                         Ok(v) => v,
                                         Err(err) => {
@@ -9170,7 +9216,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     &forward_headers,
                     &req_headers,
                     &upstream_body_bytes,
-                    is_stream,
+                    upstream_stream,
                     is_anthropic,
                     &request_model,
                     estimated_input_tokens,
@@ -9234,7 +9280,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         fallback_account_id.as_deref(),
                         &req_headers,
                         !upstream_body_bytes.is_empty(),
-                        is_stream,
+                        upstream_stream,
                     );
                     if let Ok(retry_resp) = state
                         .client
@@ -9269,6 +9315,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                         &bytes,
                                         &reverse_map,
                                         &model_name,
+                                        upstream_stream,
                                     ) {
                                         Ok(v) => v,
                                         Err(err) => {
@@ -9530,7 +9577,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         &forward_headers,
                         &req_headers,
                         &upstream_body_bytes,
-                        is_stream,
+                        upstream_stream,
                         is_anthropic,
                         &request_model,
                         estimated_input_tokens,
@@ -9557,6 +9604,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         &bytes,
                         &reverse_map,
                         &model_name,
+                        upstream_stream,
                     ) {
                         Ok(v) => v,
                         Err(err) => {
@@ -10624,6 +10672,7 @@ pub async fn start_openai_compat_proxy_runtime(
                         &responses_bytes,
                         &anthropic_reverse_tool_map.unwrap_or_default(),
                         request_model.as_deref().unwrap_or("unknown"),
+                        false,
                     ) {
                         Ok((
                             converted,
