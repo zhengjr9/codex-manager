@@ -158,6 +158,8 @@ struct ProxyConfig {
     reasoning_effort_override: Option<String>,
     #[serde(default = "default_proxy_upstream_mode")]
     upstream_mode: String,
+    #[serde(default = "default_codex_proxy_url")]
+    codex_proxy_url: Option<String>,
     #[serde(default)]
     custom_openai_base_url: Option<String>,
     #[serde(default)]
@@ -184,6 +186,10 @@ struct ProxyConfig {
 
 fn default_proxy_upstream_mode() -> String {
     "codex".to_string()
+}
+
+fn default_codex_proxy_url() -> Option<String> {
+    Some("http://127.0.0.1:36666".to_string())
 }
 
 fn default_enable_exact_cache() -> bool {
@@ -216,6 +222,7 @@ impl Default for ProxyConfig {
             model_override: None,
             reasoning_effort_override: None,
             upstream_mode: default_proxy_upstream_mode(),
+            codex_proxy_url: default_codex_proxy_url(),
             custom_openai_base_url: None,
             custom_openai_api_key: None,
             enable_exact_cache: default_enable_exact_cache(),
@@ -7157,6 +7164,24 @@ fn custom_openai_api_key(cfg: &ProxyConfig) -> Option<String> {
     normalized_custom_api_key(cfg.custom_openai_api_key.as_ref())
 }
 
+fn normalized_codex_proxy_url(value: Option<&String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn apply_codex_proxy(
+    builder: reqwest::ClientBuilder,
+    cfg: &ProxyConfig,
+) -> Result<reqwest::ClientBuilder, String> {
+    let Some(proxy_url) = normalized_codex_proxy_url(cfg.codex_proxy_url.as_ref()) else {
+        return Ok(builder);
+    };
+    let http_proxy = reqwest::Proxy::http(&proxy_url).map_err(|e| e.to_string())?;
+    let https_proxy = reqwest::Proxy::https(&proxy_url).map_err(|e| e.to_string())?;
+    Ok(builder.proxy(http_proxy).proxy(https_proxy))
+}
+
 fn normalize_models_path(path: &str) -> String {
     let is_models_path = path == "/v1/models" || path.starts_with("/v1/models?");
     if !is_models_path {
@@ -7598,8 +7623,8 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
     };
 
     log_proxy("building reqwest client");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+    let client_builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(120));
+    let client = apply_codex_proxy(client_builder, &cfg)?
         .build()
         .map_err(|e| {
             log_proxy(&format!("reqwest client build failed: {e}"));
@@ -11101,6 +11126,7 @@ fn update_proxy_config(
     model_override: Option<String>,
     reasoning_effort_override: Option<String>,
     upstream_mode: Option<String>,
+    codex_proxy_url: Option<String>,
     custom_openai_base_url: Option<String>,
     custom_openai_api_key: Option<String>,
     enable_exact_cache: Option<bool>,
@@ -11149,6 +11175,14 @@ fn update_proxy_config(
     }
     if let Some(value) = upstream_mode {
         cfg.upstream_mode = normalize_proxy_upstream_mode(&value).to_string();
+    }
+    if let Some(value) = codex_proxy_url {
+        let trimmed = value.trim().to_string();
+        cfg.codex_proxy_url = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
     }
     if let Some(value) = custom_openai_base_url {
         let trimmed = value.trim().trim_end_matches('/').to_string();
@@ -11703,8 +11737,8 @@ async fn fetch_account_usage_by_id(id: &str) -> Result<AccountUsage, String> {
         .and_then(|v| v.as_str())
         .ok_or("No access token for this account")?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+    let client_builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
+    let client = apply_codex_proxy(client_builder, &proxy_config_snapshot())?
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -11896,7 +11930,9 @@ async fn list_codex_models() -> Result<Vec<String>, String> {
         return Err("账号缺少 access_token，请重新登录。".to_string());
     }
 
-    let client = reqwest::Client::new();
+    let client = apply_codex_proxy(reqwest::Client::builder(), &cfg)?
+        .build()
+        .map_err(|e| e.to_string())?;
     let path = normalize_models_path("/v1/models");
     let url = build_upstream_url(&path);
     log_proxy(&format!("models: request -> {url}"));

@@ -85,6 +85,7 @@ export interface ProxyConfig {
   model_override: string | null
   reasoning_effort_override: string | null
   upstream_mode: string
+  codex_proxy_url: string | null
   custom_openai_base_url: string | null
   custom_openai_api_key: string | null
   enable_exact_cache: boolean
@@ -232,6 +233,7 @@ export const accountService = {
     model_override?: string | null
     reasoning_effort_override?: string | null
     upstream_mode?: string | null
+    codex_proxy_url?: string | null
     custom_openai_base_url?: string | null
     custom_openai_api_key?: string | null
     enable_exact_cache?: boolean

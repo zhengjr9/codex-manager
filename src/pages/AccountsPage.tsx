@@ -421,6 +421,7 @@ export default function AccountsPage() {
         model_override: proxyConfig.model_override,
         reasoning_effort_override: proxyConfig.reasoning_effort_override,
         upstream_mode: 'codex',
+        codex_proxy_url: proxyConfig.codex_proxy_url,
         custom_openai_base_url: null,
         custom_openai_api_key: null,
       })
@@ -894,6 +895,12 @@ export default function AccountsPage() {
                 onChange={(e) => setApiKeyInput(e.target.value)}
                 className="md:flex-1"
               />
+              <Input
+                placeholder="Codex HTTP/HTTPS 代理（留空直连）"
+                value={proxyConfig.codex_proxy_url ?? ''}
+                onChange={(e) => setProxyConfig({ ...proxyConfig, codex_proxy_url: e.target.value || null })}
+                className="md:flex-1"
+              />
               <Space>
                 <Button onClick={handleGenerateApiKey}>生成</Button>
                 <Button type="primary" loading={configSaving} onClick={handleSaveProxyConfig}>
@@ -951,6 +958,9 @@ export default function AccountsPage() {
             </div>
             <Text type="secondary" className="text-xs">
               客户端需在 Authorization Bearer 或 x-api-key 中携带 API Key（留空则不校验）。
+            </Text>
+            <Text type="secondary" className="text-xs">
+              Codex upstream 默认通过 <code>http://127.0.0.1:36666</code> 同时代理 HTTP 与 HTTPS 请求。
             </Text>
           </div>
         ) : (
