@@ -3,6 +3,7 @@ name = "codex-manager"
 version = "1.0.0"
 edition = "2021"
 default-run = "codex-manager"
+autobins = false
 
 [lib]
 name = "codex_manager_lib"
@@ -36,3 +37,7 @@ bytes = "1"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+[[bin]]
+name = "codex-manager"
+path = "src/main.rs"
