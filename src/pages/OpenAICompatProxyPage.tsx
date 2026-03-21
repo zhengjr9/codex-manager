@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  Alert,
   Button,
   Card,
   Empty,
@@ -27,6 +28,7 @@ import {
   accountService,
   type OpenAICompatConfig,
   type OpenAICompatModelMapping,
+  type OpenAICompatProbeResult,
   type OpenAICompatProxyStatus,
 } from '../services/accountService'
 
@@ -46,7 +48,7 @@ const emptyDraft = (): CompatDraft => ({
   base_url: '',
   api_key: '',
   default_model: '',
-  model_mappings: [{ alias: 'glm5', provider_model: 'glm-5' }],
+  model_mappings: [{ alias: '*', provider_model: 'glm-5' }],
 })
 
 export default function OpenAICompatProxyPage() {
@@ -61,6 +63,8 @@ export default function OpenAICompatProxyPage() {
   const [saveError, setSaveError] = useState<string | null>(null)
   const [providerModels, setProviderModels] = useState<string[]>([])
   const [providerModelsLoading, setProviderModelsLoading] = useState(false)
+  const [probeResult, setProbeResult] = useState<OpenAICompatProbeResult | null>(null)
+  const [probeLoading, setProbeLoading] = useState(false)
   const detailCardRef = useRef<HTMLDivElement | null>(null)
   const activeSelectedId = selectedId ?? status.config_id ?? null
 
@@ -107,6 +111,7 @@ export default function OpenAICompatProxyPage() {
   useEffect(() => {
     if (!selectedConfig) {
       setProviderModels([])
+      setProbeResult(null)
       return
     }
     setProviderModelsLoading(true)
@@ -114,7 +119,34 @@ export default function OpenAICompatProxyPage() {
       .then(setProviderModels)
       .catch(() => setProviderModels([]))
       .finally(() => setProviderModelsLoading(false))
+    setProbeResult(null)
   }, [selectedConfig?.id])
+
+  async function refreshProviderModels(configId: string) {
+    setProviderModelsLoading(true)
+    try {
+      setProviderModels(await accountService.listOpenAICompatProviderModels(configId))
+    } catch (e) {
+      setProviderModels([])
+      message.error(String(e))
+    } finally {
+      setProviderModelsLoading(false)
+    }
+  }
+
+  async function runProbe(configId: string) {
+    setProbeLoading(true)
+    try {
+      const result = await accountService.probeOpenAICompatConfig(configId)
+      setProbeResult(result)
+      message.success('兼容性探测完成')
+    } catch (e) {
+      setProbeResult(null)
+      message.error(String(e))
+    } finally {
+      setProbeLoading(false)
+    }
+  }
 
   function openCreateModal() {
     setDraft(emptyDraft())
@@ -344,8 +376,11 @@ export default function OpenAICompatProxyPage() {
                 <Text type="secondary">{selectedConfig.base_url}</Text>
               </div>
               <Space>
-                <Button icon={<ReloadOutlined />} loading={providerModelsLoading} onClick={() => selectedConfig && accountService.listOpenAICompatProviderModels(selectedConfig.id).then(setProviderModels).catch((e) => message.error(String(e)))}>
+                <Button icon={<ReloadOutlined />} loading={providerModelsLoading} onClick={() => refreshProviderModels(selectedConfig.id)}>
                   刷新模型
+                </Button>
+                <Button loading={probeLoading} onClick={() => runProbe(selectedConfig.id)}>
+                  兼容性探测
                 </Button>
                 <Button icon={<EditOutlined />} onClick={() => openEditModal(selectedConfig)}>
                   编辑当前配置
@@ -378,6 +413,64 @@ export default function OpenAICompatProxyPage() {
                   ? providerModels.map(item => <Tag color="blue" key={item}>{item}</Tag>)
                   : <Text type="secondary">{providerModelsLoading ? '加载中...' : '暂无数据'}</Text>}
               </div>
+            </div>
+
+            <div>
+              <Text strong>兼容性诊断</Text>
+              {probeResult ? (
+                <div className="mt-3 space-y-3">
+                  <Alert
+                    type={probeResult.chat_tool_call_ok && probeResult.streaming_tool_call_ok ? 'success' : 'warning'}
+                    showIcon
+                    message={`推荐策略: ${probeResult.recommended_strategy}`}
+                    description={`请求模型 ${probeResult.requested_model}，上游实际模型 ${probeResult.effective_model}`}
+                  />
+
+                  <div className="flex flex-wrap gap-2">
+                    <Tag color={probeResult.supports_models ? 'green' : 'default'}>/v1/models</Tag>
+                    <Tag color={probeResult.supports_chat_completions ? 'green' : 'red'}>/v1/chat/completions</Tag>
+                    <Tag color={probeResult.supports_responses ? 'green' : 'orange'}>/v1/responses</Tag>
+                    <Tag color={probeResult.supports_messages ? 'green' : 'red'}>/v1/messages</Tag>
+                    <Tag color={probeResult.chat_tool_call_ok ? 'green' : 'red'}>chat 工具调用</Tag>
+                    <Tag color={probeResult.responses_tool_call_ok ? 'green' : 'red'}>responses 工具调用</Tag>
+                    <Tag color={probeResult.streaming_tool_call_ok ? 'green' : 'red'}>stream 工具调用</Tag>
+                  </div>
+
+                  <div className="space-y-2">
+                    {probeResult.recommendations.map((item, index) => (
+                      <Alert key={`rec-${index}`} type="info" showIcon={false} message={item} />
+                    ))}
+                  </div>
+
+                  <div className="space-y-2">
+                    {probeResult.checks.map(item => (
+                      <Card key={item.name} size="small" className="border-gray-100">
+                        <div className="flex items-start justify-between gap-4">
+                          <div className="space-y-1">
+                            <div>
+                              <Text strong>{item.name}</Text>
+                              <Text type="secondary" className="ml-2">{item.method} {item.path}</Text>
+                            </div>
+                            <div className="text-sm text-gray-700">{item.summary}</div>
+                            {item.response_excerpt ? (
+                              <pre className="mb-0 mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-gray-50 p-2 text-xs text-gray-600">{item.response_excerpt}</pre>
+                            ) : null}
+                          </div>
+                          <Space direction="vertical" size={4} align="end">
+                            <Tag color={item.ok ? 'green' : 'red'}>{item.ok ? '通过' : '异常'}</Tag>
+                            <Text type="secondary" className="text-xs">HTTP {item.status}</Text>
+                            <Text type="secondary" className="text-xs">{item.duration_ms} ms</Text>
+                          </Space>
+                        </div>
+                      </Card>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-2">
+                  <Text type="secondary">点击“兼容性探测”后，会验证 models、chat、responses、messages 和工具调用链路。</Text>
+                </div>
+              )}
             </div>
           </div>
         ) : (
@@ -426,10 +519,13 @@ export default function OpenAICompatProxyPage() {
           </Form.Item>
           <Form.Item label="模型映射">
             <div className="space-y-2">
+              <Text type="secondary" className="block text-xs">
+                `*` 表示兜底映射，会把所有请求模型转到同一个 Provider 模型。
+              </Text>
               {draft.model_mappings.map((mapping, index) => (
                 <Space key={`mapping-${index}`} className="flex">
                   <Input
-                    placeholder="对外模型名，例如 glm5"
+                    placeholder="对外模型名，例如 * 或 glm5"
                     value={mapping.alias}
                     onChange={(e) => {
                       const next = [...draft.model_mappings]

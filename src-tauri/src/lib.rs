@@ -1,20 +1,23 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use bytes::Bytes;
+use futures_util::StreamExt;
 use rand::RngCore;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use rusqlite::{params, Connection, OptionalExtension};
-use bytes::Bytes;
-use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::io;
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex, OnceLock, RwLock};
-use tokio::sync::Notify;
-use tokio::sync::oneshot;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex, OnceLock, RwLock,
+};
 use tauri::Emitter;
+use tokio::sync::oneshot;
+use tokio::sync::Notify;
 
 static TOOL_CALL_ID_MAP: OnceLock<Mutex<HashMap<String, (String, i64)>>> = OnceLock::new();
 
@@ -31,7 +34,10 @@ fn store_tool_call_id_mapping(client_call_id: &str, upstream_call_id: &str) {
 
     let now = chrono::Utc::now().timestamp();
     let mut map = tool_call_id_map().lock().unwrap_or_else(|e| e.into_inner());
-    map.insert(client_call_id.to_string(), (upstream_call_id.to_string(), now));
+    map.insert(
+        client_call_id.to_string(),
+        (upstream_call_id.to_string(), now),
+    );
 
     // Best-effort TTL + size cap to avoid unbounded growth.
     const TTL_SECS: i64 = 60 * 60;
@@ -259,6 +265,37 @@ struct OpenAICompatProxyState {
     config: Arc<RwLock<OpenAICompatProviderConfig>>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct OpenAICompatProbeCheck {
+    name: String,
+    method: String,
+    path: String,
+    status: u16,
+    ok: bool,
+    duration_ms: u64,
+    summary: String,
+    response_excerpt: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct OpenAICompatProbeResult {
+    provider_name: String,
+    base_url: String,
+    requested_model: String,
+    effective_model: String,
+    checked_at: u64,
+    supports_models: bool,
+    supports_chat_completions: bool,
+    supports_responses: bool,
+    supports_messages: bool,
+    chat_tool_call_ok: bool,
+    responses_tool_call_ok: bool,
+    streaming_tool_call_ok: bool,
+    recommended_strategy: String,
+    recommendations: Vec<String>,
+    checks: Vec<OpenAICompatProbeCheck>,
+}
+
 static OPENAI_COMPAT_PROXY_SHUTDOWN: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
 static OPENAI_COMPAT_PROXY_PORT: Mutex<Option<u16>> = Mutex::new(None);
 static OPENAI_COMPAT_PROXY_STATE: Mutex<Option<Arc<OpenAICompatProxyState>>> = Mutex::new(None);
@@ -299,9 +336,12 @@ fn proxy_config() -> &'static Mutex<ProxyConfig> {
 
 fn emit_accounts_updated(reason: &str) {
     if let Some(handle) = APP_HANDLE.get() {
-        let _ = handle.emit("accounts_updated", serde_json::json!({
-            "reason": reason,
-        }));
+        let _ = handle.emit(
+            "accounts_updated",
+            serde_json::json!({
+                "reason": reason,
+            }),
+        );
     }
 }
 
@@ -339,7 +379,10 @@ fn sanitize_openai_compat_mappings(
         if alias.is_empty() || provider_model.is_empty() {
             continue;
         }
-        out.push(OpenAICompatModelMapping { alias, provider_model });
+        out.push(OpenAICompatModelMapping {
+            alias,
+            provider_model,
+        });
     }
     out
 }
@@ -395,7 +438,11 @@ fn openai_compat_exposed_models(config: &OpenAICompatProviderConfig) -> Vec<Stri
             models.push(mapping.alias.clone());
         }
     }
-    if let Some(default_model) = config.default_model.as_ref().filter(|v| !v.trim().is_empty()) {
+    if let Some(default_model) = config
+        .default_model
+        .as_ref()
+        .filter(|v| !v.trim().is_empty())
+    {
         models.push(default_model.trim().to_string());
     }
     models.sort();
@@ -403,12 +450,44 @@ fn openai_compat_exposed_models(config: &OpenAICompatProviderConfig) -> Vec<Stri
     models
 }
 
-fn map_openai_compat_model(config: &OpenAICompatProviderConfig, requested_model: Option<&str>) -> Option<String> {
+fn openai_compat_is_glm_family(
+    config: &OpenAICompatProviderConfig,
+    requested_model: Option<&str>,
+) -> bool {
+    let mut haystacks = vec![config.provider_name.as_str(), config.base_url.as_str()];
+    if let Some(model) = config.default_model.as_deref() {
+        haystacks.push(model);
+    }
+    if let Some(model) = requested_model {
+        haystacks.push(model);
+    }
+    for mapping in &config.model_mappings {
+        haystacks.push(mapping.alias.as_str());
+        haystacks.push(mapping.provider_model.as_str());
+    }
+    haystacks.into_iter().any(|value| {
+        let normalized = value.to_ascii_lowercase();
+        normalized.contains("glm")
+            || normalized.contains("openclaw")
+            || normalized.contains("zhipu")
+            || normalized.contains("midea")
+    })
+}
+
+fn map_openai_compat_model(
+    config: &OpenAICompatProviderConfig,
+    requested_model: Option<&str>,
+) -> Option<String> {
     let requested = requested_model
         .map(|v| v.trim())
         .filter(|v| !v.is_empty())
         .map(|v| v.to_string())
         .or_else(|| config.default_model.clone())?;
+    for mapping in &config.model_mappings {
+        if mapping.alias == "*" {
+            return Some(mapping.provider_model.clone());
+        }
+    }
     for mapping in &config.model_mappings {
         if mapping.alias.eq_ignore_ascii_case(&requested) {
             return Some(mapping.provider_model.clone());
@@ -421,10 +500,67 @@ fn map_openai_compat_model(config: &OpenAICompatProviderConfig, requested_model:
     }
 }
 
+const GLM_CODING_AGENT_TOOL_BIAS_PROMPT: &str = "You are operating inside a tool-using coding agent runtime. When tools are available and the task requires inspection, editing, searching, execution, or patching, emit tool calls instead of describing what you would do. Prefer apply_patch for file edits. If the user explicitly requests a tool, call it before prose. Tool arguments must be valid JSON and complete.";
+
+fn maybe_inject_glm_coding_agent_bias(
+    config: &OpenAICompatProviderConfig,
+    request_model: Option<&str>,
+    chat_request: &mut Value,
+) -> bool {
+    if !openai_compat_is_glm_family(config, request_model) {
+        return false;
+    }
+    let has_tools = chat_request
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if !has_tools {
+        return false;
+    }
+
+    let Some(messages) = chat_request
+        .get_mut("messages")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return false;
+    };
+
+    let already_present = messages.iter().any(|message| {
+        let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "system" {
+            return false;
+        }
+        response_message_text(message.get("content").unwrap_or(&Value::Null))
+            .contains(GLM_CODING_AGENT_TOOL_BIAS_PROMPT)
+    });
+    if !already_present {
+        messages.insert(
+            0,
+            serde_json::json!({
+                "role": "system",
+                "content": GLM_CODING_AGENT_TOOL_BIAS_PROMPT,
+            }),
+        );
+    }
+
+    if chat_request.get("temperature").is_none() {
+        chat_request["temperature"] = serde_json::json!(0.2);
+    }
+    if chat_request.get("tool_choice").is_none() {
+        chat_request["tool_choice"] = serde_json::json!("auto");
+    }
+    if chat_request.get("parallel_tool_calls").is_none() {
+        chat_request["parallel_tool_calls"] = serde_json::json!(true);
+    }
+    true
+}
+
 fn normalize_proxy_upstream_mode(value: &str) -> &'static str {
     let normalized = value.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "openai" | "openai-compatible" | "openai_compatible" | "custom_openai" | "custom-openai" => "openai_compatible",
+        "openai" | "openai-compatible" | "openai_compatible" | "custom_openai"
+        | "custom-openai" => "openai_compatible",
         _ => "codex",
     }
 }
@@ -753,8 +889,18 @@ fn extract_provider_cached_input_tokens_from_value(value: &Value) -> i64 {
         if let Some(v) = usage
             .get("cache_read_input_tokens")
             .and_then(|v| v.as_i64())
-            .or_else(|| usage.get("input_tokens_details").and_then(|v| v.get("cached_tokens")).and_then(|v| v.as_i64()))
-            .or_else(|| usage.get("prompt_tokens_details").and_then(|v| v.get("cached_tokens")).and_then(|v| v.as_i64()))
+            .or_else(|| {
+                usage
+                    .get("input_tokens_details")
+                    .and_then(|v| v.get("cached_tokens"))
+                    .and_then(|v| v.as_i64())
+            })
+            .or_else(|| {
+                usage
+                    .get("prompt_tokens_details")
+                    .and_then(|v| v.get("cached_tokens"))
+                    .and_then(|v| v.as_i64())
+            })
         {
             return v.max(0);
         }
@@ -777,7 +923,9 @@ fn insert_proxy_log(entry: &ProxyLogEntry) -> Result<(), String> {
     if !cfg.enable_logging {
         return Ok(());
     }
-    let (derived_cache_eligible, derived_cache_key, _, derived_bypass_reason) = if cfg.enable_exact_cache {
+    let (derived_cache_eligible, derived_cache_key, _, derived_bypass_reason) = if cfg
+        .enable_exact_cache
+    {
         match entry.request_body.as_ref() {
             Some(body) => evaluate_local_cache_request(&entry.method, &entry.path, body.as_bytes()),
             None => (false, None, None, Some("empty_body".to_string())),
@@ -787,10 +935,13 @@ fn insert_proxy_log(entry: &ProxyLogEntry) -> Result<(), String> {
     };
     let cache_eligible = entry.cache_eligible.or(Some(derived_cache_eligible));
     let cache_key = entry.cache_key.clone().or(derived_cache_key);
-    let cache_bypass_reason = entry
-        .cache_bypass_reason
-        .clone()
-        .or_else(|| if cache_eligible == Some(true) { None } else { derived_bypass_reason });
+    let cache_bypass_reason = entry.cache_bypass_reason.clone().or_else(|| {
+        if cache_eligible == Some(true) {
+            None
+        } else {
+            derived_bypass_reason
+        }
+    });
     let cache_status = entry.cache_status.clone().or_else(|| {
         if cache_eligible == Some(true) {
             Some("miss".to_string())
@@ -806,7 +957,8 @@ fn insert_proxy_log(entry: &ProxyLogEntry) -> Result<(), String> {
         && entry.status >= 200
         && entry.status < 300
     {
-        if let (Some(key), Some(response_body)) = (cache_key.as_ref(), entry.response_body.as_ref()) {
+        if let (Some(key), Some(response_body)) = (cache_key.as_ref(), entry.response_body.as_ref())
+        {
             let content_type = entry
                 .response_headers
                 .as_ref()
@@ -926,8 +1078,11 @@ fn truncate_body(bytes: &[u8]) -> String {
     };
     let mut text = String::from_utf8_lossy(slice).to_string();
     if bytes.len() > MAX_LOG_BODY_BYTES {
-        text.push_str(&format!("
-...truncated {} bytes", bytes.len() - MAX_LOG_BODY_BYTES));
+        text.push_str(&format!(
+            "
+...truncated {} bytes",
+            bytes.len() - MAX_LOG_BODY_BYTES
+        ));
     }
     text
 }
@@ -1022,7 +1177,11 @@ fn evaluate_local_cache_request(
         Ok(v) => v,
         Err(_) => return (false, None, None, Some("invalid_json".to_string())),
     };
-    if value.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if value
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return (false, None, None, Some("streaming_request".to_string()));
     }
     if request_has_tools(&value) {
@@ -1040,12 +1199,19 @@ fn evaluate_local_cache_request(
         obj.remove("stream");
         obj.remove("stream_options");
     }
-    let model = value.get("model").and_then(|v| v.as_str()).map(|v| v.to_string());
+    let model = value
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
     let key = compute_cache_key(cache_namespace(path), method, path, &value);
     (true, Some(key), model, None)
 }
 
-fn cleanup_expired_ai_cache(conn: &Connection, now: &str, max_entries: usize) -> Result<(), String> {
+fn cleanup_expired_ai_cache(
+    conn: &Connection,
+    now: &str,
+    max_entries: usize,
+) -> Result<(), String> {
     conn.execute(
         "DELETE FROM ai_cache_entries WHERE expires_at <= ?1",
         params![now],
@@ -1092,12 +1258,25 @@ fn lookup_local_cache(cache_key: &str) -> Result<Option<LocalCacheHit>, String> 
         })
         .optional()
         .map_err(|e| e.to_string())?;
-    let Some((id, status, content_type, response_body, model, input_tokens, output_tokens, provider_cached_input_tokens)) = hit else {
+    let Some((
+        id,
+        status,
+        content_type,
+        response_body,
+        model,
+        input_tokens,
+        output_tokens,
+        provider_cached_input_tokens,
+    )) = hit
+    else {
         return Ok(None);
     };
     conn.execute(
         "UPDATE ai_cache_entries SET hit_count = hit_count + 1, last_hit_at = ?2 WHERE id = ?1",
-        params![id, chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()],
+        params![
+            id,
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(Some(LocalCacheHit {
@@ -1128,9 +1307,10 @@ fn store_local_cache_entry(
     let conn = proxy_log_db()?;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     cleanup_expired_ai_cache(&conn, &now, cfg.exact_cache_max_entries)?;
-    let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(cfg.exact_cache_ttl_minutes.max(1)))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+    let expires_at = (chrono::Utc::now()
+        + chrono::Duration::minutes(cfg.exact_cache_ttl_minutes.max(1)))
+    .format("%Y-%m-%dT%H:%M:%SZ")
+    .to_string();
     conn.execute(
         "INSERT INTO ai_cache_entries (
             cache_key, cache_type, path, method, model, status, content_type, response_body, response_preview,
@@ -1201,7 +1381,10 @@ fn parse_usage_limit_error(body: &[u8]) -> Option<(Option<i64>, Option<i64>)> {
     Some((resets_at, resets_in_seconds))
 }
 
-fn usage_limit_cooldown_until(resets_at: Option<i64>, resets_in_seconds: Option<i64>) -> std::time::Instant {
+fn usage_limit_cooldown_until(
+    resets_at: Option<i64>,
+    resets_in_seconds: Option<i64>,
+) -> std::time::Instant {
     let now = chrono::Utc::now().timestamp();
     if let Some(secs) = resets_in_seconds {
         if secs > 0 {
@@ -1384,7 +1567,12 @@ fn count_codex_input_tokens(body: &Value) -> i64 {
     rough_token_count(&joined)
 }
 
-fn apply_usage_limit_policy(state: &Arc<ProxyState>, idx: usize, id: &str, until: std::time::Instant) {
+fn apply_usage_limit_policy(
+    state: &Arc<ProxyState>,
+    idx: usize,
+    id: &str,
+    until: std::time::Instant,
+) {
     let cfg = proxy_config_snapshot();
     if cfg.disable_on_usage_limit {
         {
@@ -1467,10 +1655,11 @@ static PROXY_STATE: Mutex<Option<Arc<ProxyState>>> = Mutex::new(None);
 
 // ─── Anthropic proxy globals ─────────────────────────────────────────────────
 
-
 fn anthropic_config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".codex-manager").join("anthropic_keys.json")
+    PathBuf::from(home)
+        .join(".codex-manager")
+        .join("anthropic_keys.json")
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1563,7 +1752,9 @@ fn anthropic_system_parts(value: &Value) -> Vec<String> {
             .iter()
             .filter_map(|item| {
                 if item.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    item.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+                    item.get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
                 } else {
                     None
                 }
@@ -1605,9 +1796,208 @@ fn anthropic_image_url(item: &Value) -> Option<String> {
 fn anthropic_tool_result_content(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
+        Value::Array(items) => {
+            let mut parts = Vec::new();
+            for item in items {
+                match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                    "text" => {
+                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() {
+                                parts.push(trimmed.to_string());
+                            }
+                        }
+                    }
+                    "tool_reference" => {
+                        let tool_name = item
+                            .get("tool_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        if !tool_name.is_empty() {
+                            parts.push(format!("[tool reference: {tool_name}]"));
+                        }
+                    }
+                    "image" => {
+                        parts.push("[image omitted]".to_string());
+                    }
+                    _ => {
+                        let fallback = serde_json::to_string(item).unwrap_or_default();
+                        if !fallback.is_empty() {
+                            parts.push(fallback);
+                        }
+                    }
+                }
+            }
+            if parts.is_empty() {
+                serde_json::to_string(value).unwrap_or_default()
+            } else {
+                parts.join("\n\n")
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                text.to_string()
+            } else {
+                serde_json::to_string(value).unwrap_or_default()
+            }
+        }
         Value::Null => "".to_string(),
         _ => serde_json::to_string(value).unwrap_or_default(),
     }
+}
+
+fn compact_middle_text(text: &str, max_chars: usize, head_chars: usize, tail_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    let head_end = text
+        .char_indices()
+        .nth(head_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    let tail_start = if tail_chars == 0 {
+        text.len()
+    } else {
+        let total_chars = text.chars().count();
+        let skip = total_chars.saturating_sub(tail_chars);
+        text.char_indices()
+            .nth(skip)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    };
+    let omitted = text.len().saturating_sub(head_end).saturating_sub(text.len().saturating_sub(tail_start));
+    format!(
+        "{}\n[... truncated {} chars ...]\n{}",
+        &text[..head_end],
+        omitted,
+        &text[tail_start..]
+    )
+}
+
+fn text_fingerprint(text: &str) -> String {
+    let hex = format!("{:x}", Sha256::digest(text.as_bytes()));
+    hex[..16.min(hex.len())].to_string()
+}
+
+fn extract_system_reminder_tool_name(text: &str, prefix: &str, suffix: &str) -> Option<String> {
+    let start = text.find(prefix)? + prefix.len();
+    let rest = &text[start..];
+    let end = rest.find(suffix)?;
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn is_noisy_context_tool(tool_name: &str) -> bool {
+    let normalized = tool_name.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "read" | "exec_command" | "write_stdin" | "open" | "find" | "search_query" | "image_query"
+    )
+}
+
+fn compact_system_reminder_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("<system-reminder>") || !trimmed.ends_with("</system-reminder>") {
+        return text.to_string();
+    }
+
+    if trimmed.contains("The following skills are available for use with the Skill tool:") {
+        return format!(
+            "<system-reminder>\nSkill inventory omitted for context efficiency. Original size: {} chars.\n</system-reminder>",
+            trimmed.len()
+        );
+    }
+
+    if let Some(tool_name) = extract_system_reminder_tool_name(
+        trimmed,
+        "Result of calling the ",
+        " tool:",
+    ) {
+        let noisy = is_noisy_context_tool(&tool_name);
+        let max_chars = if noisy { 2200 } else { 4200 };
+        let head_chars = if noisy { 1200 } else { 2400 };
+        let tail_chars = if noisy { 500 } else { 900 };
+        if trimmed.len() <= max_chars {
+            return text.to_string();
+        }
+        let compacted = compact_middle_text(trimmed, max_chars, head_chars, tail_chars);
+        return format!(
+            "<system-reminder>\nResult of calling the {tool_name} tool (truncated from {} chars):\n{}\n</system-reminder>",
+            trimmed.len(),
+            compacted
+        );
+    }
+    if let Some(tool_name) = extract_system_reminder_tool_name(
+        trimmed,
+        "Called the ",
+        " tool with the following input:",
+    ) {
+        return format!(
+            "<system-reminder>\nCalled the {tool_name} tool.\nInput omitted for context efficiency. Original size: {} chars.\n</system-reminder>",
+            trimmed.len()
+        );
+    }
+
+    const MAX_REMINDER_CHARS: usize = 4000;
+    const HEAD_CHARS: usize = 2400;
+    const TAIL_CHARS: usize = 900;
+    if trimmed.len() <= MAX_REMINDER_CHARS {
+        return text.to_string();
+    }
+    compact_middle_text(trimmed, MAX_REMINDER_CHARS, HEAD_CHARS, TAIL_CHARS)
+}
+
+fn compact_embedded_system_reminders(text: &str) -> String {
+    const START: &str = "<system-reminder>";
+    const END: &str = "</system-reminder>";
+
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = text[cursor..].find(START) {
+        let start = cursor + rel_start;
+        output.push_str(&text[cursor..start]);
+        if let Some(rel_end) = text[start..].find(END) {
+            let end = start + rel_end + END.len();
+            output.push_str(&compact_system_reminder_text(&text[start..end]));
+            cursor = end;
+        } else {
+            output.push_str(&text[start..]);
+            cursor = text.len();
+            break;
+        }
+    }
+
+    if cursor < text.len() {
+        output.push_str(&text[cursor..]);
+    }
+
+    output
+}
+
+fn compact_anthropic_text_content(text: &str) -> String {
+    if text.contains("<system-reminder>") {
+        if text.trim().starts_with("<system-reminder>") && text.trim().ends_with("</system-reminder>") {
+            compact_system_reminder_text(text)
+        } else {
+            compact_embedded_system_reminders(text)
+        }
+    } else {
+        text.to_string()
+    }
+}
+
+fn compact_anthropic_tool_result_content(text: &str) -> String {
+    let normalized = compact_embedded_system_reminders(text);
+    const MAX_TOOL_RESULT_CHARS: usize = 8000;
+    const HEAD_CHARS: usize = 4200;
+    const TAIL_CHARS: usize = 1400;
+    compact_middle_text(&normalized, MAX_TOOL_RESULT_CHARS, HEAD_CHARS, TAIL_CHARS)
 }
 
 fn convert_budget_to_effort(budget: i64) -> Option<&'static str> {
@@ -1746,7 +2136,9 @@ fn normalize_tool_parameters(value: &Value) -> Value {
                         if let Value::Array(items) = required {
                             let filtered: Vec<Value> = items
                                 .into_iter()
-                                .filter_map(|item| item.as_str().map(|s| Value::String(s.to_string())))
+                                .filter_map(|item| {
+                                    item.as_str().map(|s| Value::String(s.to_string()))
+                                })
                                 .collect();
                             if !filtered.is_empty() {
                                 obj.insert("required".to_string(), Value::Array(filtered));
@@ -1787,8 +2179,10 @@ fn normalize_tool_parameters(value: &Value) -> Value {
 
             for key in ["anyOf", "oneOf", "allOf"] {
                 if let Some(Value::Array(items)) = obj.remove(key) {
-                    let normalized_items: Vec<Value> =
-                        items.into_iter().map(|item| normalize_schema(&item)).collect();
+                    let normalized_items: Vec<Value> = items
+                        .into_iter()
+                        .map(|item| normalize_schema(&item))
+                        .collect();
                     if !normalized_items.is_empty() {
                         obj.insert(key.to_string(), Value::Array(normalized_items));
                     }
@@ -1803,7 +2197,11 @@ fn normalize_tool_parameters(value: &Value) -> Value {
 }
 
 fn build_reverse_tool_map(original: &Value) -> HashMap<String, String> {
-    let tools = original.get("tools").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let tools = original
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut names = Vec::new();
     for tool in &tools {
         if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
@@ -1818,6 +2216,78 @@ fn build_reverse_tool_map(original: &Value) -> HashMap<String, String> {
         reverse.insert(short, orig);
     }
     reverse
+}
+
+fn normalize_openai_tool_choice_for_chat(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(s) => {
+            let normalized = s.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "auto" | "none" | "required" => Some(Value::String(normalized)),
+                _ => None,
+            }
+        }
+        Value::Object(obj) => {
+            let choice_type = obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            match choice_type.as_str() {
+                "function" => {
+                    let name = obj
+                        .get("function")
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .or_else(|| obj.get("name").and_then(|v| v.as_str()))
+                        .map(|v| v.trim())
+                        .filter(|v| !v.is_empty())?;
+                    Some(serde_json::json!({
+                        "type": "function",
+                        "function": { "name": name },
+                    }))
+                }
+                "auto" | "none" | "required" => Some(Value::String(choice_type)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn convert_claude_tool_choice(
+    value: &Value,
+    short_map: &HashMap<String, String>,
+) -> Option<(Value, Option<bool>)> {
+    let Value::Object(obj) = value else {
+        return None;
+    };
+    let disable_parallel = obj
+        .get("disable_parallel_tool_use")
+        .and_then(|v| v.as_bool());
+    let choice = match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "auto" => Value::String("auto".to_string()),
+        "any" => Value::String("required".to_string()),
+        "none" => Value::String("none".to_string()),
+        "tool" => {
+            let raw_name = obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())?;
+            let mapped_name = short_map
+                .get(raw_name)
+                .cloned()
+                .unwrap_or_else(|| shorten_name_if_needed(raw_name));
+            serde_json::json!({
+                "type": "function",
+                "name": mapped_name,
+            })
+        }
+        _ => return None,
+    };
+    Some((choice, disable_parallel))
 }
 
 fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, String>, bool), String> {
@@ -1861,6 +2331,10 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
     if system_parts.first().map(|s| s.as_str()) != Some(CLAUDE_CODE_SYSTEM_PROMPT) {
         system_parts.insert(0, CLAUDE_CODE_SYSTEM_PROMPT.to_string());
     }
+    {
+        let mut seen_system_parts = HashSet::new();
+        system_parts.retain(|part| seen_system_parts.insert(part.clone()));
+    }
     if !system_parts.is_empty() {
         let mut msg = serde_json::json!({
             "type": "message",
@@ -1879,6 +2353,8 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
     }
 
     if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
+        let mut seen_reminder_fingerprints: HashSet<String> = HashSet::new();
+        let mut seen_tool_output_fingerprints: HashSet<String> = HashSet::new();
         for msg in messages {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             let mut message = serde_json::json!({
@@ -1888,20 +2364,35 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
             });
             let mut has_content = false;
 
-            let mut flush_message = |template: &mut Value, message: &mut Value, has_content: &mut bool| {
-                if *has_content {
-                    if let Some(arr) = template["input"].as_array_mut() {
-                        arr.push(message.clone());
+            let mut flush_message =
+                |template: &mut Value, message: &mut Value, has_content: &mut bool| {
+                    if *has_content {
+                        if let Some(arr) = template["input"].as_array_mut() {
+                            arr.push(message.clone());
+                        }
+                        message["content"] = Value::Array(vec![]);
+                        *has_content = false;
                     }
-                    message["content"] = Value::Array(vec![]);
-                    *has_content = false;
-                }
-            };
+                };
 
             let mut append_text = |text: &str, message: &mut Value, has_content: &mut bool| {
-                let part_type = if role == "assistant" { "output_text" } else { "input_text" };
+                let normalized_text = compact_anthropic_text_content(text);
+                if normalized_text.is_empty() {
+                    return;
+                }
+                if normalized_text.contains("<system-reminder>") {
+                    let fingerprint = text_fingerprint(&normalized_text);
+                    if !seen_reminder_fingerprints.insert(fingerprint) {
+                        return;
+                    }
+                }
+                let part_type = if role == "assistant" {
+                    "output_text"
+                } else {
+                    "input_text"
+                };
                 if let Some(arr) = message["content"].as_array_mut() {
-                    arr.push(serde_json::json!({ "type": part_type, "text": text }));
+                    arr.push(serde_json::json!({ "type": part_type, "text": normalized_text }));
                 }
                 *has_content = true;
             };
@@ -1932,8 +2423,16 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
                                 }
                             }
                             "tool_use" => {
-                                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let name_raw = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let id = item
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let name_raw = item
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
                                 if id.is_empty() || name_raw.is_empty() {
                                     continue;
                                 }
@@ -1948,7 +2447,8 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
                                 let args_string = if input.is_null() {
                                     "{}".to_string()
                                 } else {
-                                    serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
+                                    serde_json::to_string(&input)
+                                        .unwrap_or_else(|_| "{}".to_string())
                                 };
                                 let mut fn_call = serde_json::json!({
                                     "type": "function_call",
@@ -1961,13 +2461,30 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
                                 }
                             }
                             "tool_result" => {
-                                let tool_use_id = item.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let tool_use_id = item
+                                    .get("tool_use_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
                                 if tool_use_id.is_empty() {
                                     continue;
                                 }
                                 flush_message(&mut template, &mut message, &mut has_content);
                                 let content = item.get("content").unwrap_or(&Value::Null);
-                                let output_string = anthropic_tool_result_content(content);
+                                let mut output_string =
+                                    compact_anthropic_tool_result_content(&anthropic_tool_result_content(content));
+                                if output_string.is_empty() {
+                                    continue;
+                                }
+                                if output_string.len() > 512 {
+                                    let fingerprint = text_fingerprint(&output_string);
+                                    if !seen_tool_output_fingerprints.insert(fingerprint) {
+                                        output_string = format!(
+                                            "[duplicate tool output omitted; identical content already provided, original size {} chars]",
+                                            output_string.len()
+                                        );
+                                    }
+                                }
                                 let mut fn_out = serde_json::json!({
                                     "type": "function_call_output",
                                     "call_id": tool_use_id,
@@ -1995,6 +2512,7 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
         }
     }
 
+    let mut parallel_tool_calls = true;
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
         let mut out_tools: Vec<Value> = Vec::new();
         for tool in tools {
@@ -2002,14 +2520,23 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
                 out_tools.push(serde_json::json!({ "type": "web_search" }));
                 continue;
             }
-            let mut name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let mut name = tool
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if let Some(short) = short_map.get(&name) {
                 name = short.clone();
             } else if !name.is_empty() {
                 name = shorten_name_if_needed(&name);
             }
-            let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let params = normalize_tool_parameters(tool.get("input_schema").unwrap_or(&Value::Null));
+            let desc = tool
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let params =
+                normalize_tool_parameters(tool.get("input_schema").unwrap_or(&Value::Null));
             let mut entry = serde_json::json!({
                 "type": "function",
                 "name": name,
@@ -2018,7 +2545,8 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
                 "strict": false
             });
             if let Some(obj) = entry.as_object_mut() {
-                if let Some(params_obj) = obj.get_mut("parameters").and_then(|v| v.as_object_mut()) {
+                if let Some(params_obj) = obj.get_mut("parameters").and_then(|v| v.as_object_mut())
+                {
                     params_obj.remove("$schema");
                 }
             }
@@ -2030,7 +2558,18 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
         }
     }
 
-    template["parallel_tool_calls"] = serde_json::json!(true);
+    if let Some(tool_choice) = body.get("tool_choice") {
+        if let Some((choice, disable_parallel)) =
+            convert_claude_tool_choice(tool_choice, &short_map)
+        {
+            template["tool_choice"] = choice;
+            if disable_parallel == Some(true) {
+                parallel_tool_calls = false;
+            }
+        }
+    }
+
+    template["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
 
     let mut reasoning_effort = "medium".to_string();
     if let Some(thinking) = body.get("thinking") {
@@ -2066,7 +2605,10 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
         "summary": "auto"
     });
 
-    let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     template["stream"] = serde_json::json!(stream);
     template["store"] = serde_json::json!(false);
     template["include"] = serde_json::json!(["reasoning.encrypted_content"]);
@@ -2075,8 +2617,14 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
 }
 
 fn extract_responses_usage(value: &Value) -> (i64, i64, i64) {
-    let input_tokens = value.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-    let output_tokens = value.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+    let input_tokens = value
+        .get("input_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let output_tokens = value
+        .get("output_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     let cached_tokens = value
         .get("input_tokens_details")
         .and_then(|v| v.get("cached_tokens"))
@@ -2126,7 +2674,9 @@ fn response_reasoning_text(value: &Value) -> String {
     String::new()
 }
 
-fn openai_chat_usage(value: Option<&Value>) -> (Option<i64>, Option<i64>, Option<i64>, Option<i64>) {
+fn openai_chat_usage(
+    value: Option<&Value>,
+) -> (Option<i64>, Option<i64>, Option<i64>, Option<i64>) {
     let Some(usage) = value else {
         return (None, None, None, None);
     };
@@ -2137,7 +2687,11 @@ fn openai_chat_usage(value: Option<&Value>) -> (Option<i64>, Option<i64>, Option
     let cached = usage
         .get("prompt_tokens_details")
         .and_then(|v| v.get("cached_tokens"))
-        .or_else(|| usage.get("input_tokens_details").and_then(|v| v.get("cached_tokens")))
+        .or_else(|| {
+            usage
+                .get("input_tokens_details")
+                .and_then(|v| v.get("cached_tokens"))
+        })
         .and_then(|v| v.as_i64());
     let output = usage
         .get("completion_tokens")
@@ -2146,7 +2700,11 @@ fn openai_chat_usage(value: Option<&Value>) -> (Option<i64>, Option<i64>, Option
     let reasoning = usage
         .get("completion_tokens_details")
         .and_then(|v| v.get("reasoning_tokens"))
-        .or_else(|| usage.get("output_tokens_details").and_then(|v| v.get("reasoning_tokens")))
+        .or_else(|| {
+            usage
+                .get("output_tokens_details")
+                .and_then(|v| v.get("reasoning_tokens"))
+        })
         .and_then(|v| v.as_i64());
     (input, output, cached, reasoning)
 }
@@ -2343,6 +2901,48 @@ fn extract_any_valid_json_object(input: &str) -> Option<String> {
     best.map(|(_, slice)| slice)
 }
 
+fn parse_tagged_tool_arguments(args: &str) -> Option<String> {
+    let trimmed = args.trim();
+    if !trimmed.contains("<tool_call>") || !trimmed.contains("</tool_call>") {
+        return None;
+    }
+    let start = trimmed.find("<tool_call>")? + "<tool_call>".len();
+    let end = trimmed.rfind("</tool_call>")?;
+    if end < start {
+        return None;
+    }
+    let inner = &trimmed[start..end];
+    if !inner.contains("<arg_key>") {
+        return Some("{}".to_string());
+    }
+
+    let mut output = serde_json::Map::new();
+    let mut cursor = inner;
+    loop {
+        let Some(key_start) = cursor.find("<arg_key>") else {
+            break;
+        };
+        let key_body = &cursor[key_start + "<arg_key>".len()..];
+        let key_end = key_body.find("</arg_key>")?;
+        let key = key_body[..key_end].trim();
+        if key.is_empty() {
+            return None;
+        }
+        let value_body = &key_body[key_end + "</arg_key>".len()..];
+        let value_start = value_body.find("<arg_value>")?;
+        let value_body = &value_body[value_start + "<arg_value>".len()..];
+        let value_end = value_body.find("</arg_value>")?;
+        let value = &value_body[..value_end];
+        output.insert(key.to_string(), Value::String(value.to_string()));
+        cursor = &value_body[value_end + "</arg_value>".len()..];
+    }
+
+    if output.is_empty() {
+        return Some("{}".to_string());
+    }
+    serde_json::to_string(&Value::Object(output)).ok()
+}
+
 fn repair_tool_arguments_json(args: &str) -> Option<String> {
     let trimmed = args.trim();
     if trimmed.is_empty() {
@@ -2363,6 +2963,7 @@ fn repair_tool_arguments_json(args: &str) -> Option<String> {
             .or_else(|| extract_any_valid_json_object(trimmed))
             .or_else(|| extract_any_valid_json_object(&repaired)),
     }
+    .or_else(|| parse_tagged_tool_arguments(trimmed))
 }
 
 fn parse_tool_arguments_json(args: &str) -> Result<Value, String> {
@@ -2372,8 +2973,65 @@ fn parse_tool_arguments_json(args: &str) -> Result<Value, String> {
             truncate_body(args.trim().as_bytes())
         )
     })?;
-    serde_json::from_str::<Value>(&repaired)
-        .map_err(|e| format!("invalid tool arguments JSON: {e}; raw={}", truncate_body(repaired.as_bytes())))
+    serde_json::from_str::<Value>(&repaired).map_err(|e| {
+        format!(
+            "invalid tool arguments JSON: {e}; raw={}",
+            truncate_body(repaired.as_bytes())
+        )
+    })
+}
+
+fn normalize_chat_completion_tool_arguments_value(root: &mut Value) -> bool {
+    let mut changed = false;
+    if let Some(choices) = root.get_mut("choices").and_then(|v| v.as_array_mut()) {
+        for choice in choices {
+            if let Some(tool_calls) = choice
+                .get_mut("message")
+                .and_then(|v| v.get_mut("tool_calls"))
+                .and_then(|v| v.as_array_mut())
+            {
+                for tool_call in tool_calls {
+                    if let Some(arguments_value) = tool_call
+                        .get_mut("function")
+                        .and_then(|v| v.get_mut("arguments"))
+                    {
+                        if let Some(arguments) = arguments_value.as_str() {
+                            if let Some(repaired) = repair_tool_arguments_json(arguments) {
+                                if repaired != arguments {
+                                    *arguments_value = Value::String(repaired);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn normalize_chat_completion_tool_arguments_bytes(body_bytes: &[u8]) -> Option<Bytes> {
+    let mut root: Value = serde_json::from_slice(body_bytes).ok()?;
+    if !normalize_chat_completion_tool_arguments_value(&mut root) {
+        return None;
+    }
+    serde_json::to_vec(&root).ok().map(Bytes::from)
+}
+
+fn maybe_normalize_chat_completion_response_bytes(
+    upstream_path: &str,
+    status: reqwest::StatusCode,
+    body_bytes: &[u8],
+) -> Bytes {
+    let is_chat_path =
+        upstream_path == "/v1/chat/completions" || upstream_path.starts_with("/v1/chat/completions?");
+    if status.is_success() && is_chat_path {
+        normalize_chat_completion_tool_arguments_bytes(body_bytes)
+            .unwrap_or_else(|| Bytes::copy_from_slice(body_bytes))
+    } else {
+        Bytes::copy_from_slice(body_bytes)
+    }
 }
 
 fn build_local_models_response(models: &[String]) -> Bytes {
@@ -2405,6 +3063,841 @@ fn configured_proxy_models(cfg: &ProxyConfig) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn build_probe_check(
+    name: &str,
+    method: &str,
+    path: &str,
+    status: u16,
+    ok: bool,
+    duration_ms: u64,
+    summary: String,
+    response_excerpt: Option<String>,
+) -> OpenAICompatProbeCheck {
+    OpenAICompatProbeCheck {
+        name: name.to_string(),
+        method: method.to_string(),
+        path: path.to_string(),
+        status,
+        ok,
+        duration_ms,
+        summary,
+        response_excerpt,
+    }
+}
+
+fn parse_probe_chat_tool_call(root: &Value) -> (bool, String) {
+    let Some(tool_call) = root
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("tool_calls"))
+        .and_then(|v| v.as_array())
+        .and_then(|tool_calls| tool_calls.first())
+    else {
+        return (false, "未返回 tool_calls".to_string());
+    };
+    let name = tool_call
+        .get("function")
+        .and_then(|v| v.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let arguments = tool_call
+        .get("function")
+        .and_then(|v| v.get("arguments"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let args_ok = repair_tool_arguments_json(arguments).is_some();
+    (
+        !name.is_empty() && args_ok,
+        format!(
+            "name={name} args_json={} finish_reason={}",
+            args_ok,
+            root.get("choices")
+                .and_then(|v| v.as_array())
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("finish_reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+        ),
+    )
+}
+
+fn parse_probe_responses_tool_call(root: &Value) -> (bool, String) {
+    let Some(tool_call) = root
+        .get("output")
+        .and_then(|v| v.as_array())
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call"))
+        })
+    else {
+        return (false, "未返回 function_call".to_string());
+    };
+    let name = tool_call.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let arguments = tool_call
+        .get("arguments")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let args_ok = repair_tool_arguments_json(arguments).is_some();
+    (
+        !name.is_empty() && args_ok,
+        format!(
+            "name={name} args_json={} raw={}",
+            args_ok,
+            truncate_body(arguments.as_bytes())
+        ),
+    )
+}
+
+fn parse_probe_chat_stream_tool_call(body: &str) -> (bool, String) {
+    let mut call_name = String::new();
+    let mut call_args = String::new();
+    for block in body.split("\n\n") {
+        let mut data_lines = Vec::new();
+        for line in block.lines() {
+            if let Some(rest) = line.strip_prefix("data:") {
+                data_lines.push(rest.trim().to_string());
+            }
+        }
+        if data_lines.is_empty() {
+            continue;
+        }
+        let payload = data_lines.join("\n");
+        if payload == "[DONE]" {
+            continue;
+        }
+        let Ok(root) = serde_json::from_str::<Value>(&payload) else {
+            continue;
+        };
+        if let Some(tool_calls) = root
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"))
+            .and_then(|delta| delta.get("tool_calls"))
+            .and_then(|v| v.as_array())
+        {
+            for tool_call in tool_calls {
+                if let Some(name) = tool_call
+                    .get("function")
+                    .and_then(|v| v.get("name"))
+                    .and_then(|v| v.as_str())
+                {
+                    if !name.is_empty() {
+                        call_name = name.to_string();
+                    }
+                }
+                if let Some(arguments) = tool_call
+                    .get("function")
+                    .and_then(|v| v.get("arguments"))
+                    .and_then(|v| v.as_str())
+                {
+                    let (merged, _) = merge_custom_tool_arguments(&call_args, arguments);
+                    call_args = merged;
+                }
+            }
+        }
+    }
+    let args_ok = repair_tool_arguments_json(&call_args).is_some();
+    (
+        !call_name.is_empty() && args_ok,
+        format!(
+            "name={call_name} args_json={} raw={}",
+            args_ok,
+            truncate_body(call_args.as_bytes())
+        ),
+    )
+}
+
+async fn run_smoke_chat_tool_case(
+    client: &reqwest::Client,
+    chat_url: &str,
+    config: &OpenAICompatProviderConfig,
+    model: &str,
+    tool_name: &str,
+    prompt: &str,
+    description: &str,
+    parameters: Value,
+    tool_choice: Value,
+) -> Result<Value, String> {
+    let mut request = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": "You are Codex, a coding agent. Prefer using tools over describing what you would do." },
+            { "role": "user", "content": prompt }
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": description,
+                "parameters": parameters,
+            }
+        }],
+        "tool_choice": tool_choice,
+    });
+    let _ = maybe_inject_glm_coding_agent_bias(config, Some(model), &mut request);
+    let resp = client
+        .post(chat_url)
+        .bearer_auth(&config.api_key)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let root: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let (ok, summary) = if let Some(tool_call) = root
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("tool_calls"))
+        .and_then(|v| v.as_array())
+        .and_then(|tool_calls| tool_calls.first())
+    {
+        let name = tool_call
+            .get("function")
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let arguments = tool_call
+            .get("function")
+            .and_then(|v| v.get("arguments"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let args_ok = repair_tool_arguments_json(arguments).is_some();
+        (
+            name == tool_name && args_ok,
+            format!(
+                "name={name} args_json={} raw={}",
+                args_ok,
+                truncate_body(arguments.as_bytes())
+            ),
+        )
+    } else {
+        (false, "未返回 tool_calls".to_string())
+    };
+    Ok(serde_json::json!({
+        "status": status,
+        "ok": ok,
+        "summary": summary,
+        "excerpt": truncate_body(&bytes),
+    }))
+}
+
+async fn probe_openai_compat_upstream(
+    config: &OpenAICompatProviderConfig,
+) -> Result<OpenAICompatProbeResult, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let requested_model = config
+        .default_model
+        .clone()
+        .or_else(|| config.model_mappings.first().map(|item| item.alias.clone()))
+        .unwrap_or_else(|| "glm-5".to_string());
+    let effective_model = map_openai_compat_model(config, Some(&requested_model))
+        .unwrap_or_else(|| requested_model.clone());
+    let mut checks = Vec::new();
+
+    let probe_base_url = config.base_url.clone();
+    let probe_api_key = config.api_key.clone();
+    let probe_client = client.clone();
+    let run_json_request =
+        move |method: reqwest::Method, path: &'static str, body: Option<Value>, anthropic: bool| {
+            let client = probe_client.clone();
+            let base_url = probe_base_url.clone();
+            let api_key = probe_api_key.clone();
+            async move {
+                let url = build_upstream_url_with_base(&base_url, path);
+                let started_at = std::time::Instant::now();
+                let mut req = client.request(method.clone(), &url);
+                if anthropic {
+                    req = req
+                        .header("x-api-key", api_key)
+                        .header("anthropic-version", "2023-06-01");
+                } else {
+                    req = req.bearer_auth(api_key);
+                }
+                if let Some(body) = body {
+                    req = req.json(&body);
+                }
+                let resp = req.send().await;
+                let duration_ms = started_at.elapsed().as_millis() as u64;
+                match resp {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let body_bytes = resp.bytes().await.unwrap_or_default();
+                        let body_text = String::from_utf8_lossy(&body_bytes).to_string();
+                        let json = serde_json::from_slice::<Value>(&body_bytes).ok();
+                        (status, duration_ms, body_text, json)
+                    }
+                    Err(err) => (599, duration_ms, err.to_string(), None),
+                }
+            }
+        };
+
+    let (status, duration_ms, body_text, json) =
+        run_json_request(reqwest::Method::GET, "/v1/models", None, false).await;
+    let supports_models = status >= 200
+        && status < 300
+        && json
+            .as_ref()
+            .and_then(|root| root.get("data").and_then(|v| v.as_array()))
+            .is_some();
+    checks.push(build_probe_check(
+        "models",
+        "GET",
+        "/v1/models",
+        status,
+        supports_models,
+        duration_ms,
+        if supports_models {
+            "支持模型列表查询".to_string()
+        } else {
+            format!(
+                "上游未提供标准模型列表，body={}",
+                truncate_body(body_text.as_bytes())
+            )
+        },
+        Some(truncate_body(body_text.as_bytes())),
+    ));
+
+    let chat_body = serde_json::json!({
+        "model": effective_model,
+        "messages": [{ "role": "user", "content": "Reply with exactly: pong" }],
+    });
+    let (status, duration_ms, body_text, json) = run_json_request(
+        reqwest::Method::POST,
+        "/v1/chat/completions",
+        Some(chat_body),
+        false,
+    )
+    .await;
+    let chat_text_ok = json
+        .as_ref()
+        .and_then(|root| root.get("choices").and_then(|v| v.as_array()))
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .map(|message| response_message_text(message.get("content").unwrap_or(&Value::Null)))
+        .map(|text| text.trim() == "pong")
+        .unwrap_or(false);
+    checks.push(build_probe_check(
+        "chat_completions",
+        "POST",
+        "/v1/chat/completions",
+        status,
+        chat_text_ok,
+        duration_ms,
+        if chat_text_ok {
+            "文本对话正常".to_string()
+        } else {
+            format!("文本对话异常，body={}", truncate_body(body_text.as_bytes()))
+        },
+        Some(truncate_body(body_text.as_bytes())),
+    ));
+
+    let responses_body = serde_json::json!({
+        "model": effective_model,
+        "input": "Reply with exactly: pong",
+    });
+    let (status, duration_ms, body_text, json) = run_json_request(
+        reqwest::Method::POST,
+        "/v1/responses",
+        Some(responses_body),
+        false,
+    )
+    .await;
+    let responses_text_ok = json
+        .as_ref()
+        .and_then(|root| root.get("output").and_then(|v| v.as_array()))
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+        })
+        .map(|message| response_message_text(message.get("content").unwrap_or(&Value::Null)))
+        .map(|text| text.trim() == "pong")
+        .unwrap_or(false);
+    checks.push(build_probe_check(
+        "responses",
+        "POST",
+        "/v1/responses",
+        status,
+        responses_text_ok,
+        duration_ms,
+        if responses_text_ok {
+            "Responses 文本返回正常".to_string()
+        } else {
+            format!(
+                "Responses 文本返回异常，body={}",
+                truncate_body(body_text.as_bytes())
+            )
+        },
+        Some(truncate_body(body_text.as_bytes())),
+    ));
+
+    let messages_body = serde_json::json!({
+        "model": effective_model,
+        "max_tokens": 64,
+        "messages": [{ "role": "user", "content": "Reply with exactly: pong" }],
+    });
+    let (status, duration_ms, body_text, _json) = run_json_request(
+        reqwest::Method::POST,
+        "/v1/messages",
+        Some(messages_body),
+        true,
+    )
+    .await;
+    let supports_messages = status >= 200 && status < 300;
+    checks.push(build_probe_check(
+        "messages",
+        "POST",
+        "/v1/messages",
+        status,
+        supports_messages,
+        duration_ms,
+        if supports_messages {
+            "支持原生 Anthropic messages".to_string()
+        } else {
+            format!(
+                "Anthropic 协议不可直通，body={}",
+                truncate_body(body_text.as_bytes())
+            )
+        },
+        Some(truncate_body(body_text.as_bytes())),
+    ));
+
+    let chat_tool_body = serde_json::json!({
+        "model": effective_model,
+        "messages": [
+            { "role": "system", "content": "You are a coding agent. Use tools when explicitly required." },
+            { "role": "user", "content": "Call the get_workspace_root tool now. Do not answer directly." }
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_workspace_root",
+                "description": "Return current workspace root path.",
+                "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+            }
+        }],
+        "tool_choice": {
+            "type": "function",
+            "function": { "name": "get_workspace_root" }
+        }
+    });
+    let (status, duration_ms, body_text, json) = run_json_request(
+        reqwest::Method::POST,
+        "/v1/chat/completions",
+        Some(chat_tool_body),
+        false,
+    )
+    .await;
+    let (chat_tool_call_ok, chat_tool_summary) = json
+        .as_ref()
+        .map(parse_probe_chat_tool_call)
+        .unwrap_or_else(|| (false, truncate_body(body_text.as_bytes())));
+    checks.push(build_probe_check(
+        "chat_tool_call",
+        "POST",
+        "/v1/chat/completions",
+        status,
+        status >= 200 && status < 300 && chat_tool_call_ok,
+        duration_ms,
+        chat_tool_summary,
+        Some(truncate_body(body_text.as_bytes())),
+    ));
+
+    let responses_tool_body = serde_json::json!({
+        "model": effective_model,
+        "input": "Call the get_workspace_root tool now. Do not answer directly.",
+        "tools": [{
+            "type": "function",
+            "name": "get_workspace_root",
+            "description": "Return current workspace root path.",
+            "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+        }],
+        "tool_choice": {
+            "type": "function",
+            "name": "get_workspace_root"
+        }
+    });
+    let (status, duration_ms, body_text, json) = run_json_request(
+        reqwest::Method::POST,
+        "/v1/responses",
+        Some(responses_tool_body),
+        false,
+    )
+    .await;
+    let (responses_tool_call_ok, responses_tool_summary) = json
+        .as_ref()
+        .map(parse_probe_responses_tool_call)
+        .unwrap_or_else(|| (false, truncate_body(body_text.as_bytes())));
+    checks.push(build_probe_check(
+        "responses_tool_call",
+        "POST",
+        "/v1/responses",
+        status,
+        status >= 200 && status < 300 && responses_tool_call_ok,
+        duration_ms,
+        responses_tool_summary,
+        Some(truncate_body(body_text.as_bytes())),
+    ));
+
+    let url = build_upstream_url_with_base(&config.base_url, "/v1/chat/completions");
+    let stream_body = serde_json::json!({
+        "model": effective_model,
+        "stream": true,
+        "messages": [
+            { "role": "system", "content": "You are Codex, a coding agent. Prefer using tools over describing what you would do." },
+            { "role": "user", "content": "Use the apply_patch tool to create a new file hello.txt with the single line hello. Do not answer with prose." }
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": "Apply a unified patch to modify files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "patch": { "type": "string", "description": "Patch text in apply_patch format." }
+                    },
+                    "required": ["patch"],
+                    "additionalProperties": false
+                }
+            }
+        }],
+        "tool_choice": "auto"
+    });
+    let started_at = std::time::Instant::now();
+    let stream_resp = client
+        .post(&url)
+        .bearer_auth(&config.api_key)
+        .json(&stream_body)
+        .send()
+        .await;
+    let (status, duration_ms, body_text) = match stream_resp {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            (
+                status,
+                started_at.elapsed().as_millis() as u64,
+                String::from_utf8_lossy(&bytes).to_string(),
+            )
+        }
+        Err(err) => (
+            599,
+            started_at.elapsed().as_millis() as u64,
+            err.to_string(),
+        ),
+    };
+    let (streaming_tool_call_ok, stream_summary) = parse_probe_chat_stream_tool_call(&body_text);
+    checks.push(build_probe_check(
+        "chat_stream_tool_call",
+        "POST",
+        "/v1/chat/completions",
+        status,
+        status >= 200 && status < 300 && streaming_tool_call_ok,
+        duration_ms,
+        stream_summary,
+        Some(truncate_body(body_text.as_bytes())),
+    ));
+
+    let supports_chat_completions = chat_text_ok;
+    let supports_responses = responses_text_ok;
+    let recommended_strategy = if supports_chat_completions && !responses_tool_call_ok {
+        "bridge_all_agent_traffic_to_chat_completions".to_string()
+    } else if supports_chat_completions && supports_messages {
+        "native_mixed_protocols".to_string()
+    } else {
+        "chat_completions_only".to_string()
+    };
+    let mut recommendations = Vec::new();
+    if !supports_models {
+        recommendations.push("上游不支持 `/v1/models`，请依赖本地默认模型和模型映射，不要把模型发现建立在上游列表上。".to_string());
+    }
+    if supports_chat_completions {
+        recommendations.push(
+            "将 Codex/Claude agent 流量统一桥接到上游 `/v1/chat/completions` 是当前最稳的路径。"
+                .to_string(),
+        );
+    }
+    if !responses_tool_call_ok {
+        recommendations.push("不要直通上游原生 `/v1/responses` 工具调用；继续由本地代理做 Responses -> Chat 的协议收敛。".to_string());
+    }
+    if !supports_messages {
+        recommendations.push(
+            "不要直通上游原生 `/v1/messages`；继续由本地代理做 Claude -> Chat 的协议转换。"
+                .to_string(),
+        );
+    }
+    if chat_tool_call_ok && streaming_tool_call_ok {
+        recommendations.push(
+            "保留流式工具参数拼接与 JSON 修复逻辑，`glm-5` 的 SSE 工具参数是分片返回的。"
+                .to_string(),
+        );
+    }
+    if openai_compat_is_glm_family(config, Some(&effective_model)) {
+        recommendations.push("对 `glm-5` 保持 coding-agent 工具偏置：工具优先、文件编辑优先 `apply_patch`、工具参数必须是完整 JSON。".to_string());
+    }
+
+    Ok(OpenAICompatProbeResult {
+        provider_name: config.provider_name.clone(),
+        base_url: config.base_url.clone(),
+        requested_model,
+        effective_model,
+        checked_at: chrono::Utc::now().timestamp_millis() as u64,
+        supports_models,
+        supports_chat_completions,
+        supports_responses,
+        supports_messages,
+        chat_tool_call_ok,
+        responses_tool_call_ok,
+        streaming_tool_call_ok,
+        recommended_strategy,
+        recommendations,
+        checks,
+    })
+}
+
+pub async fn run_openai_compat_bridge_smoke(
+    base_url: String,
+    api_key: String,
+    model: String,
+) -> Result<Value, String> {
+    let config = OpenAICompatProviderConfig {
+        id: "smoke".to_string(),
+        provider_name: "smoke".to_string(),
+        base_url,
+        api_key,
+        default_model: Some(model.clone()),
+        model_mappings: vec![OpenAICompatModelMapping {
+            alias: "*".to_string(),
+            provider_model: model.clone(),
+        }],
+        created_at: 0,
+        updated_at: 0,
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut proxy_cfg = proxy_config_snapshot();
+    proxy_cfg.model_override = Some(model.clone());
+    let chat_url = build_upstream_url_with_base(&config.base_url, "/v1/chat/completions");
+
+    let responses_text_request = serde_json::json!({
+        "model": model,
+        "input": "Reply with exactly: pong",
+    });
+    let (mut chat_request, _) =
+        convert_responses_request_to_chat_completions(&responses_text_request, &proxy_cfg)?;
+    let _ = maybe_inject_glm_coding_agent_bias(&config, Some(&model), &mut chat_request);
+    let chat_resp = client
+        .post(&chat_url)
+        .bearer_auth(&config.api_key)
+        .json(&chat_request)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let text_status = chat_resp.status().as_u16();
+    let text_bytes = chat_resp.bytes().await.map_err(|e| e.to_string())?;
+    let (responses_bytes, _, _, _) =
+        convert_chat_completions_non_stream_to_responses(&responses_text_request, &text_bytes)?;
+    let responses_root: Value =
+        serde_json::from_slice(&responses_bytes).map_err(|e| e.to_string())?;
+    let responses_text_ok = responses_root
+        .get("output")
+        .and_then(|v| v.as_array())
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+        })
+        .map(|message| response_message_text(message.get("content").unwrap_or(&Value::Null)))
+        .map(|text| text.trim() == "pong")
+        .unwrap_or(false);
+
+    let responses_tool_request = serde_json::json!({
+        "model": model,
+        "input": "Call the get_workspace_root tool now. Do not answer directly.",
+        "tools": [{
+            "type": "function",
+            "name": "get_workspace_root",
+            "description": "Return current workspace root path.",
+            "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+        }],
+        "tool_choice": {
+            "type": "function",
+            "name": "get_workspace_root"
+        }
+    });
+    let (mut chat_tool_request, _) =
+        convert_responses_request_to_chat_completions(&responses_tool_request, &proxy_cfg)?;
+    let _ = maybe_inject_glm_coding_agent_bias(&config, Some(&model), &mut chat_tool_request);
+    let chat_tool_resp = client
+        .post(&chat_url)
+        .bearer_auth(&config.api_key)
+        .json(&chat_tool_request)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let tool_status = chat_tool_resp.status().as_u16();
+    let tool_bytes = chat_tool_resp.bytes().await.map_err(|e| e.to_string())?;
+    let (responses_tool_bytes, _, _, _) =
+        convert_chat_completions_non_stream_to_responses(&responses_tool_request, &tool_bytes)?;
+    let responses_tool_root: Value =
+        serde_json::from_slice(&responses_tool_bytes).map_err(|e| e.to_string())?;
+    let (responses_tool_ok, responses_tool_summary) =
+        parse_probe_responses_tool_call(&responses_tool_root);
+
+    let claude_request = serde_json::json!({
+        "model": model,
+        "max_tokens": 256,
+        "messages": [{
+            "role": "user",
+            "content": [{ "type": "text", "text": "Call the get_workspace_root tool now. Do not answer directly." }]
+        }],
+        "tools": [{
+            "name": "get_workspace_root",
+            "description": "Return current workspace root path.",
+            "input_schema": { "type": "object", "properties": {}, "additionalProperties": false }
+        }],
+        "tool_choice": { "type": "tool", "name": "get_workspace_root" }
+    });
+    let (responses_request, reverse_map, _) = convert_claude_to_codex(&claude_request)?;
+    let (mut claude_chat_request, _) =
+        convert_responses_request_to_chat_completions(&responses_request, &proxy_cfg)?;
+    let _ = maybe_inject_glm_coding_agent_bias(&config, Some(&model), &mut claude_chat_request);
+    let claude_chat_resp = client
+        .post(&chat_url)
+        .bearer_auth(&config.api_key)
+        .json(&claude_chat_request)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let claude_status = claude_chat_resp.status().as_u16();
+    let claude_chat_bytes = claude_chat_resp.bytes().await.map_err(|e| e.to_string())?;
+    let (claude_tool_use_ok, claude_bridge_excerpt) =
+        match convert_chat_completions_non_stream_to_responses(&responses_request, &claude_chat_bytes) {
+            Ok((claude_responses_bytes, _, _, _)) => {
+                match convert_codex_response_bytes_to_claude(&claude_responses_bytes, &reverse_map, &model) {
+                    Ok((claude_bytes, _, _)) => {
+                        let claude_root: Value =
+                            serde_json::from_slice(&claude_bytes).map_err(|e| e.to_string())?;
+                        let ok = claude_root
+                            .get("content")
+                            .and_then(|v| v.as_array())
+                            .map(|items| {
+                                items.iter().any(|item| {
+                                    item.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+                                        && item.get("name").and_then(|v| v.as_str()) == Some("get_workspace_root")
+                                })
+                            })
+                            .unwrap_or(false);
+                        (ok, truncate_body(&claude_bytes))
+                    }
+                    Err(err) => (false, err),
+                }
+            }
+            Err(err) => (false, err),
+        };
+
+    let apply_patch_auto = run_smoke_chat_tool_case(
+        &client,
+        &chat_url,
+        &config,
+        &model,
+        "apply_patch",
+        "Use the apply_patch tool to create a new file hello.txt with the single line hello. Do not answer with prose.",
+        "Apply a unified patch to modify files.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "patch": { "type": "string", "description": "Patch text in apply_patch format." }
+            },
+            "required": ["patch"],
+            "additionalProperties": false
+        }),
+        serde_json::json!("auto"),
+    )
+    .await?;
+    let apply_patch_required = run_smoke_chat_tool_case(
+        &client,
+        &chat_url,
+        &config,
+        &model,
+        "apply_patch",
+        "Use the apply_patch tool to create a new file hello.txt with the single line hello. Do not answer with prose.",
+        "Apply a unified patch to modify files.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "patch": { "type": "string", "description": "Patch text in apply_patch format." }
+            },
+            "required": ["patch"],
+            "additionalProperties": false
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": { "name": "apply_patch" }
+        }),
+    )
+    .await?;
+    let exec_command_auto = run_smoke_chat_tool_case(
+        &client,
+        &chat_url,
+        &config,
+        &model,
+        "exec_command",
+        "Run the exec_command tool with the command pwd. Do not answer with prose.",
+        "Run a shell command.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "cmd": { "type": "string", "description": "Shell command to execute." }
+            },
+            "required": ["cmd"],
+            "additionalProperties": false
+        }),
+        serde_json::json!("auto"),
+    )
+    .await?;
+
+    Ok(serde_json::json!({
+        "base_url": config.base_url,
+        "model": model,
+        "responses_text_bridge_ok": responses_text_ok,
+        "responses_text_bridge_status": text_status,
+        "responses_tool_bridge_ok": responses_tool_ok,
+        "responses_tool_bridge_status": tool_status,
+        "responses_tool_bridge_summary": responses_tool_summary,
+        "claude_tool_bridge_ok": claude_tool_use_ok,
+        "claude_tool_bridge_status": claude_status,
+        "apply_patch_auto_ok": apply_patch_auto.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+        "apply_patch_auto_status": apply_patch_auto.get("status").and_then(|v| v.as_u64()).unwrap_or(0),
+        "apply_patch_auto_summary": apply_patch_auto.get("summary").cloned().unwrap_or(Value::Null),
+        "apply_patch_required_ok": apply_patch_required.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+        "apply_patch_required_status": apply_patch_required.get("status").and_then(|v| v.as_u64()).unwrap_or(0),
+        "apply_patch_required_summary": apply_patch_required.get("summary").cloned().unwrap_or(Value::Null),
+        "exec_command_auto_ok": exec_command_auto.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+        "exec_command_auto_status": exec_command_auto.get("status").and_then(|v| v.as_u64()).unwrap_or(0),
+        "exec_command_auto_summary": exec_command_auto.get("summary").cloned().unwrap_or(Value::Null),
+        "responses_text_bridge_excerpt": truncate_body(&responses_bytes),
+        "responses_tool_bridge_excerpt": truncate_body(&responses_tool_bytes),
+        "claude_tool_bridge_excerpt": claude_bridge_excerpt,
+        "apply_patch_auto_excerpt": apply_patch_auto.get("excerpt").cloned().unwrap_or(Value::Null),
+        "apply_patch_required_excerpt": apply_patch_required.get("excerpt").cloned().unwrap_or(Value::Null),
+        "exec_command_auto_excerpt": exec_command_auto.get("excerpt").cloned().unwrap_or(Value::Null),
+    }))
+}
+
 fn convert_responses_request_to_chat_completions(
     body: &Value,
     cfg: &ProxyConfig,
@@ -2415,7 +3908,12 @@ fn convert_responses_request_to_chat_completions(
         .unwrap_or("")
         .trim()
         .to_string();
-    if let Some(override_model) = cfg.model_override.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()) {
+    if let Some(override_model) = cfg
+        .model_override
+        .as_ref()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+    {
         model = override_model.to_string();
     }
     if model.eq_ignore_ascii_case("glm5") {
@@ -2425,14 +3923,21 @@ fn convert_responses_request_to_chat_completions(
         return Err("未配置模型。请在代理设置中填写模型名称，例如 glm-5。".to_string());
     }
 
-    let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let mut out = serde_json::json!({
         "model": model,
         "messages": [],
         "stream": stream,
     });
 
-    if let Some(instructions) = body.get("instructions").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+    if let Some(instructions) = body
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+    {
         if let Some(messages) = out.get_mut("messages").and_then(|v| v.as_array_mut()) {
             messages.push(serde_json::json!({
                 "role": "system",
@@ -2461,7 +3966,7 @@ fn convert_responses_request_to_chat_completions(
                     match item_type {
                         "message" | "" => {
                             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-                            let role = if role == "developer" { "user" } else { role };
+                            let role = if role == "developer" { "system" } else { role };
                             let mut message = serde_json::json!({
                                 "role": role,
                                 "content": [],
@@ -2479,7 +3984,10 @@ fn convert_responses_request_to_chat_completions(
                                             .unwrap_or("input_text");
                                         match content_type {
                                             "input_text" | "output_text" => {
-                                                if let Some(text) = content_item.get("text").and_then(|v| v.as_str()) {
+                                                if let Some(text) = content_item
+                                                    .get("text")
+                                                    .and_then(|v| v.as_str())
+                                                {
                                                     content.push(serde_json::json!({
                                                         "type": "text",
                                                         "text": text,
@@ -2487,7 +3995,10 @@ fn convert_responses_request_to_chat_completions(
                                                 }
                                             }
                                             "input_image" => {
-                                                if let Some(url) = content_item.get("image_url").and_then(|v| v.as_str()) {
+                                                if let Some(url) = content_item
+                                                    .get("image_url")
+                                                    .and_then(|v| v.as_str())
+                                                {
                                                     content.push(serde_json::json!({
                                                         "type": "image_url",
                                                         "image_url": { "url": url },
@@ -2505,7 +4016,9 @@ fn convert_responses_request_to_chat_completions(
                                 }
                                 _ => {}
                             }
-                            if let Some(messages) = out.get_mut("messages").and_then(|v| v.as_array_mut()) {
+                            if let Some(messages) =
+                                out.get_mut("messages").and_then(|v| v.as_array_mut())
+                            {
                                 messages.push(message);
                             }
                         }
@@ -2528,7 +4041,9 @@ fn convert_responses_request_to_chat_completions(
                                     arguments.len()
                                 ));
                             }
-                            if let Some(messages) = out.get_mut("messages").and_then(|v| v.as_array_mut()) {
+                            if let Some(messages) =
+                                out.get_mut("messages").and_then(|v| v.as_array_mut())
+                            {
                                 messages.push(serde_json::json!({
                                     "role": "assistant",
                                     "content": Value::Null,
@@ -2566,7 +4081,9 @@ fn convert_responses_request_to_chat_completions(
                                     output.len()
                                 ));
                             }
-                            if let Some(messages) = out.get_mut("messages").and_then(|v| v.as_array_mut()) {
+                            if let Some(messages) =
+                                out.get_mut("messages").and_then(|v| v.as_array_mut())
+                            {
                                 messages.push(serde_json::json!({
                                     "role": "tool",
                                     "tool_call_id": call_id,
@@ -2593,7 +4110,10 @@ fn convert_responses_request_to_chat_completions(
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
         let mut chat_tools = Vec::new();
         for tool in tools {
-            let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("function");
+            let tool_type = tool
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("function");
             if tool_type != "function" && !tool.get("name").is_some() {
                 continue;
             }
@@ -2601,8 +4121,12 @@ fn convert_responses_request_to_chat_completions(
             if name.is_empty() {
                 continue;
             }
-            let description = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
-            let parameters = normalize_tool_parameters(tool.get("parameters").unwrap_or(&Value::Null));
+            let description = tool
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let parameters =
+                normalize_tool_parameters(tool.get("parameters").unwrap_or(&Value::Null));
             chat_tools.push(serde_json::json!({
                 "type": "function",
                 "function": {
@@ -2621,11 +4145,14 @@ fn convert_responses_request_to_chat_completions(
         out["max_tokens"] = serde_json::json!(max_tokens);
     }
     if has_chat_tools {
-        if let Some(parallel_tool_calls) = body.get("parallel_tool_calls").and_then(|v| v.as_bool()) {
+        if let Some(parallel_tool_calls) = body.get("parallel_tool_calls").and_then(|v| v.as_bool())
+        {
             out["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
         }
         if let Some(tool_choice) = body.get("tool_choice") {
-            out["tool_choice"] = tool_choice.clone();
+            if let Some(normalized_choice) = normalize_openai_tool_choice_for_chat(tool_choice) {
+                out["tool_choice"] = normalized_choice;
+            }
         }
     }
 
@@ -2635,7 +4162,11 @@ fn convert_responses_request_to_chat_completions(
         .and_then(|v| v.as_str())
         .and_then(normalize_reasoning_effort)
     {
-        let effort = if effort == "xhigh" { "high".to_string() } else { effort };
+        let effort = if effort == "xhigh" {
+            "high".to_string()
+        } else {
+            effort
+        };
         out["reasoning_effort"] = serde_json::json!(effort);
     }
 
@@ -2712,11 +4243,13 @@ fn convert_chat_completions_non_stream_to_responses(
                         .and_then(|v| v.get("arguments"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
+                    let normalized_arguments = repair_tool_arguments_json(arguments)
+                        .unwrap_or_else(|| arguments.to_string());
                     output.push(serde_json::json!({
                         "id": format!("fc_{call_id}"),
                         "type": "function_call",
                         "status": "completed",
-                        "arguments": arguments,
+                        "arguments": normalized_arguments,
                         "call_id": call_id,
                         "name": name,
                     }));
@@ -2765,15 +4298,128 @@ fn convert_chat_completions_non_stream_to_responses(
     Ok((Bytes::from(bytes), input_tokens, output_tokens, body_text))
 }
 
+fn extract_upstream_error_message_from_value(value: &Value) -> Option<String> {
+    if let Some(message) = value
+        .get("error")
+        .and_then(|v| v.get("message"))
+        .and_then(|v| v.as_str())
+    {
+        let trimmed = message.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(message) = value.get("message").and_then(|v| v.as_str()) {
+        let trimmed = message.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(detail) = value.get("detail").and_then(|v| v.as_str()) {
+        let trimmed = detail.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn extract_upstream_error_message(body_bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body_bytes).trim().to_string();
+    if text.is_empty() {
+        return "upstream request failed".to_string();
+    }
+    if let Ok(value) = serde_json::from_slice::<Value>(body_bytes) {
+        if let Some(message) = extract_upstream_error_message_from_value(&value) {
+            return message;
+        }
+    }
+    truncate_body(text.as_bytes())
+}
+
+fn anthropic_error_type_for_status(status: reqwest::StatusCode) -> &'static str {
+    match status {
+        reqwest::StatusCode::BAD_REQUEST => "invalid_request_error",
+        reqwest::StatusCode::UNAUTHORIZED => "authentication_error",
+        reqwest::StatusCode::FORBIDDEN => "permission_error",
+        reqwest::StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        _ => "api_error",
+    }
+}
+
+fn build_anthropic_error_response_bytes(
+    status: reqwest::StatusCode,
+    body_bytes: &[u8],
+) -> (Bytes, String, Option<String>) {
+    let message = extract_upstream_error_message(body_bytes);
+    let payload = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": anthropic_error_type_for_status(status),
+            "message": message,
+        }
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| {
+        format!(
+            "{{\"type\":\"error\",\"error\":{{\"type\":\"{}\",\"message\":{}}}}}",
+            anthropic_error_type_for_status(status),
+            serde_json::to_string(&message).unwrap_or_else(|_| "\"upstream request failed\"".to_string())
+        )
+        .into_bytes()
+    });
+    let response_body_text = if bytes.is_empty() {
+        None
+    } else {
+        Some(truncate_body(&bytes))
+    };
+    (Bytes::from(bytes), message, response_body_text)
+}
+
+fn build_claude_response_or_error_body(
+    status: reqwest::StatusCode,
+    bytes: &Bytes,
+    reverse_tool_map: &HashMap<String, String>,
+    request_model: &str,
+) -> Result<
+    (
+        Bytes,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    ),
+    String,
+> {
+    if status.is_success() {
+        let (converted, input_tokens, output_tokens, response_body_text) =
+            build_claude_response_body(bytes, reverse_tool_map, request_model)?;
+        Ok((
+            converted,
+            input_tokens,
+            output_tokens,
+            response_body_text,
+            None,
+        ))
+    } else {
+        let (converted, error_message, response_body_text) =
+            build_anthropic_error_response_bytes(status, bytes);
+        Ok((converted, None, None, response_body_text, Some(error_message)))
+    }
+}
+
 fn convert_codex_non_stream_to_claude(
     resp: &Value,
     reverse_tool_map: &HashMap<String, String>,
     request_model: &str,
 ) -> Result<Value, String> {
     let response = if resp.get("type").and_then(|v| v.as_str()) == Some("response.completed") {
-        resp.get("response").cloned().unwrap_or_else(|| serde_json::json!({}))
+        resp.get("response")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}))
     } else if resp.get("response").is_some() {
-        resp.get("response").cloned().unwrap_or_else(|| serde_json::json!({}))
+        resp.get("response")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}))
     } else {
         resp.clone()
     };
@@ -2842,7 +4488,8 @@ fn convert_codex_non_stream_to_claude(
                     if let Some(content) = item.get("content") {
                         if let Some(arr) = content.as_array() {
                             for part in arr {
-                                if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
+                                if part.get("type").and_then(|v| v.as_str()) == Some("output_text")
+                                {
                                     if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                                         if !text.is_empty() {
                                             if let Some(arr) = out["content"].as_array_mut() {
@@ -2863,7 +4510,11 @@ fn convert_codex_non_stream_to_claude(
                 }
                 "function_call" => {
                     has_tool_call = true;
-                    let mut name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let mut name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     if let Some(orig) = reverse_tool_map.get(&name) {
                         name = orig.clone();
                     }
@@ -2965,10 +4616,7 @@ fn push_claude_sse(state: &mut CodexToClaudeStreamState, event: &str, payload: &
     state.pending.push_back(Bytes::from(line));
 }
 
-fn codex_event_to_claude(
-    state: &mut CodexToClaudeStreamState,
-    event: &Value,
-) {
+fn codex_event_to_claude(state: &mut CodexToClaudeStreamState, event: &Value) {
     let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match event_type {
         "response.created" => {
@@ -3041,7 +4689,11 @@ fn codex_event_to_claude(
             if let Some(item) = event.get("item") {
                 if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
                     state.has_tool_call = true;
-                    let mut name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let mut name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     if let Some(orig) = state.reverse_tool_map.get(&name) {
                         name = orig.clone();
                     }
@@ -3134,7 +4786,9 @@ fn codex_event_to_claude(
 fn process_codex_sse_chunk(state: &mut CodexToClaudeStreamState, chunk: &str) {
     state.buffer.push_str(chunk);
     loop {
-        let Some(pos) = state.buffer.find("\n\n") else { break; };
+        let Some(pos) = state.buffer.find("\n\n") else {
+            break;
+        };
         let raw = state.buffer[..pos].to_string();
         state.buffer = state.buffer[pos + 2..].to_string();
         let mut data_line = None;
@@ -3144,7 +4798,9 @@ fn process_codex_sse_chunk(state: &mut CodexToClaudeStreamState, chunk: &str) {
                 break;
             }
         }
-        let Some(payload) = data_line else { continue; };
+        let Some(payload) = data_line else {
+            continue;
+        };
         if payload.is_empty() {
             continue;
         }
@@ -3183,43 +4839,49 @@ async fn build_anthropic_stream_response(
     };
 
     let mut upstream_stream = upstream_resp.bytes_stream();
-    let stream = futures_util::stream::unfold((upstream_stream, state), |(mut upstream_stream, mut state)| async move {
-        loop {
-            if let Some(bytes) = state.pending.pop_front() {
-                return Some((Ok::<Bytes, std::io::Error>(bytes), (upstream_stream, state)));
-            }
-            if state.done {
-                if let Some(mut entry) = state.log_entry.take() {
-                    if !state.captured.is_empty() {
-                        entry.response_body = Some(state.captured.clone());
+    let stream = futures_util::stream::unfold(
+        (upstream_stream, state),
+        |(mut upstream_stream, mut state)| async move {
+            loop {
+                if let Some(bytes) = state.pending.pop_front() {
+                    return Some((Ok::<Bytes, std::io::Error>(bytes), (upstream_stream, state)));
+                }
+                if state.done {
+                    if let Some(mut entry) = state.log_entry.take() {
+                        if !state.captured.is_empty() {
+                            entry.response_body = Some(state.captured.clone());
+                        }
+                        entry.input_tokens = state.usage_input;
+                        entry.output_tokens = state.usage_output;
+                        let _ = insert_proxy_log(&entry);
                     }
-                    entry.input_tokens = state.usage_input;
-                    entry.output_tokens = state.usage_output;
-                    let _ = insert_proxy_log(&entry);
+                    return None;
                 }
-                return None;
+                match upstream_stream.next().await {
+                    Some(Ok(chunk)) => {
+                        let chunk_text = String::from_utf8_lossy(&chunk);
+                        process_codex_sse_chunk(&mut state, &chunk_text);
+                        continue;
+                    }
+                    Some(Err(err)) => {
+                        let msg = format!(
+                            "event: error\ndata: {{\"type\":\"error\",\"message\":\"{}\"}}\n\n",
+                            err
+                        );
+                        append_capture_text(&mut state.captured, &msg);
+                        return Some((
+                            Ok::<Bytes, std::io::Error>(Bytes::from(msg)),
+                            (upstream_stream, state),
+                        ));
+                    }
+                    None => {
+                        state.done = true;
+                        continue;
+                    }
+                }
             }
-            match upstream_stream.next().await {
-                Some(Ok(chunk)) => {
-                    let chunk_text = String::from_utf8_lossy(&chunk);
-                    process_codex_sse_chunk(&mut state, &chunk_text);
-                    continue;
-                }
-                Some(Err(err)) => {
-                    let msg = format!(
-                        "event: error\ndata: {{\"type\":\"error\",\"message\":\"{}\"}}\n\n",
-                        err
-                    );
-                    append_capture_text(&mut state.captured, &msg);
-                    return Some((Ok::<Bytes, std::io::Error>(Bytes::from(msg)), (upstream_stream, state)));
-                }
-                None => {
-                    state.done = true;
-                    continue;
-                }
-            }
-        }
-    });
+        },
+    );
 
     axum::response::Response::builder()
         .status(status)
@@ -3382,7 +5044,10 @@ fn finalize_custom_reasoning(state: &mut CustomResponsesStreamState, output_inde
     let Some(reasoning_id) = state.active_reasoning_ids.remove(&output_index) else {
         return;
     };
-    let text = state.active_reasoning_text.remove(&output_index).unwrap_or_default();
+    let text = state
+        .active_reasoning_text
+        .remove(&output_index)
+        .unwrap_or_default();
     let text_done = serde_json::json!({
         "type": "response.reasoning_summary_text.done",
         "sequence_number": next_custom_responses_seq(state),
@@ -3419,7 +5084,9 @@ fn finalize_custom_reasoning(state: &mut CustomResponsesStreamState, output_inde
         }
     });
     push_custom_responses_sse(state, "response.output_item.done", &output_item_done);
-    state.completed_reasoning.push((output_index, reasoning_id, text));
+    state
+        .completed_reasoning
+        .push((output_index, reasoning_id, text));
 }
 
 fn ensure_custom_message_started(state: &mut CustomResponsesStreamState, output_index: i64) {
@@ -3462,7 +5129,11 @@ fn finalize_custom_message(state: &mut CustomResponsesStreamState, output_index:
     if !state.message_added.contains(&output_index) || state.message_done.contains(&output_index) {
         return;
     }
-    let text = state.message_text.get(&output_index).cloned().unwrap_or_default();
+    let text = state
+        .message_text
+        .get(&output_index)
+        .cloned()
+        .unwrap_or_default();
     let text_done = serde_json::json!({
         "type": "response.output_text.done",
         "sequence_number": next_custom_responses_seq(state),
@@ -3525,7 +5196,11 @@ fn finalize_custom_tool_call(state: &mut CustomResponsesStreamState, output_inde
         .filter(|v| !v.is_empty())
         .and_then(|v| repair_tool_arguments_json(&v).or(Some(v)))
         .unwrap_or_else(|| "{}".to_string());
-    let name = state.tool_names.get(&output_index).cloned().unwrap_or_default();
+    let name = state
+        .tool_names
+        .get(&output_index)
+        .cloned()
+        .unwrap_or_default();
     let args_done = serde_json::json!({
         "type": "response.function_call_arguments.done",
         "sequence_number": next_custom_responses_seq(state),
@@ -3708,7 +5383,9 @@ fn finalize_custom_responses_stream(state: &mut CustomResponsesStreamState) {
 fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk: &str) {
     state.buffer.push_str(chunk);
     loop {
-        let Some(pos) = state.buffer.find("\n\n") else { break; };
+        let Some(pos) = state.buffer.find("\n\n") else {
+            break;
+        };
         let raw = state.buffer[..pos].to_string();
         state.buffer = state.buffer[pos + 2..].to_string();
 
@@ -3772,8 +5449,12 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                         state.reasoning_output_index.insert(choice_index, idx);
                         idx
                     };
-                    if !state.active_reasoning_ids.contains_key(&reasoning_output_index) {
-                        let reasoning_id = format!("rs_{}_{}", state.response_id, reasoning_output_index);
+                    if !state
+                        .active_reasoning_ids
+                        .contains_key(&reasoning_output_index)
+                    {
+                        let reasoning_id =
+                            format!("rs_{}_{}", state.response_id, reasoning_output_index);
                         state
                             .active_reasoning_ids
                             .insert(reasoning_output_index, reasoning_id.clone());
@@ -3800,7 +5481,11 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                                 "text": "",
                             }
                         });
-                        push_custom_responses_sse(state, "response.reasoning_summary_part.added", &part_added);
+                        push_custom_responses_sse(
+                            state,
+                            "response.reasoning_summary_part.added",
+                            &part_added,
+                        );
                     }
                     state
                         .active_reasoning_text
@@ -3815,22 +5500,31 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                         "summary_index": 0,
                         "delta": reasoning_delta,
                     });
-                    push_custom_responses_sse(state, "response.reasoning_summary_text.delta", &payload);
+                    push_custom_responses_sse(
+                        state,
+                        "response.reasoning_summary_text.delta",
+                        &payload,
+                    );
                 }
 
-                if let Some(text_delta) = delta.get("content").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
-                    if let Some(reasoning_output_index) = state.reasoning_output_index.get(&choice_index).copied() {
+                if let Some(text_delta) = delta
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+                {
+                    if let Some(reasoning_output_index) =
+                        state.reasoning_output_index.get(&choice_index).copied()
+                    {
                         finalize_custom_reasoning(state, reasoning_output_index);
                     }
-                    let message_output_index = if let Some(idx) =
-                        state.message_output_index.get(&choice_index).copied()
-                    {
-                        idx
-                    } else {
-                        let idx = alloc_custom_output_index(state);
-                        state.message_output_index.insert(choice_index, idx);
-                        idx
-                    };
+                    let message_output_index =
+                        if let Some(idx) = state.message_output_index.get(&choice_index).copied() {
+                            idx
+                        } else {
+                            let idx = alloc_custom_output_index(state);
+                            state.message_output_index.insert(choice_index, idx);
+                            idx
+                        };
                     ensure_custom_message_started(state, message_output_index);
                     let payload = serde_json::json!({
                         "type": "response.output_text.delta",
@@ -3850,10 +5544,14 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                 }
 
                 if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                    if let Some(reasoning_output_index) = state.reasoning_output_index.get(&choice_index).copied() {
+                    if let Some(reasoning_output_index) =
+                        state.reasoning_output_index.get(&choice_index).copied()
+                    {
                         finalize_custom_reasoning(state, reasoning_output_index);
                     }
-                    if let Some(message_output_index) = state.message_output_index.get(&choice_index).copied() {
+                    if let Some(message_output_index) =
+                        state.message_output_index.get(&choice_index).copied()
+                    {
                         finalize_custom_message(state, message_output_index);
                     }
                     for (pos, tool_call) in tool_calls.iter().enumerate() {
@@ -3863,26 +5561,37 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                             .and_then(|v| v.as_i64())
                             .unwrap_or(pos as i64);
                         let tool_key = format!("{choice_index}:{tool_index}");
-                        let fallback_output_index = if let Some(idx) = state.tool_output_index.get(&tool_key).copied() {
-                            idx
-                        } else {
-                            let idx = alloc_custom_output_index(state);
-                            state.tool_output_index.insert(tool_key, idx);
-                            idx
-                        };
+                        let fallback_output_index =
+                            if let Some(idx) = state.tool_output_index.get(&tool_key).copied() {
+                                idx
+                            } else {
+                                let idx = alloc_custom_output_index(state);
+                                state.tool_output_index.insert(tool_key, idx);
+                                idx
+                            };
 
-                        let upstream_call_id =
-                            tool_call.get("id").and_then(|v| v.as_str()).filter(|v| !v.is_empty());
+                        let upstream_call_id = tool_call
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .filter(|v| !v.is_empty());
                         let client_call_id = upstream_call_id
                             .map(wrap_client_tool_call_id)
-                            .unwrap_or_else(|| synth_client_tool_call_id(&state.response_id, choice_index, tool_index));
+                            .unwrap_or_else(|| {
+                                synth_client_tool_call_id(
+                                    &state.response_id,
+                                    choice_index,
+                                    tool_index,
+                                )
+                            });
                         if let Some(upstream_call_id) = upstream_call_id {
                             store_tool_call_id_mapping(&client_call_id, upstream_call_id);
                         }
 
                         let tool_output_index = if !client_call_id.is_empty() {
                             let call_id = &client_call_id;
-                            if let Some(existing) = state.tool_output_index_by_call_id.get(call_id).copied() {
+                            if let Some(existing) =
+                                state.tool_output_index_by_call_id.get(call_id).copied()
+                            {
                                 if existing != fallback_output_index {
                                     log_proxy(&format!(
                                         "custom_responses: tool output_index mismatch call_id={} existing={} fallback={} choice_index={} tool_index={}",
@@ -3891,10 +5600,9 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                                 }
                                 existing
                             } else {
-                                state.tool_output_index_by_call_id.insert(
-                                    call_id.to_string(),
-                                    fallback_output_index,
-                                );
+                                state
+                                    .tool_output_index_by_call_id
+                                    .insert(call_id.to_string(), fallback_output_index);
                                 fallback_output_index
                             }
                         } else {
@@ -3947,7 +5655,11 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                                         "name": state.tool_names.get(&tool_output_index).cloned().unwrap_or_default(),
                                     }
                                 });
-                                push_custom_responses_sse(state, "response.output_item.added", &payload);
+                                push_custom_responses_sse(
+                                    state,
+                                    "response.output_item.added",
+                                    &payload,
+                                );
                             }
                         }
                         if let Some(arguments_delta) = tool_call
@@ -3964,7 +5676,9 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                             let (merged_arguments, emitted_delta) =
                                 merge_custom_tool_arguments(&existing_arguments, arguments_delta);
                             state.tool_args.insert(tool_output_index, merged_arguments);
-                            if let Some(call_id) = state.tool_call_ids.get(&tool_output_index).cloned() {
+                            if let Some(call_id) =
+                                state.tool_call_ids.get(&tool_output_index).cloned()
+                            {
                                 if let Some(delta_to_emit) = emitted_delta {
                                     let payload = serde_json::json!({
                                         "type": "response.function_call_arguments.delta",
@@ -3973,7 +5687,11 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                                         "output_index": tool_output_index,
                                         "delta": delta_to_emit,
                                     });
-                                    push_custom_responses_sse(state, "response.function_call_arguments.delta", &payload);
+                                    push_custom_responses_sse(
+                                        state,
+                                        "response.function_call_arguments.delta",
+                                        &payload,
+                                    );
                                 } else if repair_tool_arguments_json(arguments_delta).is_some() {
                                     log_proxy(&format!(
                                         "custom_responses: replaced tool arguments with full JSON output_index={} call_id={}",
@@ -3985,11 +5703,19 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                     }
                 }
 
-                if choice.get("finish_reason").and_then(|v| v.as_str()).is_some() {
-                    if let Some(reasoning_output_index) = state.reasoning_output_index.get(&choice_index).copied() {
+                if choice
+                    .get("finish_reason")
+                    .and_then(|v| v.as_str())
+                    .is_some()
+                {
+                    if let Some(reasoning_output_index) =
+                        state.reasoning_output_index.get(&choice_index).copied()
+                    {
                         finalize_custom_reasoning(state, reasoning_output_index);
                     }
-                    if let Some(message_output_index) = state.message_output_index.get(&choice_index).copied() {
+                    if let Some(message_output_index) =
+                        state.message_output_index.get(&choice_index).copied()
+                    {
                         finalize_custom_message(state, message_output_index);
                     }
                 }
@@ -4042,45 +5768,48 @@ async fn build_custom_openai_stream_response(
     };
 
     let mut upstream_stream = upstream_resp.bytes_stream();
-    let stream = futures_util::stream::unfold((upstream_stream, state), |(mut upstream_stream, mut state)| async move {
-        loop {
-            if let Some(bytes) = state.pending.pop_front() {
-                return Some((Ok::<Bytes, std::io::Error>(bytes), (upstream_stream, state)));
-            }
-            if state.done {
-                if let Some(mut entry) = state.log_entry.take() {
-                    if !state.captured.is_empty() {
-                        entry.response_body = Some(state.captured.clone());
+    let stream = futures_util::stream::unfold(
+        (upstream_stream, state),
+        |(mut upstream_stream, mut state)| async move {
+            loop {
+                if let Some(bytes) = state.pending.pop_front() {
+                    return Some((Ok::<Bytes, std::io::Error>(bytes), (upstream_stream, state)));
+                }
+                if state.done {
+                    if let Some(mut entry) = state.log_entry.take() {
+                        if !state.captured.is_empty() {
+                            entry.response_body = Some(state.captured.clone());
+                        }
+                        entry.input_tokens = state.input_tokens;
+                        entry.output_tokens = state.output_tokens;
+                        let _ = insert_proxy_log(&entry);
                     }
-                    entry.input_tokens = state.input_tokens;
-                    entry.output_tokens = state.output_tokens;
-                    let _ = insert_proxy_log(&entry);
+                    return None;
                 }
-                return None;
-            }
-            match upstream_stream.next().await {
-                Some(Ok(chunk)) => {
-                    let chunk_text = String::from_utf8_lossy(&chunk);
-                    process_custom_openai_sse_chunk(&mut state, &chunk_text);
-                }
-                Some(Err(err)) => {
-                    let payload = serde_json::json!({
-                        "type": "error",
-                        "message": err.to_string(),
-                    });
-                    let line = format!(
-                        "event: error\ndata: {}\n\n",
-                        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
-                    );
-                    append_capture_text(&mut state.captured, &line);
-                    state.pending.push_back(Bytes::from(line));
-                }
-                None => {
-                    finalize_custom_responses_stream(&mut state);
+                match upstream_stream.next().await {
+                    Some(Ok(chunk)) => {
+                        let chunk_text = String::from_utf8_lossy(&chunk);
+                        process_custom_openai_sse_chunk(&mut state, &chunk_text);
+                    }
+                    Some(Err(err)) => {
+                        let payload = serde_json::json!({
+                            "type": "error",
+                            "message": err.to_string(),
+                        });
+                        let line = format!(
+                            "event: error\ndata: {}\n\n",
+                            serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+                        );
+                        append_capture_text(&mut state.captured, &line);
+                        state.pending.push_back(Bytes::from(line));
+                    }
+                    None => {
+                        finalize_custom_responses_stream(&mut state);
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 
     axum::response::Response::builder()
         .status(status)
@@ -4171,7 +5900,10 @@ fn stop_openai_claude_block(state: &mut OpenAIToClaudeStreamState, index: Option
     }
 }
 
-fn finalize_openai_claude_stream(state: &mut OpenAIToClaudeStreamState, finish_reason: Option<&str>) {
+fn finalize_openai_claude_stream(
+    state: &mut OpenAIToClaudeStreamState,
+    finish_reason: Option<&str>,
+) {
     if state.done {
         return;
     }
@@ -4183,7 +5915,11 @@ fn finalize_openai_claude_stream(state: &mut OpenAIToClaudeStreamState, finish_r
     let mut sorted_tool_indexes: Vec<i64> = state.tool_block_indexes.keys().copied().collect();
     sorted_tool_indexes.sort_unstable();
     for tool_index in sorted_tool_indexes {
-        if let Some(args) = state.tool_arguments.get(&tool_index).filter(|v| !v.is_empty()) {
+        if let Some(args) = state
+            .tool_arguments
+            .get(&tool_index)
+            .filter(|v| !v.is_empty())
+        {
             let partial_json = repair_tool_arguments_json(args).unwrap_or_else(|| args.clone());
             let payload = serde_json::json!({
                 "type": "content_block_delta",
@@ -4229,7 +5965,9 @@ fn finalize_openai_claude_stream(state: &mut OpenAIToClaudeStreamState, finish_r
 fn process_openai_chat_to_claude_sse_chunk(state: &mut OpenAIToClaudeStreamState, chunk: &str) {
     state.buffer.push_str(chunk);
     loop {
-        let Some(pos) = state.buffer.find("\n\n") else { break; };
+        let Some(pos) = state.buffer.find("\n\n") else {
+            break;
+        };
         let raw = state.buffer[..pos].to_string();
         state.buffer = state.buffer[pos + 2..].to_string();
 
@@ -4291,7 +6029,11 @@ fn process_openai_chat_to_claude_sse_chunk(state: &mut OpenAIToClaudeStreamState
                     push_openai_to_claude_sse(state, "content_block_delta", &payload);
                 }
 
-                if let Some(text_delta) = delta.get("content").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+                if let Some(text_delta) = delta
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+                {
                     let reasoning_block_index = state.reasoning_block_index.take();
                     stop_openai_claude_block(state, reasoning_block_index);
                     if state.text_block_index.is_none() {
@@ -4319,7 +6061,8 @@ fn process_openai_chat_to_claude_sse_chunk(state: &mut OpenAIToClaudeStreamState
                     stop_openai_claude_block(state, reasoning_block_index);
                     stop_openai_claude_block(state, text_block_index);
                     for tool_call in tool_calls {
-                        let tool_index = tool_call.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let tool_index =
+                            tool_call.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
                         if let Some(name) = tool_call
                             .get("function")
                             .and_then(|v| v.get("name"))
@@ -4333,7 +6076,11 @@ fn process_openai_chat_to_claude_sse_chunk(state: &mut OpenAIToClaudeStreamState
                                 .unwrap_or_else(|| name.to_string());
                             state.tool_names.insert(tool_index, mapped_name);
                         }
-                        if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+                        if let Some(id) = tool_call
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .filter(|v| !v.is_empty())
+                        {
                             state.tool_ids.insert(tool_index, id.to_string());
                         }
                         if !state.tool_block_indexes.contains_key(&tool_index) {
@@ -4408,41 +6155,44 @@ async fn build_openai_chat_to_claude_stream_response(
     };
 
     let mut upstream_stream = upstream_resp.bytes_stream();
-    let stream = futures_util::stream::unfold((upstream_stream, state), |(mut upstream_stream, mut state)| async move {
-        loop {
-            if let Some(bytes) = state.pending.pop_front() {
-                return Some((Ok::<Bytes, std::io::Error>(bytes), (upstream_stream, state)));
-            }
-            if state.done {
-                if let Some(mut entry) = state.log_entry.take() {
-                    if !state.captured.is_empty() {
-                        entry.response_body = Some(state.captured.clone());
+    let stream = futures_util::stream::unfold(
+        (upstream_stream, state),
+        |(mut upstream_stream, mut state)| async move {
+            loop {
+                if let Some(bytes) = state.pending.pop_front() {
+                    return Some((Ok::<Bytes, std::io::Error>(bytes), (upstream_stream, state)));
+                }
+                if state.done {
+                    if let Some(mut entry) = state.log_entry.take() {
+                        if !state.captured.is_empty() {
+                            entry.response_body = Some(state.captured.clone());
+                        }
+                        entry.input_tokens = state.input_tokens;
+                        entry.output_tokens = state.output_tokens;
+                        let _ = insert_proxy_log(&entry);
                     }
-                    entry.input_tokens = state.input_tokens;
-                    entry.output_tokens = state.output_tokens;
-                    let _ = insert_proxy_log(&entry);
+                    return None;
                 }
-                return None;
-            }
-            match upstream_stream.next().await {
-                Some(Ok(chunk)) => {
-                    let chunk_text = String::from_utf8_lossy(&chunk);
-                    process_openai_chat_to_claude_sse_chunk(&mut state, &chunk_text);
-                }
-                Some(Err(err)) => {
-                    let payload = serde_json::json!({
-                        "type": "error",
-                        "error": { "type": "api_error", "message": err.to_string() }
-                    });
-                    push_openai_to_claude_sse(&mut state, "error", &payload);
-                    state.done = true;
-                }
-                None => {
-                    finalize_openai_claude_stream(&mut state, None);
+                match upstream_stream.next().await {
+                    Some(Ok(chunk)) => {
+                        let chunk_text = String::from_utf8_lossy(&chunk);
+                        process_openai_chat_to_claude_sse_chunk(&mut state, &chunk_text);
+                    }
+                    Some(Err(err)) => {
+                        let payload = serde_json::json!({
+                            "type": "error",
+                            "error": { "type": "api_error", "message": err.to_string() }
+                        });
+                        push_openai_to_claude_sse(&mut state, "error", &payload);
+                        state.done = true;
+                    }
+                    None => {
+                        finalize_openai_claude_stream(&mut state, None);
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 
     axum::response::Response::builder()
         .status(status)
@@ -4661,19 +6411,13 @@ fn build_auth_url(redirect_uri: &str, code_challenge: &str, state: &str) -> Stri
          &codex_cli_simplified_flow=true\
          &state={state}\
          &originator=codex_cli_rs",
-        redirect_uri = percent_encoding::utf8_percent_encode(
-            redirect_uri,
-            percent_encoding::NON_ALPHANUMERIC
-        ),
+        redirect_uri =
+            percent_encoding::utf8_percent_encode(redirect_uri, percent_encoding::NON_ALPHANUMERIC),
         scope = percent_encoding::utf8_percent_encode(SCOPE, percent_encoding::NON_ALPHANUMERIC),
     )
 }
 
-async fn exchange_code(
-    code: &str,
-    redirect_uri: &str,
-    verifier: &str,
-) -> Result<Value, String> {
+async fn exchange_code(code: &str, redirect_uri: &str, verifier: &str) -> Result<Value, String> {
     let client = reqwest::Client::new();
     let params = [
         ("grant_type", "authorization_code"),
@@ -4736,9 +6480,7 @@ fn save_oauth_tokens(token_response: &Value) -> Result<CodexAccount, String> {
         .unwrap_or("")
         .to_string();
 
-    let now_iso = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+    let now_iso = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     // Parse account_id from access token
     let at_payload = decode_jwt(&access_token);
@@ -5066,8 +6808,14 @@ fn get_oauth_url() -> Result<Value, String> {
 /// Complete OAuth login by parsing a callback URL the user pasted manually.
 /// Extracts code+state, exchanges for tokens, saves and imports the account.
 #[tauri::command]
-async fn complete_oauth_manual(callback_url: String, label: Option<String>) -> Result<Value, String> {
-    let pending = oauth_pending().lock().unwrap().take()
+async fn complete_oauth_manual(
+    callback_url: String,
+    label: Option<String>,
+) -> Result<Value, String> {
+    let pending = oauth_pending()
+        .lock()
+        .unwrap()
+        .take()
         .ok_or("No pending OAuth session. Please generate a login URL first.")?;
 
     // Parse query string from full URL or bare query string
@@ -5093,7 +6841,9 @@ async fn complete_oauth_manual(callback_url: String, label: Option<String>) -> R
     if returned_state != pending.state {
         return Err("State mismatch — the callback URL does not match this session.".into());
     }
-    let code = params.get("code").ok_or("No authorization code found in the URL.")?;
+    let code = params
+        .get("code")
+        .ok_or("No authorization code found in the URL.")?;
 
     let token_resp = exchange_code(code, &pending.redirect_uri, &pending.verifier).await?;
     let account = save_oauth_tokens(&token_resp)?;
@@ -5130,7 +6880,9 @@ async fn oauth_login(label: Option<String>) -> Result<Value, String> {
     let listener_v4 = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
         .await
         .map_err(|e| e.to_string())?;
-    let listener_v6 = tokio::net::TcpListener::bind(format!("[::1]:{port}")).await.ok();
+    let listener_v6 = tokio::net::TcpListener::bind(format!("[::1]:{port}"))
+        .await
+        .ok();
 
     // We only need one request; use a channel to get the query string
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
@@ -5278,9 +7030,7 @@ async fn refresh_account_token(id: String) -> Result<Value, String> {
         .unwrap_or(&id)
         .to_string();
 
-    let now_iso = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+    let now_iso = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let updated = serde_json::json!({
         "tokens": {
@@ -5292,11 +7042,8 @@ async fn refresh_account_token(id: String) -> Result<Value, String> {
         "last_refresh": now_iso,
     });
 
-    fs::write(
-        &auth_path,
-        serde_json::to_string_pretty(&updated).unwrap(),
-    )
-    .map_err(|e| e.to_string())?;
+    fs::write(&auth_path, serde_json::to_string_pretty(&updated).unwrap())
+        .map_err(|e| e.to_string())?;
 
     // If this is the active account, update auth.json too
     if let Ok(current_content) = fs::read_to_string(auth_file()) {
@@ -5304,10 +7051,7 @@ async fn refresh_account_token(id: String) -> Result<Value, String> {
             let curr_tokens = current.get("tokens").unwrap_or(&empty);
             let curr_rt = curr_tokens.get("refresh_token").and_then(|v| v.as_str());
             if curr_rt == Some(refresh_token) {
-                let _ = fs::write(
-                    auth_file(),
-                    serde_json::to_string_pretty(&updated).unwrap(),
-                );
+                let _ = fs::write(auth_file(), serde_json::to_string_pretty(&updated).unwrap());
             }
         }
     }
@@ -5589,18 +7333,16 @@ async fn serve_proxy_on_listener(
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
 }
 
-async fn run_proxy_server(
-    addr: &str,
-    app: axum::Router,
-    shutdown: Arc<Notify>,
-) -> io::Result<()> {
+async fn run_proxy_server(addr: &str, app: axum::Router, shutdown: Arc<Notify>) -> io::Result<()> {
     // Bind dual-stack when using localhost.
     let addr_trimmed = addr.trim();
     if addr_trimmed.len() > "localhost:".len()
         && addr_trimmed[..("localhost:".len())].eq_ignore_ascii_case("localhost:")
     {
         let port = &addr_trimmed["localhost:".len()..];
-        log_proxy(&format!("binding listeners: 127.0.0.1:{port}, [::1]:{port}"));
+        log_proxy(&format!(
+            "binding listeners: 127.0.0.1:{port}, [::1]:{port}"
+        ));
         let v4 = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await;
         let v6 = tokio::net::TcpListener::bind(format!("[::1]:{port}")).await;
         return match (v4, v6) {
@@ -5644,7 +7386,9 @@ fn load_proxy_accounts() -> Result<Vec<ProxyAccount>, String> {
             }
         }
         let auth_path = entry.path().join("auth.json");
-        if !auth_path.exists() { continue; }
+        if !auth_path.exists() {
+            continue;
+        }
 
         if let Ok(content) = fs::read_to_string(&auth_path) {
             if let Ok(auth_data) = serde_json::from_str::<Value>(&content) {
@@ -5680,18 +7424,32 @@ fn load_proxy_accounts() -> Result<Vec<ProxyAccount>, String> {
 
 /// Headers that should NOT be forwarded to upstream
 fn skip_request_header(name: &str) -> bool {
-    matches!(name.to_lowercase().as_str(),
-        "host" | "connection" | "keep-alive" | "proxy-authenticate" |
-        "proxy-authorization" | "authorization" | "te" | "trailers" | "transfer-encoding" |
-        "upgrade" | "content-length"
+    matches!(
+        name.to_lowercase().as_str(),
+        "host"
+            | "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "authorization"
+            | "te"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
     )
 }
 
 /// Headers that should NOT be forwarded back to client
 fn skip_response_header(name: &str) -> bool {
-    matches!(name.to_lowercase().as_str(),
-        "connection" | "keep-alive" | "transfer-encoding" | "upgrade" |
-        "proxy-authenticate" | "content-length"
+    matches!(
+        name.to_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "transfer-encoding"
+            | "upgrade"
+            | "proxy-authenticate"
+            | "content-length"
     )
 }
 
@@ -5699,7 +7457,10 @@ fn skip_response_header(name: &str) -> bool {
 async fn try_refresh_account(account_id: &str, refresh_token: &str) -> Option<String> {
     let token_resp = do_token_refresh(refresh_token).await.ok()?;
 
-    let new_access = token_resp.get("access_token").and_then(|v| v.as_str())?.to_string();
+    let new_access = token_resp
+        .get("access_token")
+        .and_then(|v| v.as_str())?
+        .to_string();
     let new_refresh = token_resp
         .get("refresh_token")
         .and_then(|v| v.as_str())
@@ -5780,7 +7541,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         }
     };
     let account_count = accounts.len();
-    log_proxy(&format!("start requested: port={proxy_port} accounts={account_count}"));
+    log_proxy(&format!(
+        "start requested: port={proxy_port} accounts={account_count}"
+    ));
 
     log_proxy("init shutdown channel");
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -5790,12 +7553,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
     }
 
     use axum::{
-        body::Body,
-        extract::State,
-        http::StatusCode,
-        response::Response,
-        routing::any,
-        Router,
+        body::Body, extract::State, http::StatusCode, response::Response, routing::any, Router,
     };
 
     log_proxy("building reqwest client");
@@ -5828,6 +7586,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         is_stream: bool,
         is_anthropic: bool,
         request_model: &Option<String>,
+        estimated_input_tokens: Option<i64>,
         request_body_text: &Option<String>,
         request_headers_json: &Option<String>,
         request_url: &Option<String>,
@@ -5857,7 +7616,8 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 is_stream,
             );
 
-            let retry_resp = match state.client
+            let retry_resp = match state
+                .client
                 .request(method.clone(), target)
                 .headers(retry_headers)
                 .body(upstream_body_bytes.clone())
@@ -5866,16 +7626,21 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             {
                 Ok(resp) => resp,
                 Err(err) => {
-                    log_proxy(&format!("req#{request_id} usage-limit retry error on {fallback_id}: {err}"));
+                    log_proxy(&format!(
+                        "req#{request_id} usage-limit retry error on {fallback_id}: {err}"
+                    ));
                     continue;
                 }
             };
 
             let retry_status = retry_resp.status();
-            log_proxy(&format!("req#{request_id} usage-limit retry status: {}", retry_status.as_u16()));
+            log_proxy(&format!(
+                "req#{request_id} usage-limit retry status: {}",
+                retry_status.as_u16()
+            ));
 
             if is_stream {
-                if is_anthropic {
+                if is_anthropic && retry_status.is_success() {
                     let entry = ProxyLogEntry {
                         timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
                         method: method_label.to_string(),
@@ -5888,22 +7653,25 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         error: None,
                         model: request_model.clone(),
                         request_headers: request_headers_json.clone(),
-                        response_headers: headers_to_json_string(vec![
-                            ("content-type".to_string(), "text/event-stream".to_string()),
-                        ]),
+                        response_headers: headers_to_json_string(vec![(
+                            "content-type".to_string(),
+                            "text/event-stream".to_string(),
+                        )]),
                         request_body: request_body_text.clone(),
                         response_body: None,
-                        input_tokens: None,
+                        input_tokens: estimated_input_tokens,
                         output_tokens: None,
-                    cache_status: None,
-                    cache_key: None,
-                    cache_eligible: None,
-                    cache_bypass_reason: None,
-                    local_cached_input_tokens: None,
-                    provider_cached_input_tokens: None,
+                        cache_status: None,
+                        cache_key: None,
+                        cache_eligible: None,
+                        cache_bypass_reason: None,
+                        local_cached_input_tokens: None,
+                        provider_cached_input_tokens: None,
                     };
                     let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
-                    return Some(build_anthropic_stream_response(retry_resp, reverse_map, entry).await);
+                    return Some(
+                        build_anthropic_stream_response(retry_resp, reverse_map, entry).await,
+                    );
                 }
 
                 let entry = ProxyLogEntry {
@@ -5918,23 +7686,26 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     error: None,
                     model: request_model.clone(),
                     request_headers: request_headers_json.clone(),
-                    response_headers: headers_to_json_string(sanitize_reqwest_headers(retry_resp.headers())),
+                    response_headers: headers_to_json_string(sanitize_reqwest_headers(
+                        retry_resp.headers(),
+                    )),
                     request_body: request_body_text.clone(),
                     response_body: None,
-                    input_tokens: None,
+                    input_tokens: estimated_input_tokens,
                     output_tokens: None,
-                cache_status: None,
-                cache_key: None,
-                cache_eligible: None,
-                cache_bypass_reason: None,
-                local_cached_input_tokens: None,
-                provider_cached_input_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 return Some(build_proxy_response(retry_resp).await);
             }
 
-            let resp_hdrs_json = headers_to_json_string(sanitize_reqwest_headers(retry_resp.headers()));
+            let resp_hdrs_json =
+                headers_to_json_string(sanitize_reqwest_headers(retry_resp.headers()));
             let headers = retry_resp.headers().clone();
             let bytes = retry_resp.bytes().await.unwrap_or_default();
 
@@ -5955,12 +7726,19 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             if is_anthropic {
                 let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
                 let model_name = request_model.clone().unwrap_or_default();
-                let (converted, input_tokens, output_tokens, response_body_text) =
-                    match build_claude_response_body(&bytes, &reverse_map, &model_name) {
+                let (converted, input_tokens, output_tokens, response_body_text, error_message) =
+                    match build_claude_response_or_error_body(
+                        retry_status,
+                        &bytes,
+                        &reverse_map,
+                        &model_name,
+                    ) {
                         Ok(v) => v,
                         Err(err) => {
                             let entry = ProxyLogEntry {
-                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                timestamp: chrono::Utc::now()
+                                    .format("%Y-%m-%dT%H:%M:%SZ")
+                                    .to_string(),
                                 method: method_label.to_string(),
                                 path: path.to_string(),
                                 request_url: request_url.clone(),
@@ -5974,21 +7752,23 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                 response_headers: resp_hdrs_json.clone(),
                                 request_body: request_body_text.clone(),
                                 response_body: None,
-                                input_tokens: None,
+                                input_tokens: estimated_input_tokens,
                                 output_tokens: None,
-                            cache_status: None,
-                            cache_key: None,
-                            cache_eligible: None,
-                            cache_bypass_reason: None,
-                            local_cached_input_tokens: None,
-                            provider_cached_input_tokens: None,
+                                cache_status: None,
+                                cache_key: None,
+                                cache_eligible: None,
+                                cache_bypass_reason: None,
+                                local_cached_input_tokens: None,
+                                provider_cached_input_tokens: None,
                             };
                             let _ = insert_proxy_log(&entry);
-                            return Some(Response::builder()
-                                .status(StatusCode::BAD_GATEWAY)
-                                .header("Access-Control-Allow-Origin", "*")
-                                .body(Body::from("Anthropic response conversion failed"))
-                                .unwrap());
+                            return Some(
+                                Response::builder()
+                                    .status(StatusCode::BAD_GATEWAY)
+                                    .header("Access-Control-Allow-Origin", "*")
+                                    .body(Body::from("Anthropic response conversion failed"))
+                                    .unwrap(),
+                            );
                         }
                     };
                 let entry = ProxyLogEntry {
@@ -6000,37 +7780,46 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     duration_ms: started_at.elapsed().as_millis() as u64,
                     proxy_account_id: fallback_id.clone(),
                     account_id: fallback_account_id.clone(),
-                    error: None,
+                    error: error_message,
                     model: request_model.clone(),
                     request_headers: request_headers_json.clone(),
-                    response_headers: headers_to_json_string(vec![
-                        ("content-type".to_string(), "application/json".to_string()),
-                    ]),
+                    response_headers: headers_to_json_string(vec![(
+                        "content-type".to_string(),
+                        "application/json".to_string(),
+                    )]),
                     request_body: request_body_text.clone(),
                     response_body: response_body_text,
-                    input_tokens,
+                    input_tokens: input_tokens.or(estimated_input_tokens),
                     output_tokens,
                     ..ProxyLogEntry::default()
                 };
                 let _ = insert_proxy_log(&entry);
                 let status = axum::http::StatusCode::from_u16(retry_status.as_u16())
                     .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-                return Some(Response::builder()
-                    .status(status)
-                    .header("Content-Type", "application/json")
-                    .header("Access-Control-Allow-Origin", "*")
-                    .header("Access-Control-Allow-Headers", "*")
-                    .body(Body::from(converted))
-                    .unwrap_or_else(|_| {
-                        Response::builder()
-                            .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
-                            .body(Body::empty())
-                            .unwrap()
-                    }));
+                return Some(
+                    Response::builder()
+                        .status(status)
+                        .header("Content-Type", "application/json")
+                        .header("Access-Control-Allow-Origin", "*")
+                        .header("Access-Control-Allow-Headers", "*")
+                        .body(Body::from(converted))
+                        .unwrap_or_else(|_| {
+                            Response::builder()
+                                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Body::empty())
+                                .unwrap()
+                        }),
+                );
             }
 
-            let response_body_text = if bytes.is_empty() { None } else { Some(truncate_body(&bytes)) };
-            let (input_tokens, output_tokens) = extract_usage(&bytes);
+            let normalized_bytes =
+                maybe_normalize_chat_completion_response_bytes(path, retry_status, &bytes);
+            let response_body_text = if normalized_bytes.is_empty() {
+                None
+            } else {
+                Some(truncate_body(&normalized_bytes))
+            };
+            let (input_tokens, output_tokens) = extract_usage(&normalized_bytes);
             let entry = ProxyLogEntry {
                 timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
                 method: method_label.to_string(),
@@ -6051,7 +7840,11 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 ..ProxyLogEntry::default()
             };
             let _ = insert_proxy_log(&entry);
-            return Some(build_proxy_response_from_bytes(retry_status, &headers, bytes));
+            return Some(build_proxy_response_from_bytes(
+                retry_status,
+                &headers,
+                normalized_bytes,
+            ));
         }
     }
 
@@ -6065,7 +7858,10 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             return Response::builder()
                 .status(StatusCode::NO_CONTENT)
                 .header("Access-Control-Allow-Origin", "*")
-                .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
+                .header(
+                    "Access-Control-Allow-Methods",
+                    "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                )
                 .header("Access-Control-Allow-Headers", "*")
                 .header("Access-Control-Max-Age", "86400")
                 .body(Body::empty())
@@ -6092,7 +7888,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         // Collect and filter incoming headers (pass them through, except hop-by-hop)
         let mut forward_headers = reqwest::header::HeaderMap::new();
         for (k, v) in req.headers() {
-            if skip_request_header(k.as_str()) { continue; }
+            if skip_request_header(k.as_str()) {
+                continue;
+            }
             if let (Ok(name), Ok(val)) = (
                 reqwest::header::HeaderName::from_bytes(k.as_str().as_bytes()),
                 reqwest::header::HeaderValue::from_bytes(v.as_bytes()),
@@ -6123,19 +7921,20 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     error: Some("request body too large".to_string()),
                     model: None,
                     request_headers: request_headers_json.clone(),
-                    response_headers: headers_to_json_string(vec![
-                        ("content-type".to_string(), "text/plain".to_string()),
-                    ]),
+                    response_headers: headers_to_json_string(vec![(
+                        "content-type".to_string(),
+                        "text/plain".to_string(),
+                    )]),
                     request_body: None,
                     response_body: Some("Request body too large".to_string()),
                     input_tokens: None,
                     output_tokens: None,
-                cache_status: None,
-                cache_key: None,
-                cache_eligible: None,
-                cache_bypass_reason: None,
-                local_cached_input_tokens: None,
-                provider_cached_input_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 log_proxy_error_detail(
@@ -6173,19 +7972,20 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     error: Some("request body too large".to_string()),
                     model: None,
                     request_headers: request_headers_json.clone(),
-                    response_headers: headers_to_json_string(vec![
-                        ("content-type".to_string(), "text/plain".to_string()),
-                    ]),
+                    response_headers: headers_to_json_string(vec![(
+                        "content-type".to_string(),
+                        "text/plain".to_string(),
+                    )]),
                     request_body: None,
                     response_body: Some("Request body too large".to_string()),
                     input_tokens: None,
                     output_tokens: None,
-                cache_status: None,
-                cache_key: None,
-                cache_eligible: None,
-                cache_bypass_reason: None,
-                local_cached_input_tokens: None,
-                provider_cached_input_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 log_proxy_error_detail(
@@ -6217,12 +8017,14 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         let mut anthropic_reverse_tool_map: Option<HashMap<String, String>> = None;
         let mut anthropic_stream = None;
         let mut anthropic_body_json: Option<Value> = None;
+        let mut estimated_input_tokens: Option<i64> = None;
         let cfg = proxy_config_snapshot();
-        let (cache_eligible, cache_key, cache_model, _cache_bypass_reason) = if cfg.enable_exact_cache {
-            evaluate_local_cache_request(&method_label, &path, &body_bytes)
-        } else {
-            (false, None, None, Some("exact_cache_disabled".to_string()))
-        };
+        let (cache_eligible, cache_key, cache_model, _cache_bypass_reason) =
+            if cfg.enable_exact_cache {
+                evaluate_local_cache_request(&method_label, &path, &body_bytes)
+            } else {
+                (false, None, None, Some("exact_cache_disabled".to_string()))
+            };
         if request_model.is_none() {
             request_model = cache_model.clone();
         }
@@ -6276,19 +8078,20 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     error: Some("method not allowed".to_string()),
                     model: None,
                     request_headers: request_headers_json.clone(),
-                    response_headers: headers_to_json_string(vec![
-                        ("content-type".to_string(), "text/plain".to_string()),
-                    ]),
+                    response_headers: headers_to_json_string(vec![(
+                        "content-type".to_string(),
+                        "text/plain".to_string(),
+                    )]),
                     request_body: request_body_text.clone(),
                     response_body: Some("Method not allowed".to_string()),
                     input_tokens: None,
                     output_tokens: None,
-                cache_status: None,
-                cache_key: None,
-                cache_eligible: None,
-                cache_bypass_reason: None,
-                local_cached_input_tokens: None,
-                provider_cached_input_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 log_proxy_error_detail(
@@ -6323,19 +8126,20 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         error: Some("invalid json".to_string()),
                         model: None,
                         request_headers: request_headers_json.clone(),
-                        response_headers: headers_to_json_string(vec![
-                            ("content-type".to_string(), "text/plain".to_string()),
-                        ]),
+                        response_headers: headers_to_json_string(vec![(
+                            "content-type".to_string(),
+                            "text/plain".to_string(),
+                        )]),
                         request_body: request_body_text.clone(),
                         response_body: Some("Invalid JSON".to_string()),
                         input_tokens: None,
                         output_tokens: None,
-                    cache_status: None,
-                    cache_key: None,
-                    cache_eligible: None,
-                    cache_bypass_reason: None,
-                    local_cached_input_tokens: None,
-                    provider_cached_input_tokens: None,
+                        cache_status: None,
+                        cache_key: None,
+                        cache_eligible: None,
+                        cache_bypass_reason: None,
+                        local_cached_input_tokens: None,
+                        provider_cached_input_tokens: None,
                     };
                     let _ = insert_proxy_log(&entry);
                     log_proxy_error_detail(
@@ -6357,17 +8161,33 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 }
             };
             anthropic_body_json = Some(body_json.clone());
-            request_model = body_json.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+            request_model = body_json
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             if !is_count_tokens {
                 match convert_claude_to_codex(&body_json) {
                     Ok((codex_body, reverse_map, stream)) => {
-                        request_model = codex_body.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        upstream_body_bytes = serde_json::to_vec(&codex_body).unwrap_or_default().into();
+                        estimated_input_tokens = Some(count_codex_input_tokens(&codex_body));
+                        request_model = codex_body
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        upstream_body_bytes =
+                            serde_json::to_vec(&codex_body).unwrap_or_default().into();
                         upstream_path = "/v1/responses".to_string();
                         target = build_upstream_url(&upstream_path);
                         request_url = Some(target.clone());
                         anthropic_reverse_tool_map = Some(reverse_map);
                         anthropic_stream = Some(stream);
+                        if let Some(estimate) = estimated_input_tokens {
+                            if estimate > 20_000 {
+                                log_proxy(&format!(
+                                    "req#{request_id} large anthropic request estimated_input_tokens={estimate} request_len={}",
+                                    request_body_text.as_ref().map(|v| v.len()).unwrap_or(0)
+                                ));
+                            }
+                        }
                     }
                     Err(err) => {
                         let entry = ProxyLogEntry {
@@ -6382,19 +8202,20 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                             error: Some(err.clone()),
                             model: request_model.clone(),
                             request_headers: request_headers_json.clone(),
-                            response_headers: headers_to_json_string(vec![
-                                ("content-type".to_string(), "text/plain".to_string()),
-                            ]),
+                            response_headers: headers_to_json_string(vec![(
+                                "content-type".to_string(),
+                                "text/plain".to_string(),
+                            )]),
                             request_body: request_body_text.clone(),
                             response_body: Some(err.clone()),
                             input_tokens: None,
                             output_tokens: None,
-                        cache_status: None,
-                        cache_key: None,
-                        cache_eligible: None,
-                        cache_bypass_reason: None,
-                        local_cached_input_tokens: None,
-                        provider_cached_input_tokens: None,
+                            cache_status: None,
+                            cache_key: None,
+                            cache_eligible: None,
+                            cache_bypass_reason: None,
+                            local_cached_input_tokens: None,
+                            provider_cached_input_tokens: None,
                         };
                         let _ = insert_proxy_log(&entry);
                         log_proxy_error_detail(
@@ -6421,7 +8242,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             request_url = Some(target.clone());
         }
 
-        log_proxy(&format!("req#{request_id} start {method_label} {path} -> {target}"));
+        log_proxy(&format!(
+            "req#{request_id} start {method_label} {path} -> {target}"
+        ));
 
         if !proxy_api_key_valid(&req_headers) {
             let entry = ProxyLogEntry {
@@ -6441,12 +8264,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 response_body: None,
                 input_tokens: None,
                 output_tokens: None,
-            cache_status: None,
-            cache_key: None,
-            cache_eligible: None,
-            cache_bypass_reason: None,
-            local_cached_input_tokens: None,
-            provider_cached_input_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
             };
             let _ = insert_proxy_log(&entry);
             return Response::builder()
@@ -6479,7 +8302,8 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             };
             let count = count_codex_input_tokens(&codex_body);
             let response_payload = serde_json::json!({ "input_tokens": count });
-            let response_body = serde_json::to_vec(&response_payload).unwrap_or_else(|_| b"{}".to_vec());
+            let response_body =
+                serde_json::to_vec(&response_payload).unwrap_or_else(|_| b"{}".to_vec());
             let entry = ProxyLogEntry {
                 timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
                 method: method_label.clone(),
@@ -6492,19 +8316,20 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 error: None,
                 model: request_model.clone(),
                 request_headers: request_headers_json.clone(),
-                response_headers: headers_to_json_string(vec![
-                    ("content-type".to_string(), "application/json".to_string()),
-                ]),
+                response_headers: headers_to_json_string(vec![(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
                 request_body: request_body_text.clone(),
                 response_body: Some(truncate_body(&response_body)),
                 input_tokens: Some(count),
                 output_tokens: Some(0),
-            cache_status: None,
-            cache_key: None,
-            cache_eligible: None,
-            cache_bypass_reason: None,
-            local_cached_input_tokens: None,
-            provider_cached_input_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
             };
             let _ = insert_proxy_log(&entry);
             return Response::builder()
@@ -6546,12 +8371,19 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         .header("Content-Type", "application/json")
                         .header("Access-Control-Allow-Origin", "*")
                         .header("Access-Control-Allow-Headers", "*")
-                        .body(Body::from(serde_json::to_vec(&serde_json::json!({
-                            "error": {
-                                "message": "请先在代理设置中填写模型名称，例如 glm-5。",
-                                "type": "invalid_request_error"
-                            }
-                        })).unwrap_or_else(|_| "{\"error\":{\"message\":\"model_not_configured\"}}".as_bytes().to_vec())))
+                        .body(Body::from(
+                            serde_json::to_vec(&serde_json::json!({
+                                "error": {
+                                    "message": "请先在代理设置中填写模型名称，例如 glm-5。",
+                                    "type": "invalid_request_error"
+                                }
+                            }))
+                            .unwrap_or_else(|_| {
+                                "{\"error\":{\"message\":\"model_not_configured\"}}"
+                                    .as_bytes()
+                                    .to_vec()
+                            }),
+                        ))
                         .unwrap();
                 }
                 let response_body = build_local_models_response(&configured_models);
@@ -6567,19 +8399,20 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     error: None,
                     model: configured_models.first().cloned(),
                     request_headers: request_headers_json.clone(),
-                    response_headers: headers_to_json_string(vec![
-                        ("content-type".to_string(), "application/json".to_string()),
-                    ]),
+                    response_headers: headers_to_json_string(vec![(
+                        "content-type".to_string(),
+                        "application/json".to_string(),
+                    )]),
                     request_body: request_body_text.clone(),
                     response_body: Some(truncate_body(&response_body)),
                     input_tokens: None,
                     output_tokens: None,
-                cache_status: None,
-                cache_key: None,
-                cache_eligible: None,
-                cache_bypass_reason: None,
-                local_cached_input_tokens: None,
-                provider_cached_input_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 return Response::builder()
@@ -6620,12 +8453,16 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 };
                 match convert_responses_request_to_chat_completions(&body_json, &proxy_cfg) {
                     Ok((chat_body, stream)) => {
-                        request_model = chat_body.get("model").and_then(|v| v.as_str()).map(|v| v.to_string());
+                        request_model = chat_body
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(|v| v.to_string());
                         custom_stream = stream;
                         request_body_text = Some(truncate_body(
                             &serde_json::to_vec(&chat_body).unwrap_or_default(),
                         ));
-                        upstream_body_bytes = serde_json::to_vec(&chat_body).unwrap_or_default().into();
+                        upstream_body_bytes =
+                            serde_json::to_vec(&chat_body).unwrap_or_default().into();
                         custom_request_json = Some(chat_body);
                         upstream_path = "/v1/chat/completions".to_string();
                     }
@@ -6641,7 +8478,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
 
             target = build_upstream_url_with_base(&custom_base_url, &upstream_path);
             request_url = Some(target.clone());
-            log_proxy(&format!("req#{request_id} start {method_label} {path} -> {target}"));
+            log_proxy(&format!(
+                "req#{request_id} start {method_label} {path} -> {target}"
+            ));
 
             let mut custom_headers = reqwest::header::HeaderMap::new();
             apply_custom_openai_headers(
@@ -6651,7 +8490,8 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 custom_stream,
             );
 
-            let upstream_resp = match state.client
+            let upstream_resp = match state
+                .client
                 .request(method.clone(), &target)
                 .headers(custom_headers)
                 .body(upstream_body_bytes.clone())
@@ -6677,12 +8517,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         response_body: None,
                         input_tokens: None,
                         output_tokens: None,
-                    cache_status: None,
-                    cache_key: None,
-                    cache_eligible: None,
-                    cache_bypass_reason: None,
-                    local_cached_input_tokens: None,
-                    provider_cached_input_tokens: None,
+                        cache_status: None,
+                        cache_key: None,
+                        cache_eligible: None,
+                        cache_bypass_reason: None,
+                        local_cached_input_tokens: None,
+                        provider_cached_input_tokens: None,
                     };
                     let _ = insert_proxy_log(&entry);
                     return Response::builder()
@@ -6694,7 +8534,10 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             };
 
             let upstream_status = upstream_resp.status();
-            log_proxy(&format!("req#{request_id} upstream status: {}", upstream_status.as_u16()));
+            log_proxy(&format!(
+                "req#{request_id} upstream status: {}",
+                upstream_status.as_u16()
+            ));
 
             if custom_responses_path && custom_stream && upstream_status.is_success() {
                 let entry = ProxyLogEntry {
@@ -6709,19 +8552,20 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     error: None,
                     model: request_model.clone(),
                     request_headers: request_headers_json.clone(),
-                    response_headers: headers_to_json_string(vec![
-                        ("content-type".to_string(), "text/event-stream".to_string()),
-                    ]),
+                    response_headers: headers_to_json_string(vec![(
+                        "content-type".to_string(),
+                        "text/event-stream".to_string(),
+                    )]),
                     request_body: request_body_text.clone(),
                     response_body: None,
                     input_tokens: None,
                     output_tokens: None,
-                cache_status: None,
-                cache_key: None,
-                cache_eligible: None,
-                cache_bypass_reason: None,
-                local_cached_input_tokens: None,
-                provider_cached_input_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                 };
                 return build_custom_openai_stream_response(
                     upstream_resp,
@@ -6731,7 +8575,8 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 .await;
             }
 
-            let response_headers_json = headers_to_json_string(sanitize_reqwest_headers(upstream_resp.headers()));
+            let response_headers_json =
+                headers_to_json_string(sanitize_reqwest_headers(upstream_resp.headers()));
             let headers = upstream_resp.headers().clone();
             let bytes = upstream_resp.bytes().await.unwrap_or_default();
 
@@ -6753,9 +8598,10 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                             error: None,
                             model: request_model.clone(),
                             request_headers: request_headers_json.clone(),
-                            response_headers: headers_to_json_string(vec![
-                                ("content-type".to_string(), "application/json".to_string()),
-                            ]),
+                            response_headers: headers_to_json_string(vec![(
+                                "content-type".to_string(),
+                                "application/json".to_string(),
+                            )]),
                             request_body: request_body_text.clone(),
                             response_body: response_body_text,
                             input_tokens,
@@ -6764,7 +8610,10 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         };
                         let _ = insert_proxy_log(&entry);
                         return Response::builder()
-                            .status(axum::http::StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::OK))
+                            .status(
+                                axum::http::StatusCode::from_u16(upstream_status.as_u16())
+                                    .unwrap_or(StatusCode::OK),
+                            )
                             .header("Content-Type", "application/json")
                             .header("Access-Control-Allow-Origin", "*")
                             .header("Access-Control-Allow-Headers", "*")
@@ -6789,12 +8638,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                             response_body: Some(truncate_body(&bytes)),
                             input_tokens: None,
                             output_tokens: None,
-                        cache_status: None,
-                        cache_key: None,
-                        cache_eligible: None,
-                        cache_bypass_reason: None,
-                        local_cached_input_tokens: None,
-                        provider_cached_input_tokens: None,
+                            cache_status: None,
+                            cache_key: None,
+                            cache_eligible: None,
+                            cache_bypass_reason: None,
+                            local_cached_input_tokens: None,
+                            provider_cached_input_tokens: None,
                         };
                         let _ = insert_proxy_log(&entry);
                         return Response::builder()
@@ -6806,8 +8655,14 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 }
             }
 
-            let response_body_text = if bytes.is_empty() { None } else { Some(truncate_body(&bytes)) };
-            let (input_tokens, output_tokens) = extract_usage(&bytes);
+            let normalized_bytes =
+                maybe_normalize_chat_completion_response_bytes(&upstream_path, upstream_status, &bytes);
+            let response_body_text = if normalized_bytes.is_empty() {
+                None
+            } else {
+                Some(truncate_body(&normalized_bytes))
+            };
+            let (input_tokens, output_tokens) = extract_usage(&normalized_bytes);
             let entry = ProxyLogEntry {
                 timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
                 method: method_label.clone(),
@@ -6828,7 +8683,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 ..ProxyLogEntry::default()
             };
             let _ = insert_proxy_log(&entry);
-            return build_proxy_response_from_bytes(upstream_status, &headers, bytes);
+            return build_proxy_response_from_bytes(upstream_status, &headers, normalized_bytes);
         }
 
         // Pick a healthy account (skip cooldown-expired accounts, revive if cooldown elapsed)
@@ -6902,7 +8757,8 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             is_stream,
         );
 
-        let upstream_result = state.client
+        let upstream_result = state
+            .client
             .request(method.clone(), &target)
             .headers(upstream_headers)
             .body(upstream_body_bytes.clone())
@@ -6930,12 +8786,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     response_body: None,
                     input_tokens: None,
                     output_tokens: None,
-                cache_status: None,
-                cache_key: None,
-                cache_eligible: None,
-                cache_bypass_reason: None,
-                local_cached_input_tokens: None,
-                provider_cached_input_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 return Response::builder()
@@ -6947,7 +8803,10 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         };
 
         let upstream_status = upstream_resp.status();
-        log_proxy(&format!("req#{request_id} upstream status: {}", upstream_status.as_u16()));
+        log_proxy(&format!(
+            "req#{request_id} upstream status: {}",
+            upstream_status.as_u16()
+        ));
 
         if is_stream && upstream_status == reqwest::StatusCode::BAD_REQUEST {
             let headers = upstream_resp.headers().clone();
@@ -6968,6 +8827,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     is_stream,
                     is_anthropic,
                     &request_model,
+                    estimated_input_tokens,
                     &request_body_text,
                     &request_headers_json,
                     &request_url,
@@ -6975,7 +8835,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     &method_label,
                     &path,
                     started_at,
-                ).await {
+                )
+                .await
+                {
                     return resp;
                 }
             }
@@ -7004,14 +8866,16 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         !upstream_body_bytes.is_empty(),
                         is_stream,
                     );
-                    if let Ok(retry_resp) = state.client
+                    if let Ok(retry_resp) = state
+                        .client
                         .request(method.clone(), &target)
                         .headers(retry_headers)
                         .body(upstream_body_bytes.clone())
                         .send()
                         .await
                     {
-                        let response_headers_json = headers_to_json_string(sanitize_reqwest_headers(retry_resp.headers()));
+                        let response_headers_json =
+                            headers_to_json_string(sanitize_reqwest_headers(retry_resp.headers()));
                         if !is_stream {
                             let status = retry_resp.status();
                             let headers = retry_resp.headers().clone();
@@ -7019,7 +8883,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                 Ok(b) => b,
                                 Err(e) => {
                                     let entry = ProxyLogEntry {
-                                        timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                        timestamp: chrono::Utc::now()
+                                            .format("%Y-%m-%dT%H:%M:%SZ")
+                                            .to_string(),
                                         method: method_label.clone(),
                                         path: path.to_string(),
                                         request_url: request_url.clone(),
@@ -7035,12 +8901,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                         response_body: None,
                                         input_tokens: None,
                                         output_tokens: None,
-                                    cache_status: None,
-                                    cache_key: None,
-                                    cache_eligible: None,
-                                    cache_bypass_reason: None,
-                                    local_cached_input_tokens: None,
-                                    provider_cached_input_tokens: None,
+                                        cache_status: None,
+                                        cache_key: None,
+                                        cache_eligible: None,
+                                        cache_bypass_reason: None,
+                                        local_cached_input_tokens: None,
+                                        provider_cached_input_tokens: None,
                                     };
                                     let _ = insert_proxy_log(&entry);
                                     return Response::builder()
@@ -7051,19 +8917,33 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                 }
                             };
                             if is_anthropic {
-                                let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
+                                let reverse_map =
+                                    anthropic_reverse_tool_map.clone().unwrap_or_default();
                                 let model_name = request_model.clone().unwrap_or_default();
-                                let (converted, input_tokens, output_tokens, response_body_text) =
-                                    match build_claude_response_body(&bytes, &reverse_map, &model_name) {
+                                let (
+                                    converted,
+                                    input_tokens,
+                                    output_tokens,
+                                    response_body_text,
+                                    error_message,
+                                ) = match build_claude_response_or_error_body(
+                                        status,
+                                        &bytes,
+                                        &reverse_map,
+                                        &model_name,
+                                    ) {
                                         Ok(v) => v,
                                         Err(err) => {
                                             let entry = ProxyLogEntry {
-                                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                                timestamp: chrono::Utc::now()
+                                                    .format("%Y-%m-%dT%H:%M:%SZ")
+                                                    .to_string(),
                                                 method: method_label.clone(),
                                                 path: path.to_string(),
                                                 request_url: request_url.clone(),
                                                 status: StatusCode::BAD_GATEWAY.as_u16(),
-                                                duration_ms: started_at.elapsed().as_millis() as u64,
+                                                duration_ms: started_at.elapsed().as_millis()
+                                                    as u64,
                                                 proxy_account_id: chosen_id.clone(),
                                                 account_id: chosen_account_id.clone(),
                                                 error: Some(err),
@@ -7072,25 +8952,29 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                                 response_headers: response_headers_json.clone(),
                                                 request_body: request_body_text.clone(),
                                                 response_body: None,
-                                                input_tokens: None,
+                                                input_tokens: estimated_input_tokens,
                                                 output_tokens: None,
-                                            cache_status: None,
-                                            cache_key: None,
-                                            cache_eligible: None,
-                                            cache_bypass_reason: None,
-                                            local_cached_input_tokens: None,
-                                            provider_cached_input_tokens: None,
+                                                cache_status: None,
+                                                cache_key: None,
+                                                cache_eligible: None,
+                                                cache_bypass_reason: None,
+                                                local_cached_input_tokens: None,
+                                                provider_cached_input_tokens: None,
                                             };
                                             let _ = insert_proxy_log(&entry);
                                             return Response::builder()
                                                 .status(StatusCode::BAD_GATEWAY)
                                                 .header("Access-Control-Allow-Origin", "*")
-                                                .body(Body::from("Anthropic response conversion failed"))
+                                                .body(Body::from(
+                                                    "Anthropic response conversion failed",
+                                                ))
                                                 .unwrap();
                                         }
                                     };
                                 let entry = ProxyLogEntry {
-                                    timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                    timestamp: chrono::Utc::now()
+                                        .format("%Y-%m-%dT%H:%M:%SZ")
+                                        .to_string(),
                                     method: method_label.clone(),
                                     path: path.to_string(),
                                     request_url: request_url.clone(),
@@ -7098,15 +8982,16 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                     duration_ms: started_at.elapsed().as_millis() as u64,
                                     proxy_account_id: chosen_id.clone(),
                                     account_id: chosen_account_id.clone(),
-                                    error: None,
+                                    error: error_message,
                                     model: request_model.clone(),
                                     request_headers: request_headers_json.clone(),
-                                    response_headers: headers_to_json_string(vec![
-                                        ("content-type".to_string(), "application/json".to_string()),
-                                    ]),
+                                    response_headers: headers_to_json_string(vec![(
+                                        "content-type".to_string(),
+                                        "application/json".to_string(),
+                                    )]),
                                     request_body: request_body_text.clone(),
                                     response_body: response_body_text,
-                                    input_tokens,
+                                    input_tokens: input_tokens.or(estimated_input_tokens),
                                     output_tokens,
                                     ..ProxyLogEntry::default()
                                 };
@@ -7133,7 +9018,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                             };
                             let (input_tokens, output_tokens) = extract_usage(&bytes);
                             let entry = ProxyLogEntry {
-                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                timestamp: chrono::Utc::now()
+                                    .format("%Y-%m-%dT%H:%M:%SZ")
+                                    .to_string(),
                                 method: method_label.clone(),
                                 path: path.to_string(),
                                 request_url: request_url.clone(),
@@ -7156,7 +9043,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         }
                         if is_anthropic {
                             let entry = ProxyLogEntry {
-                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                timestamp: chrono::Utc::now()
+                                    .format("%Y-%m-%dT%H:%M:%SZ")
+                                    .to_string(),
                                 method: method_label.clone(),
                                 path: path.to_string(),
                                 request_url: request_url.clone(),
@@ -7167,22 +9056,25 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                 error: None,
                                 model: request_model.clone(),
                                 request_headers: request_headers_json.clone(),
-                                response_headers: headers_to_json_string(vec![
-                                    ("content-type".to_string(), "text/event-stream".to_string()),
-                                ]),
+                                response_headers: headers_to_json_string(vec![(
+                                    "content-type".to_string(),
+                                    "text/event-stream".to_string(),
+                                )]),
                                 request_body: request_body_text.clone(),
                                 response_body: None,
                                 input_tokens: None,
                                 output_tokens: None,
-                            cache_status: None,
-                            cache_key: None,
-                            cache_eligible: None,
-                            cache_bypass_reason: None,
-                            local_cached_input_tokens: None,
-                            provider_cached_input_tokens: None,
+                                cache_status: None,
+                                cache_key: None,
+                                cache_eligible: None,
+                                cache_bypass_reason: None,
+                                local_cached_input_tokens: None,
+                                provider_cached_input_tokens: None,
                             };
-                            let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
-                            return build_anthropic_stream_response(retry_resp, reverse_map, entry).await;
+                            let reverse_map =
+                                anthropic_reverse_tool_map.clone().unwrap_or_default();
+                            return build_anthropic_stream_response(retry_resp, reverse_map, entry)
+                                .await;
                         }
 
                         let entry = ProxyLogEntry {
@@ -7202,12 +9094,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                             response_body: None,
                             input_tokens: None,
                             output_tokens: None,
-                        cache_status: None,
-                        cache_key: None,
-                        cache_eligible: None,
-                        cache_bypass_reason: None,
-                        local_cached_input_tokens: None,
-                        provider_cached_input_tokens: None,
+                            cache_status: None,
+                            cache_key: None,
+                            cache_eligible: None,
+                            cache_bypass_reason: None,
+                            local_cached_input_tokens: None,
+                            provider_cached_input_tokens: None,
                         };
                         let _ = insert_proxy_log(&entry);
                         return build_proxy_response(retry_resp).await;
@@ -7248,12 +9140,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         response_body: None,
                         input_tokens: None,
                         output_tokens: None,
-                    cache_status: None,
-                    cache_key: None,
-                    cache_eligible: None,
-                    cache_bypass_reason: None,
-                    local_cached_input_tokens: None,
-                    provider_cached_input_tokens: None,
+                        cache_status: None,
+                        cache_key: None,
+                        cache_eligible: None,
+                        cache_bypass_reason: None,
+                        local_cached_input_tokens: None,
+                        provider_cached_input_tokens: None,
                     };
                     let _ = insert_proxy_log(&entry);
                     return Response::builder()
@@ -7281,6 +9173,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     is_stream,
                     is_anthropic,
                     &request_model,
+                    estimated_input_tokens,
                     &request_body_text,
                     &request_headers_json,
                     &request_url,
@@ -7288,19 +9181,23 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     &method_label,
                     &path,
                     started_at,
-                ).await {
+                )
+                .await
+                {
                     return resp;
                 }
             } else {
-                let until = std::time::Instant::now()
-                    + std::time::Duration::from_secs(COOLDOWN_SECS);
+                let until =
+                    std::time::Instant::now() + std::time::Duration::from_secs(COOLDOWN_SECS);
                 {
                     let mut accounts_lock = state.accounts.write().unwrap();
                     if let Some(acc) = accounts_lock.get_mut(chosen_idx) {
                         acc.health = AccountHealth::Cooldown(until);
                     }
                 }
-                log_proxy(&format!("req#{request_id} 429 on {chosen_id}, trying another account"));
+                log_proxy(&format!(
+                    "req#{request_id} 429 on {chosen_id}, trying another account"
+                ));
 
                 // Pick a different healthy account from the pool and retry immediately
                 let fallback = {
@@ -7339,7 +9236,8 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         !upstream_body_bytes.is_empty(),
                         is_stream,
                     );
-                    if let Ok(retry_resp) = state.client
+                    if let Ok(retry_resp) = state
+                        .client
                         .request(method.clone(), &target)
                         .headers(retry_headers)
                         .body(upstream_body_bytes.clone())
@@ -7347,25 +9245,43 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         .await
                     {
                         let retry_status = retry_resp.status();
-                        log_proxy(&format!("req#{request_id} 429-retry status: {}", retry_status.as_u16()));
-                        let resp_hdrs_json = headers_to_json_string(sanitize_reqwest_headers(retry_resp.headers()));
+                        log_proxy(&format!(
+                            "req#{request_id} 429-retry status: {}",
+                            retry_status.as_u16()
+                        ));
+                        let resp_hdrs_json =
+                            headers_to_json_string(sanitize_reqwest_headers(retry_resp.headers()));
                         if !is_stream {
                             let headers = retry_resp.headers().clone();
                             let bytes = retry_resp.bytes().await.unwrap_or_default();
                             if is_anthropic {
-                                let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
+                                let reverse_map =
+                                    anthropic_reverse_tool_map.clone().unwrap_or_default();
                                 let model_name = request_model.clone().unwrap_or_default();
-                                let (converted, input_tokens, output_tokens, response_body_text) =
-                                    match build_claude_response_body(&bytes, &reverse_map, &model_name) {
+                                let (
+                                    converted,
+                                    input_tokens,
+                                    output_tokens,
+                                    response_body_text,
+                                    error_message,
+                                ) = match build_claude_response_or_error_body(
+                                        retry_status,
+                                        &bytes,
+                                        &reverse_map,
+                                        &model_name,
+                                    ) {
                                         Ok(v) => v,
                                         Err(err) => {
                                             let entry = ProxyLogEntry {
-                                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                                timestamp: chrono::Utc::now()
+                                                    .format("%Y-%m-%dT%H:%M:%SZ")
+                                                    .to_string(),
                                                 method: method_label.clone(),
                                                 path: path.to_string(),
                                                 request_url: request_url.clone(),
                                                 status: StatusCode::BAD_GATEWAY.as_u16(),
-                                                duration_ms: started_at.elapsed().as_millis() as u64,
+                                                duration_ms: started_at.elapsed().as_millis()
+                                                    as u64,
                                                 proxy_account_id: chosen_id.clone(),
                                                 account_id: fallback_account_id.clone(),
                                                 error: Some(err),
@@ -7374,25 +9290,29 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                                 response_headers: resp_hdrs_json.clone(),
                                                 request_body: request_body_text.clone(),
                                                 response_body: None,
-                                                input_tokens: None,
+                                                input_tokens: estimated_input_tokens,
                                                 output_tokens: None,
-                                            cache_status: None,
-                                            cache_key: None,
-                                            cache_eligible: None,
-                                            cache_bypass_reason: None,
-                                            local_cached_input_tokens: None,
-                                            provider_cached_input_tokens: None,
+                                                cache_status: None,
+                                                cache_key: None,
+                                                cache_eligible: None,
+                                                cache_bypass_reason: None,
+                                                local_cached_input_tokens: None,
+                                                provider_cached_input_tokens: None,
                                             };
                                             let _ = insert_proxy_log(&entry);
                                             return Response::builder()
                                                 .status(StatusCode::BAD_GATEWAY)
                                                 .header("Access-Control-Allow-Origin", "*")
-                                                .body(Body::from("Anthropic response conversion failed"))
+                                                .body(Body::from(
+                                                    "Anthropic response conversion failed",
+                                                ))
                                                 .unwrap();
                                         }
                                     };
                                 let entry = ProxyLogEntry {
-                                    timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                    timestamp: chrono::Utc::now()
+                                        .format("%Y-%m-%dT%H:%M:%SZ")
+                                        .to_string(),
                                     method: method_label.clone(),
                                     path: path.to_string(),
                                     request_url: request_url.clone(),
@@ -7400,21 +9320,23 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                     duration_ms: started_at.elapsed().as_millis() as u64,
                                     proxy_account_id: chosen_id.clone(),
                                     account_id: fallback_account_id.clone(),
-                                    error: None,
+                                    error: error_message,
                                     model: request_model.clone(),
                                     request_headers: request_headers_json.clone(),
-                                    response_headers: headers_to_json_string(vec![
-                                        ("content-type".to_string(), "application/json".to_string()),
-                                    ]),
+                                    response_headers: headers_to_json_string(vec![(
+                                        "content-type".to_string(),
+                                        "application/json".to_string(),
+                                    )]),
                                     request_body: request_body_text.clone(),
                                     response_body: response_body_text,
-                                    input_tokens,
+                                    input_tokens: input_tokens.or(estimated_input_tokens),
                                     output_tokens,
                                     ..ProxyLogEntry::default()
                                 };
                                 let _ = insert_proxy_log(&entry);
-                                let status = axum::http::StatusCode::from_u16(retry_status.as_u16())
-                                    .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                                let status =
+                                    axum::http::StatusCode::from_u16(retry_status.as_u16())
+                                        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
                                 return Response::builder()
                                     .status(status)
                                     .header("Content-Type", "application/json")
@@ -7428,10 +9350,16 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                             .unwrap()
                                     });
                             }
-                            let response_body_text = if bytes.is_empty() { None } else { Some(truncate_body(&bytes)) };
+                            let response_body_text = if bytes.is_empty() {
+                                None
+                            } else {
+                                Some(truncate_body(&bytes))
+                            };
                             let (input_tokens, output_tokens) = extract_usage(&bytes);
                             let entry = ProxyLogEntry {
-                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                timestamp: chrono::Utc::now()
+                                    .format("%Y-%m-%dT%H:%M:%SZ")
+                                    .to_string(),
                                 method: method_label.clone(),
                                 path: path.to_string(),
                                 request_url: request_url.clone(),
@@ -7454,7 +9382,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         }
                         if is_anthropic {
                             let entry = ProxyLogEntry {
-                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                timestamp: chrono::Utc::now()
+                                    .format("%Y-%m-%dT%H:%M:%SZ")
+                                    .to_string(),
                                 method: method_label.clone(),
                                 path: path.to_string(),
                                 request_url: request_url.clone(),
@@ -7465,22 +9395,25 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                 error: None,
                                 model: request_model.clone(),
                                 request_headers: request_headers_json.clone(),
-                                response_headers: headers_to_json_string(vec![
-                                    ("content-type".to_string(), "text/event-stream".to_string()),
-                                ]),
+                                response_headers: headers_to_json_string(vec![(
+                                    "content-type".to_string(),
+                                    "text/event-stream".to_string(),
+                                )]),
                                 request_body: request_body_text.clone(),
                                 response_body: None,
                                 input_tokens: None,
                                 output_tokens: None,
-                            cache_status: None,
-                            cache_key: None,
-                            cache_eligible: None,
-                            cache_bypass_reason: None,
-                            local_cached_input_tokens: None,
-                            provider_cached_input_tokens: None,
+                                cache_status: None,
+                                cache_key: None,
+                                cache_eligible: None,
+                                cache_bypass_reason: None,
+                                local_cached_input_tokens: None,
+                                provider_cached_input_tokens: None,
                             };
-                            let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
-                            return build_anthropic_stream_response(retry_resp, reverse_map, entry).await;
+                            let reverse_map =
+                                anthropic_reverse_tool_map.clone().unwrap_or_default();
+                            return build_anthropic_stream_response(retry_resp, reverse_map, entry)
+                                .await;
                         }
                         let entry = ProxyLogEntry {
                             timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -7499,12 +9432,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                             response_body: None,
                             input_tokens: None,
                             output_tokens: None,
-                        cache_status: None,
-                        cache_key: None,
-                        cache_eligible: None,
-                        cache_bypass_reason: None,
-                        local_cached_input_tokens: None,
-                        provider_cached_input_tokens: None,
+                            cache_status: None,
+                            cache_key: None,
+                            cache_eligible: None,
+                            cache_bypass_reason: None,
+                            local_cached_input_tokens: None,
+                            provider_cached_input_tokens: None,
                         };
                         let _ = insert_proxy_log(&entry);
                         return build_proxy_response(retry_resp).await;
@@ -7512,7 +9445,11 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 }
             }
 
-            let response_body_text = if bytes.is_empty() { None } else { Some(truncate_body(&bytes)) };
+            let response_body_text = if bytes.is_empty() {
+                None
+            } else {
+                Some(truncate_body(&bytes))
+            };
             let (input_tokens, output_tokens) = extract_usage(&bytes);
             let entry = ProxyLogEntry {
                 timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -7537,7 +9474,8 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             return build_proxy_response_from_bytes(upstream_status, &headers, bytes);
         }
 
-        let response_headers_json = headers_to_json_string(sanitize_reqwest_headers(upstream_resp.headers()));
+        let response_headers_json =
+            headers_to_json_string(sanitize_reqwest_headers(upstream_resp.headers()));
         if !is_stream {
             let status = upstream_resp.status();
             let headers = upstream_resp.headers().clone();
@@ -7561,12 +9499,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         response_body: None,
                         input_tokens: None,
                         output_tokens: None,
-                    cache_status: None,
-                    cache_key: None,
-                    cache_eligible: None,
-                    cache_bypass_reason: None,
-                    local_cached_input_tokens: None,
-                    provider_cached_input_tokens: None,
+                        cache_status: None,
+                        cache_key: None,
+                        cache_eligible: None,
+                        cache_bypass_reason: None,
+                        local_cached_input_tokens: None,
+                        provider_cached_input_tokens: None,
                     };
                     let _ = insert_proxy_log(&entry);
                     return Response::builder()
@@ -7585,9 +9523,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     ));
                     if let Some(resp) = retry_usage_limit_across_accounts(
                         state.clone(),
-                    request_id,
-                    chosen_idx,
-                    &method,
+                        request_id,
+                        chosen_idx,
+                        &method,
                         &target,
                         &forward_headers,
                         &req_headers,
@@ -7595,6 +9533,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         is_stream,
                         is_anthropic,
                         &request_model,
+                        estimated_input_tokens,
                         &request_body_text,
                         &request_headers_json,
                         &request_url,
@@ -7602,7 +9541,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                         &method_label,
                         &path,
                         started_at,
-                    ).await {
+                    )
+                    .await
+                    {
                         return resp;
                     }
                 }
@@ -7610,12 +9551,19 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             if is_anthropic {
                 let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
                 let model_name = request_model.clone().unwrap_or_default();
-                let (converted, input_tokens, output_tokens, response_body_text) =
-                    match build_claude_response_body(&bytes, &reverse_map, &model_name) {
+                let (converted, input_tokens, output_tokens, response_body_text, error_message) =
+                    match build_claude_response_or_error_body(
+                        status,
+                        &bytes,
+                        &reverse_map,
+                        &model_name,
+                    ) {
                         Ok(v) => v,
                         Err(err) => {
                             let entry = ProxyLogEntry {
-                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                timestamp: chrono::Utc::now()
+                                    .format("%Y-%m-%dT%H:%M:%SZ")
+                                    .to_string(),
                                 method: method_label.clone(),
                                 path: path.to_string(),
                                 request_url: request_url.clone(),
@@ -7629,14 +9577,14 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                                 response_headers: response_headers_json.clone(),
                                 request_body: request_body_text.clone(),
                                 response_body: None,
-                                input_tokens: None,
+                                input_tokens: estimated_input_tokens,
                                 output_tokens: None,
-                            cache_status: None,
-                            cache_key: None,
-                            cache_eligible: None,
-                            cache_bypass_reason: None,
-                            local_cached_input_tokens: None,
-                            provider_cached_input_tokens: None,
+                                cache_status: None,
+                                cache_key: None,
+                                cache_eligible: None,
+                                cache_bypass_reason: None,
+                                local_cached_input_tokens: None,
+                                provider_cached_input_tokens: None,
                             };
                             let _ = insert_proxy_log(&entry);
                             return Response::builder()
@@ -7655,15 +9603,16 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                     duration_ms: started_at.elapsed().as_millis() as u64,
                     proxy_account_id: chosen_id.clone(),
                     account_id: chosen_account_id.clone(),
-                    error: None,
+                    error: error_message,
                     model: request_model.clone(),
                     request_headers: request_headers_json.clone(),
-                    response_headers: headers_to_json_string(vec![
-                        ("content-type".to_string(), "application/json".to_string()),
-                    ]),
+                    response_headers: headers_to_json_string(vec![(
+                        "content-type".to_string(),
+                        "application/json".to_string(),
+                    )]),
                     request_body: request_body_text.clone(),
                     response_body: response_body_text,
-                    input_tokens,
+                    input_tokens: input_tokens.or(estimated_input_tokens),
                     output_tokens,
                     ..ProxyLogEntry::default()
                 };
@@ -7712,7 +9661,7 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             return build_proxy_response_from_bytes(status, &headers, bytes);
         }
 
-        if is_anthropic {
+        if is_anthropic && upstream_status.is_success() {
             let entry = ProxyLogEntry {
                 timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
                 method: method_label.clone(),
@@ -7725,19 +9674,20 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
                 error: None,
                 model: request_model.clone(),
                 request_headers: request_headers_json.clone(),
-                response_headers: headers_to_json_string(vec![
-                    ("content-type".to_string(), "text/event-stream".to_string()),
-                ]),
+                response_headers: headers_to_json_string(vec![(
+                    "content-type".to_string(),
+                    "text/event-stream".to_string(),
+                )]),
                 request_body: request_body_text.clone(),
                 response_body: None,
-                input_tokens: None,
+                input_tokens: estimated_input_tokens,
                 output_tokens: None,
-            cache_status: None,
-            cache_key: None,
-            cache_eligible: None,
-            cache_bypass_reason: None,
-            local_cached_input_tokens: None,
-            provider_cached_input_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
             };
             let reverse_map = anthropic_reverse_tool_map.clone().unwrap_or_default();
             return build_anthropic_stream_response(upstream_resp, reverse_map, entry).await;
@@ -7760,12 +9710,12 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             response_body: None,
             input_tokens: None,
             output_tokens: None,
-        cache_status: None,
-        cache_key: None,
-        cache_eligible: None,
-        cache_bypass_reason: None,
-        local_cached_input_tokens: None,
-        provider_cached_input_tokens: None,
+            cache_status: None,
+            cache_key: None,
+            cache_eligible: None,
+            cache_bypass_reason: None,
+            local_cached_input_tokens: None,
+            provider_cached_input_tokens: None,
         };
         let _ = insert_proxy_log(&entry);
         build_proxy_response(upstream_resp).await
@@ -7778,7 +9728,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
 
         let mut builder = Response::builder().status(status);
         for (k, v) in upstream_resp.headers() {
-            if skip_response_header(k.as_str()) { continue; }
+            if skip_response_header(k.as_str()) {
+                continue;
+            }
             if let (Ok(name), Ok(val)) = (
                 axum::http::HeaderName::from_bytes(k.as_str().as_bytes()),
                 axum::http::HeaderValue::from_bytes(v.as_bytes()),
@@ -7808,7 +9760,9 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
             .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         let mut builder = Response::builder().status(status);
         for (k, v) in headers.iter() {
-            if skip_response_header(k.as_str()) { continue; }
+            if skip_response_header(k.as_str()) {
+                continue;
+            }
             if let (Ok(name), Ok(val)) = (
                 axum::http::HeaderName::from_bytes(k.as_str().as_bytes()),
                 axum::http::HeaderValue::from_bytes(v.as_bytes()),
@@ -8000,6 +9954,35 @@ fn delete_openai_compat_config(id: String) -> Result<bool, String> {
     Ok(true)
 }
 
+pub fn create_temporary_openai_compat_config(
+    provider_name: String,
+    base_url: String,
+    api_key: String,
+    model: String,
+) -> Result<String, String> {
+    let mut configs = load_openai_compat_configs();
+    let config = build_openai_compat_provider_config(
+        None,
+        provider_name,
+        base_url,
+        api_key,
+        Some(model.clone()),
+        vec![OpenAICompatModelMapping {
+            alias: "*".to_string(),
+            provider_model: model,
+        }],
+        None,
+    )?;
+    let id = config.id.clone();
+    configs.push(config);
+    save_openai_compat_configs(&configs)?;
+    Ok(id)
+}
+
+pub fn remove_openai_compat_config(id: String) -> Result<bool, String> {
+    delete_openai_compat_config(id)
+}
+
 #[tauri::command]
 async fn list_openai_compat_provider_models(config_id: String) -> Result<Vec<String>, String> {
     let config = load_openai_compat_configs()
@@ -8020,14 +10003,20 @@ async fn list_openai_compat_provider_models(config_id: String) -> Result<Vec<Str
     let status = resp.status().as_u16();
     let body_bytes = resp.bytes().await.map_err(|e| e.to_string())?;
     let body_text = truncate_body(&body_bytes);
-    log_proxy(&format!("openai-compat models status {status} body={body_text}"));
+    log_proxy(&format!(
+        "openai-compat models status {status} body={body_text}"
+    ));
     if (200..300).contains(&status) {
         let body: Value = serde_json::from_slice(&body_bytes).map_err(|e| e.to_string())?;
         let mut models: Vec<String> = Vec::new();
         if let Some(arr) = body.get("data").and_then(|v| v.as_array()) {
             for item in arr {
                 for field in ["id", "model", "slug"] {
-                    if let Some(model) = item.get(field).and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+                    if let Some(model) = item
+                        .get(field)
+                        .and_then(|v| v.as_str())
+                        .filter(|v| !v.is_empty())
+                    {
                         models.push(model.to_string());
                         break;
                     }
@@ -8049,7 +10038,18 @@ async fn list_openai_compat_provider_models(config_id: String) -> Result<Vec<Str
 }
 
 #[tauri::command]
-async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Result<Value, String> {
+async fn probe_openai_compat_config(config_id: String) -> Result<OpenAICompatProbeResult, String> {
+    let config = load_openai_compat_configs()
+        .into_iter()
+        .find(|cfg| cfg.id == config_id)
+        .ok_or_else(|| "配置不存在".to_string())?;
+    probe_openai_compat_upstream(&config).await
+}
+
+pub async fn start_openai_compat_proxy_runtime(
+    config_id: String,
+    port: Option<u16>,
+) -> Result<Value, String> {
     {
         let mut lock = OPENAI_COMPAT_PROXY_SHUTDOWN.lock().unwrap();
         if let Some(tx) = lock.take() {
@@ -8064,12 +10064,7 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
     let proxy_port = port.unwrap_or(8521);
 
     use axum::{
-        body::Body,
-        extract::State,
-        http::StatusCode,
-        response::Response,
-        routing::any,
-        Router,
+        body::Body, extract::State, http::StatusCode, response::Response, routing::any, Router,
     };
 
     let client = reqwest::Client::builder()
@@ -8095,7 +10090,10 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
             return Response::builder()
                 .status(StatusCode::NO_CONTENT)
                 .header("Access-Control-Allow-Origin", "*")
-                .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
+                .header(
+                    "Access-Control-Allow-Methods",
+                    "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                )
                 .header("Access-Control-Allow-Headers", "*")
                 .header("Access-Control-Max-Age", "86400")
                 .body(Body::empty())
@@ -8139,19 +10137,20 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                 error: None,
                 model: models.first().cloned(),
                 request_headers: request_headers_json,
-                response_headers: headers_to_json_string(vec![
-                    ("content-type".to_string(), "application/json".to_string()),
-                ]),
+                response_headers: headers_to_json_string(vec![(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
                 request_body: None,
                 response_body: Some(truncate_body(&response_body)),
                 input_tokens: None,
                 output_tokens: None,
-            cache_status: None,
-            cache_key: None,
-            cache_eligible: None,
-            cache_bypass_reason: None,
-            local_cached_input_tokens: None,
-            provider_cached_input_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
             };
             let _ = insert_proxy_log(&entry);
             return Response::builder()
@@ -8163,16 +10162,17 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                 .unwrap();
         }
 
-        let body_bytes = match axum::body::to_bytes(req.into_body(), front_proxy_max_body_bytes()).await {
-            Ok(b) => b,
-            Err(_) => {
-                return Response::builder()
-                    .status(StatusCode::PAYLOAD_TOO_LARGE)
-                    .header("Access-Control-Allow-Origin", "*")
-                    .body(Body::from("Request body too large"))
-                    .unwrap();
-            }
-        };
+        let body_bytes =
+            match axum::body::to_bytes(req.into_body(), front_proxy_max_body_bytes()).await {
+                Ok(b) => b,
+                Err(_) => {
+                    return Response::builder()
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Body::from("Request body too large"))
+                        .unwrap();
+                }
+            };
         let mut request_body_text = if body_bytes.is_empty() {
             None
         } else {
@@ -8180,10 +10180,12 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
         };
         let mut request_model = extract_model(&body_bytes);
         let mut upstream_path = path.clone();
-        let is_anthropic = upstream_path == "/v1/messages" || upstream_path.starts_with("/v1/messages?");
-        let is_anthropic_count_tokens =
-            upstream_path == "/v1/messages/count_tokens" || upstream_path.starts_with("/v1/messages/count_tokens?");
-        let custom_responses_path = upstream_path == "/v1/responses" || upstream_path.starts_with("/v1/responses?");
+        let is_anthropic =
+            upstream_path == "/v1/messages" || upstream_path.starts_with("/v1/messages?");
+        let is_anthropic_count_tokens = upstream_path == "/v1/messages/count_tokens"
+            || upstream_path.starts_with("/v1/messages/count_tokens?");
+        let custom_responses_path =
+            upstream_path == "/v1/responses" || upstream_path.starts_with("/v1/responses?");
         let mut upstream_body_bytes = body_bytes.clone();
         let mut is_stream = req_headers
             .get(axum::http::header::ACCEPT)
@@ -8192,12 +10194,14 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
             .unwrap_or(false);
         let mut translated_request_json: Option<Value> = None;
         let mut anthropic_reverse_tool_map: Option<HashMap<String, String>> = None;
+        let mut estimated_input_tokens: Option<i64> = None;
         let proxy_cfg = proxy_config_snapshot();
-        let (cache_eligible, cache_key, cache_model, _cache_bypass_reason) = if proxy_cfg.enable_exact_cache {
-            evaluate_local_cache_request(&method_label, &path, &body_bytes)
-        } else {
-            (false, None, None, Some("exact_cache_disabled".to_string()))
-        };
+        let (cache_eligible, cache_key, cache_model, _cache_bypass_reason) =
+            if proxy_cfg.enable_exact_cache {
+                evaluate_local_cache_request(&method_label, &path, &body_bytes)
+            } else {
+                (false, None, None, Some("exact_cache_disabled".to_string()))
+            };
         if request_model.is_none() {
             request_model = cache_model.clone();
         }
@@ -8278,21 +10282,25 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                 proxy_account_id: config.provider_name.clone(),
                 account_id: None,
                 error: None,
-                model: body_json.get("model").and_then(|v| v.as_str()).map(|v| v.to_string()),
+                model: body_json
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
                 request_headers: request_headers_json.clone(),
-                response_headers: headers_to_json_string(vec![
-                    ("content-type".to_string(), "application/json".to_string()),
-                ]),
+                response_headers: headers_to_json_string(vec![(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
                 request_body: request_body_text.clone(),
                 response_body: Some(truncate_body(&response_body)),
                 input_tokens: Some(count),
                 output_tokens: Some(0),
-            cache_status: None,
-            cache_key: None,
-            cache_eligible: None,
-            cache_bypass_reason: None,
-            local_cached_input_tokens: None,
-            provider_cached_input_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
             };
             let _ = insert_proxy_log(&entry);
             return Response::builder()
@@ -8322,16 +10330,18 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                         .unwrap();
                 }
             };
-            let (mut responses_request, reverse_map, stream) = match convert_claude_to_codex(&body_json) {
-                Ok(v) => v,
-                Err(err) => {
-                    return Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .header("Access-Control-Allow-Origin", "*")
-                        .body(Body::from(err))
-                        .unwrap();
-                }
-            };
+            let (mut responses_request, reverse_map, stream) =
+                match convert_claude_to_codex(&body_json) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header("Access-Control-Allow-Origin", "*")
+                            .body(Body::from(err))
+                            .unwrap();
+                    }
+                };
+            estimated_input_tokens = Some(count_codex_input_tokens(&responses_request));
             let mapped_model = map_openai_compat_model(
                 &config,
                 responses_request.get("model").and_then(|v| v.as_str()),
@@ -8340,7 +10350,10 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
             .unwrap_or_default();
             let mut temp_cfg = proxy_config_snapshot();
             temp_cfg.model_override = Some(mapped_model);
-            let (chat_request, _) = match convert_responses_request_to_chat_completions(&responses_request, &temp_cfg) {
+            let (mut chat_request, _) = match convert_responses_request_to_chat_completions(
+                &responses_request,
+                &temp_cfg,
+            ) {
                 Ok(v) => v,
                 Err(err) => {
                     return Response::builder()
@@ -8350,18 +10363,35 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                         .unwrap();
                 }
             };
-            request_model = body_json.get("model").and_then(|v| v.as_str()).map(|v| v.to_string());
-            responses_request["model"] = serde_json::json!(
-                body_json.get("model").and_then(|v| v.as_str()).unwrap_or(
-                    config.default_model.as_deref().unwrap_or("")
-                )
+            let _ = maybe_inject_glm_coding_agent_bias(
+                &config,
+                responses_request.get("model").and_then(|v| v.as_str()),
+                &mut chat_request,
             );
-            request_body_text = Some(truncate_body(&serde_json::to_vec(&chat_request).unwrap_or_default()));
+            request_model = body_json
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string());
+            responses_request["model"] = serde_json::json!(body_json
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or(config.default_model.as_deref().unwrap_or("")));
+            request_body_text = Some(truncate_body(
+                &serde_json::to_vec(&chat_request).unwrap_or_default(),
+            ));
             upstream_body_bytes = serde_json::to_vec(&chat_request).unwrap_or_default().into();
             upstream_path = "/v1/chat/completions".to_string();
             translated_request_json = Some(responses_request);
             anthropic_reverse_tool_map = Some(reverse_map);
             is_stream = stream;
+            if let Some(estimate) = estimated_input_tokens {
+                if estimate > 20_000 {
+                    log_proxy(&format!(
+                        "openai-compat large anthropic request estimated_input_tokens={estimate} request_len={}",
+                        request_body_text.as_ref().map(|v| v.len()).unwrap_or(0)
+                    ));
+                }
+            }
         } else if custom_responses_path {
             if method != reqwest::Method::POST {
                 return Response::builder()
@@ -8388,7 +10418,7 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
             .unwrap_or_default();
             let mut temp_cfg = proxy_config_snapshot();
             temp_cfg.model_override = Some(mapped_model);
-            let (chat_request, stream) =
+            let (mut chat_request, stream) =
                 match convert_responses_request_to_chat_completions(&request_json, &temp_cfg) {
                     Ok(v) => v,
                     Err(err) => {
@@ -8399,33 +10429,61 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                             .unwrap();
                     }
                 };
-            request_json["model"] = serde_json::json!(
-                request_json.get("model").and_then(|v| v.as_str()).unwrap_or(
-                    config.default_model.as_deref().unwrap_or("")
-                )
+            let _ = maybe_inject_glm_coding_agent_bias(
+                &config,
+                request_json.get("model").and_then(|v| v.as_str()),
+                &mut chat_request,
             );
-            request_model = request_json.get("model").and_then(|v| v.as_str()).map(|v| v.to_string());
-            request_body_text = Some(truncate_body(&serde_json::to_vec(&chat_request).unwrap_or_default()));
+            request_json["model"] = serde_json::json!(request_json
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or(config.default_model.as_deref().unwrap_or("")));
+            request_model = request_json
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string());
+            request_body_text = Some(truncate_body(
+                &serde_json::to_vec(&chat_request).unwrap_or_default(),
+            ));
             upstream_body_bytes = serde_json::to_vec(&chat_request).unwrap_or_default().into();
             upstream_path = "/v1/chat/completions".to_string();
             translated_request_json = Some(chat_request);
             is_stream = stream;
-        } else if upstream_path == "/v1/chat/completions" || upstream_path.starts_with("/v1/chat/completions?") {
+        } else if upstream_path == "/v1/chat/completions"
+            || upstream_path.starts_with("/v1/chat/completions?")
+        {
             if let Ok(mut request_json) = serde_json::from_slice::<Value>(&body_bytes) {
                 if let Some(mapped_model) = map_openai_compat_model(
                     &config,
                     request_json.get("model").and_then(|v| v.as_str()),
                 ) {
                     request_json["model"] = serde_json::json!(mapped_model);
-                    request_model = request_json.get("model").and_then(|v| v.as_str()).map(|v| v.to_string());
-                    request_body_text = Some(truncate_body(&serde_json::to_vec(&request_json).unwrap_or_default()));
-                    upstream_body_bytes = serde_json::to_vec(&request_json).unwrap_or_default().into();
+                    let request_model_str = request_json
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.to_string());
+                    let _ = maybe_inject_glm_coding_agent_bias(
+                        &config,
+                        request_model_str.as_deref(),
+                        &mut request_json,
+                    );
+                    request_model = request_json
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.to_string());
+                    request_body_text = Some(truncate_body(
+                        &serde_json::to_vec(&request_json).unwrap_or_default(),
+                    ));
+                    upstream_body_bytes =
+                        serde_json::to_vec(&request_json).unwrap_or_default().into();
                 }
             }
         }
 
         let target = build_upstream_url_with_base(&config.base_url, &upstream_path);
-        log_proxy(&format!("req#{request_id} start {method_label} {path} -> {target}"));
+        log_proxy(&format!(
+            "req#{request_id} start {method_label} {path} -> {target}"
+        ));
         let request_url = Some(target.clone());
 
         let mut upstream_headers = reqwest::header::HeaderMap::new();
@@ -8436,7 +10494,8 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
             is_stream,
         );
 
-        let upstream_resp = match state.client
+        let upstream_resp = match state
+            .client
             .request(method.clone(), &target)
             .headers(upstream_headers)
             .body(upstream_body_bytes.clone())
@@ -8462,12 +10521,12 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                     response_body: None,
                     input_tokens: None,
                     output_tokens: None,
-                cache_status: None,
-                cache_key: None,
-                cache_eligible: None,
-                cache_bypass_reason: None,
-                local_cached_input_tokens: None,
-                provider_cached_input_tokens: None,
+                    cache_status: None,
+                    cache_key: None,
+                    cache_eligible: None,
+                    cache_bypass_reason: None,
+                    local_cached_input_tokens: None,
+                    provider_cached_input_tokens: None,
                 };
                 let _ = insert_proxy_log(&entry);
                 return Response::builder()
@@ -8479,7 +10538,8 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
         };
 
         let upstream_status = upstream_resp.status();
-        let response_headers_json = headers_to_json_string(sanitize_reqwest_headers(upstream_resp.headers()));
+        let response_headers_json =
+            headers_to_json_string(sanitize_reqwest_headers(upstream_resp.headers()));
 
         if is_anthropic && is_stream && upstream_status.is_success() {
             let entry = ProxyLogEntry {
@@ -8494,19 +10554,20 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                 error: None,
                 model: request_model,
                 request_headers: request_headers_json,
-                response_headers: headers_to_json_string(vec![
-                    ("content-type".to_string(), "text/event-stream".to_string()),
-                ]),
+                response_headers: headers_to_json_string(vec![(
+                    "content-type".to_string(),
+                    "text/event-stream".to_string(),
+                )]),
                 request_body: request_body_text,
                 response_body: None,
                 input_tokens: None,
                 output_tokens: None,
-            cache_status: None,
-            cache_key: None,
-            cache_eligible: None,
-            cache_bypass_reason: None,
-            local_cached_input_tokens: None,
-            provider_cached_input_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
             };
             return build_openai_chat_to_claude_stream_response(
                 upstream_resp,
@@ -8529,19 +10590,20 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                 error: None,
                 model: request_model,
                 request_headers: request_headers_json,
-                response_headers: headers_to_json_string(vec![
-                    ("content-type".to_string(), "text/event-stream".to_string()),
-                ]),
+                response_headers: headers_to_json_string(vec![(
+                    "content-type".to_string(),
+                    "text/event-stream".to_string(),
+                )]),
                 request_body: request_body_text,
                 response_body: None,
                 input_tokens: None,
                 output_tokens: None,
-            cache_status: None,
-            cache_key: None,
-            cache_eligible: None,
-            cache_bypass_reason: None,
-            local_cached_input_tokens: None,
-            provider_cached_input_tokens: None,
+                cache_status: None,
+                cache_key: None,
+                cache_eligible: None,
+                cache_bypass_reason: None,
+                local_cached_input_tokens: None,
+                provider_cached_input_tokens: None,
             };
             return build_custom_openai_stream_response(
                 upstream_resp,
@@ -8557,14 +10619,23 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
             let request_json = translated_request_json.unwrap_or_else(|| serde_json::json!({}));
             match convert_chat_completions_non_stream_to_responses(&request_json, &bytes) {
                 Ok((responses_bytes, _, _, _)) => {
-                    match build_claude_response_body(
+                    match build_claude_response_or_error_body(
+                        upstream_status,
                         &responses_bytes,
                         &anthropic_reverse_tool_map.unwrap_or_default(),
                         request_model.as_deref().unwrap_or("unknown"),
                     ) {
-                        Ok((converted, input_tokens, output_tokens, response_body_text)) => {
+                        Ok((
+                            converted,
+                            input_tokens,
+                            output_tokens,
+                            response_body_text,
+                            error_message,
+                        )) => {
                             let entry = ProxyLogEntry {
-                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                timestamp: chrono::Utc::now()
+                                    .format("%Y-%m-%dT%H:%M:%SZ")
+                                    .to_string(),
                                 method: method_label,
                                 path: path.clone(),
                                 request_url,
@@ -8572,21 +10643,25 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                                 duration_ms: started_at.elapsed().as_millis() as u64,
                                 proxy_account_id: config.provider_name.clone(),
                                 account_id: None,
-                                error: None,
+                                error: error_message,
                                 model: request_model,
-                    request_headers: request_headers_json,
-                    response_headers: headers_to_json_string(vec![
-                        ("content-type".to_string(), "application/json".to_string()),
-                    ]),
-                    request_body: request_body_text,
-                    response_body: response_body_text,
-                    input_tokens,
-                    output_tokens,
-                    ..ProxyLogEntry::default()
-                };
+                                request_headers: request_headers_json,
+                                response_headers: headers_to_json_string(vec![(
+                                    "content-type".to_string(),
+                                    "application/json".to_string(),
+                                )]),
+                                request_body: request_body_text,
+                                response_body: response_body_text,
+                                input_tokens: input_tokens.or(estimated_input_tokens),
+                                output_tokens,
+                                ..ProxyLogEntry::default()
+                            };
                             let _ = insert_proxy_log(&entry);
                             return Response::builder()
-                                .status(axum::http::StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::OK))
+                                .status(
+                                    axum::http::StatusCode::from_u16(upstream_status.as_u16())
+                                        .unwrap_or(StatusCode::OK),
+                                )
                                 .header("Content-Type", "application/json")
                                 .header("Access-Control-Allow-Origin", "*")
                                 .header("Access-Control-Allow-Headers", "*")
@@ -8595,7 +10670,9 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                         }
                         Err(err) => {
                             let entry = ProxyLogEntry {
-                                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                timestamp: chrono::Utc::now()
+                                    .format("%Y-%m-%dT%H:%M:%SZ")
+                                    .to_string(),
                                 method: method_label,
                                 path: path.clone(),
                                 request_url,
@@ -8611,12 +10688,12 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                                 response_body: Some(truncate_body(&bytes)),
                                 input_tokens: None,
                                 output_tokens: None,
-                            cache_status: None,
-                            cache_key: None,
-                            cache_eligible: None,
-                            cache_bypass_reason: None,
-                            local_cached_input_tokens: None,
-                            provider_cached_input_tokens: None,
+                                cache_status: None,
+                                cache_key: None,
+                                cache_eligible: None,
+                                cache_bypass_reason: None,
+                                local_cached_input_tokens: None,
+                                provider_cached_input_tokens: None,
                             };
                             let _ = insert_proxy_log(&entry);
                             return Response::builder()
@@ -8636,6 +10713,43 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                 }
             }
         }
+        if is_anthropic && !upstream_status.is_success() {
+            let (converted, error_message, response_body_text) =
+                build_anthropic_error_response_bytes(upstream_status, &bytes);
+            let entry = ProxyLogEntry {
+                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                method: method_label,
+                path: path.clone(),
+                request_url,
+                status: upstream_status.as_u16(),
+                duration_ms: started_at.elapsed().as_millis() as u64,
+                proxy_account_id: config.provider_name.clone(),
+                account_id: None,
+                error: Some(error_message),
+                model: request_model,
+                request_headers: request_headers_json,
+                response_headers: headers_to_json_string(vec![(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                request_body: request_body_text,
+                response_body: response_body_text,
+                input_tokens: estimated_input_tokens,
+                output_tokens: None,
+                ..ProxyLogEntry::default()
+            };
+            let _ = insert_proxy_log(&entry);
+            return Response::builder()
+                .status(
+                    axum::http::StatusCode::from_u16(upstream_status.as_u16())
+                        .unwrap_or(StatusCode::BAD_GATEWAY),
+                )
+                .header("Content-Type", "application/json")
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Access-Control-Allow-Headers", "*")
+                .body(Body::from(converted))
+                .unwrap();
+        }
         if custom_responses_path && upstream_status.is_success() {
             let request_json = translated_request_json.unwrap_or_else(|| serde_json::json!({}));
             match convert_chat_completions_non_stream_to_responses(&request_json, &bytes) {
@@ -8652,9 +10766,10 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                         error: None,
                         model: request_model,
                         request_headers: request_headers_json,
-                        response_headers: headers_to_json_string(vec![
-                            ("content-type".to_string(), "application/json".to_string()),
-                        ]),
+                        response_headers: headers_to_json_string(vec![(
+                            "content-type".to_string(),
+                            "application/json".to_string(),
+                        )]),
                         request_body: request_body_text,
                         response_body: response_body_text,
                         input_tokens,
@@ -8663,7 +10778,10 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                     };
                     let _ = insert_proxy_log(&entry);
                     return Response::builder()
-                        .status(axum::http::StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::OK))
+                        .status(
+                            axum::http::StatusCode::from_u16(upstream_status.as_u16())
+                                .unwrap_or(StatusCode::OK),
+                        )
                         .header("Content-Type", "application/json")
                         .header("Access-Control-Allow-Origin", "*")
                         .header("Access-Control-Allow-Headers", "*")
@@ -8688,12 +10806,12 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                         response_body: Some(truncate_body(&bytes)),
                         input_tokens: None,
                         output_tokens: None,
-                    cache_status: None,
-                    cache_key: None,
-                    cache_eligible: None,
-                    cache_bypass_reason: None,
-                    local_cached_input_tokens: None,
-                    provider_cached_input_tokens: None,
+                        cache_status: None,
+                        cache_key: None,
+                        cache_eligible: None,
+                        cache_bypass_reason: None,
+                        local_cached_input_tokens: None,
+                        provider_cached_input_tokens: None,
                     };
                     let _ = insert_proxy_log(&entry);
                     return Response::builder()
@@ -8705,8 +10823,14 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
             }
         }
 
-        let response_body_text = if bytes.is_empty() { None } else { Some(truncate_body(&bytes)) };
-        let (input_tokens, output_tokens) = extract_usage(&bytes);
+        let normalized_bytes =
+            maybe_normalize_chat_completion_response_bytes(&upstream_path, upstream_status, &bytes);
+        let response_body_text = if normalized_bytes.is_empty() {
+            None
+        } else {
+            Some(truncate_body(&normalized_bytes))
+        };
+        let (input_tokens, output_tokens) = extract_usage(&normalized_bytes);
         let entry = ProxyLogEntry {
             timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             method: method_label,
@@ -8728,7 +10852,10 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
         };
         let _ = insert_proxy_log(&entry);
         let mut builder = Response::builder()
-            .status(axum::http::StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::OK))
+            .status(
+                axum::http::StatusCode::from_u16(upstream_status.as_u16())
+                    .unwrap_or(StatusCode::OK),
+            )
             .header("Access-Control-Allow-Origin", "*")
             .header("Access-Control-Allow-Headers", "*");
         for (k, v) in headers.iter() {
@@ -8742,7 +10869,7 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
                 builder = builder.header(name, val);
             }
         }
-        builder.body(Body::from(bytes)).unwrap()
+        builder.body(Body::from(normalized_bytes)).unwrap()
     }
 
     let app = Router::new()
@@ -8752,7 +10879,7 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
     let addr = format!("localhost:{proxy_port}");
     let shutdown_notify = Arc::new(Notify::new());
     let shutdown_waiter = shutdown_notify.clone();
-    tauri::async_runtime::spawn(async move {
+    tokio::spawn(async move {
         let _ = shutdown_rx.await;
         shutdown_waiter.notify_waiters();
     });
@@ -8766,7 +10893,7 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
         *lock = Some(proxy_port);
     }
 
-    tauri::async_runtime::spawn(async move {
+    tokio::spawn(async move {
         let serve_result = run_proxy_server(&addr, app, shutdown_notify).await;
         if let Err(err) = serve_result {
             log_proxy(&format!("openai compat proxy exited with error: {err}"));
@@ -8786,8 +10913,7 @@ async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Resu
     }))
 }
 
-#[tauri::command]
-fn stop_openai_compat_proxy() -> Result<Value, String> {
+pub fn stop_openai_compat_proxy_runtime() -> Result<Value, String> {
     let mut lock = OPENAI_COMPAT_PROXY_SHUTDOWN.lock().unwrap();
     if let Some(tx) = lock.take() {
         let _ = tx.send(());
@@ -8798,6 +10924,16 @@ fn stop_openai_compat_proxy() -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn start_openai_compat_proxy(config_id: String, port: Option<u16>) -> Result<Value, String> {
+    start_openai_compat_proxy_runtime(config_id, port).await
+}
+
+#[tauri::command]
+fn stop_openai_compat_proxy() -> Result<Value, String> {
+    stop_openai_compat_proxy_runtime()
+}
+
+#[tauri::command]
 fn get_openai_compat_proxy_status() -> Result<Value, String> {
     let port = *OPENAI_COMPAT_PROXY_PORT.lock().unwrap();
     let running = if let Some(port) = port {
@@ -8805,11 +10941,8 @@ fn get_openai_compat_proxy_status() -> Result<Value, String> {
         let socket_addr: std::net::SocketAddr = addr
             .parse()
             .map_err(|e: std::net::AddrParseError| e.to_string())?;
-        std::net::TcpStream::connect_timeout(
-            &socket_addr,
-            std::time::Duration::from_millis(200),
-        )
-        .is_ok()
+        std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(200))
+            .is_ok()
     } else {
         false
     };
@@ -8865,11 +10998,8 @@ fn get_proxy_status() -> Result<Value, String> {
         let socket_addr: std::net::SocketAddr = addr
             .parse()
             .map_err(|e: std::net::AddrParseError| e.to_string())?;
-        std::net::TcpStream::connect_timeout(
-            &socket_addr,
-            std::time::Duration::from_millis(200),
-        )
-        .is_ok()
+        std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(200))
+            .is_ok()
     } else {
         false
     };
@@ -8880,9 +11010,18 @@ fn get_proxy_status() -> Result<Value, String> {
             let now = std::time::Instant::now();
             let accounts = state.accounts.read().unwrap();
             let total = accounts.len();
-            let active = accounts.iter().filter(|a| a.health == AccountHealth::Active).count();
-            let cd = accounts.iter().filter(|a| matches!(&a.health, AccountHealth::Cooldown(u) if now < *u)).count();
-            let bl = accounts.iter().filter(|a| a.health == AccountHealth::Blocked).count();
+            let active = accounts
+                .iter()
+                .filter(|a| a.health == AccountHealth::Active)
+                .count();
+            let cd = accounts
+                .iter()
+                .filter(|a| matches!(&a.health, AccountHealth::Cooldown(u) if now < *u))
+                .count();
+            let bl = accounts
+                .iter()
+                .filter(|a| a.health == AccountHealth::Blocked)
+                .count();
             (total, active, cd, bl)
         } else {
             (0, 0, 0, 0)
@@ -8928,7 +11067,11 @@ fn update_proxy_config(
     let mut cfg = proxy_config_snapshot();
     if let Some(value) = api_key {
         let trimmed = value.trim().to_string();
-        cfg.api_key = if trimmed.is_empty() { None } else { Some(trimmed) };
+        cfg.api_key = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
     }
     if let Some(value) = enable_logging {
         cfg.enable_logging = value;
@@ -8941,22 +11084,38 @@ fn update_proxy_config(
     }
     if let Some(value) = model_override {
         let trimmed = value.trim().to_string();
-        cfg.model_override = if trimmed.is_empty() { None } else { Some(trimmed) };
+        cfg.model_override = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
     }
     if let Some(value) = reasoning_effort_override {
         let trimmed = value.trim().to_string();
-        cfg.reasoning_effort_override = if trimmed.is_empty() { None } else { Some(trimmed) };
+        cfg.reasoning_effort_override = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
     }
     if let Some(value) = upstream_mode {
         cfg.upstream_mode = normalize_proxy_upstream_mode(&value).to_string();
     }
     if let Some(value) = custom_openai_base_url {
         let trimmed = value.trim().trim_end_matches('/').to_string();
-        cfg.custom_openai_base_url = if trimmed.is_empty() { None } else { Some(trimmed) };
+        cfg.custom_openai_base_url = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
     }
     if let Some(value) = custom_openai_api_key {
         let trimmed = value.trim().to_string();
-        cfg.custom_openai_api_key = if trimmed.is_empty() { None } else { Some(trimmed) };
+        cfg.custom_openai_api_key = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
     }
     if let Some(value) = enable_exact_cache {
         cfg.enable_exact_cache = value;
@@ -8983,15 +11142,27 @@ fn update_proxy_config(
     }
     if let Some(value) = vector_api_base_url {
         let trimmed = value.trim().trim_end_matches('/').to_string();
-        cfg.vector_api_base_url = if trimmed.is_empty() { None } else { Some(trimmed) };
+        cfg.vector_api_base_url = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
     }
     if let Some(value) = vector_api_key {
         let trimmed = value.trim().to_string();
-        cfg.vector_api_key = if trimmed.is_empty() { None } else { Some(trimmed) };
+        cfg.vector_api_key = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
     }
     if let Some(value) = vector_model {
         let trimmed = value.trim().to_string();
-        cfg.vector_model = if trimmed.is_empty() { None } else { Some(trimmed) };
+        cfg.vector_model = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
     }
     save_proxy_config(&cfg)?;
     let mut lock = proxy_config().lock().unwrap();
@@ -9016,12 +11187,16 @@ fn generate_proxy_api_key() -> Result<String, String> {
 #[tauri::command]
 fn clear_proxy_logs() -> Result<Value, String> {
     let conn = proxy_log_db()?;
-    conn.execute("DELETE FROM request_logs", []).map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM request_logs", [])
+        .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "success": true }))
 }
 
 #[tauri::command]
-fn get_proxy_logs_count_filtered(filter: Option<String>, errors_only: Option<bool>) -> Result<usize, String> {
+fn get_proxy_logs_count_filtered(
+    filter: Option<String>,
+    errors_only: Option<bool>,
+) -> Result<usize, String> {
     let filter = filter.unwrap_or_default();
     let errors_only = errors_only.unwrap_or(false);
     let conn = proxy_log_db()?;
@@ -9035,13 +11210,18 @@ fn get_proxy_logs_count_filtered(filter: Option<String>, errors_only: Option<boo
     let sql = if clauses.is_empty() {
         "SELECT COUNT(*) FROM request_logs".to_string()
     } else {
-        format!("SELECT COUNT(*) FROM request_logs WHERE {}", clauses.join(" AND "))
+        format!(
+            "SELECT COUNT(*) FROM request_logs WHERE {}",
+            clauses.join(" AND ")
+        )
     };
     let count: i64 = if filter.is_empty() {
-        conn.query_row(&sql, [], |row| row.get(0)).map_err(|e| e.to_string())?
+        conn.query_row(&sql, [], |row| row.get(0))
+            .map_err(|e| e.to_string())?
     } else {
         let pattern = format!("%{}%", filter);
-        conn.query_row(&sql, params![pattern], |row| row.get(0)).map_err(|e| e.to_string())?
+        conn.query_row(&sql, params![pattern], |row| row.get(0))
+            .map_err(|e| e.to_string())?
     };
     Ok(count as usize)
 }
@@ -9064,31 +11244,39 @@ fn get_proxy_logs_filtered(
         if errors_only {
             (format!("{sql_base} WHERE (status < 200 OR status >= 400) ORDER BY id DESC LIMIT ?1 OFFSET ?2"), vec![limit.into(), offset.into()])
         } else {
-            (format!("{sql_base} ORDER BY id DESC LIMIT ?1 OFFSET ?2"), vec![limit.into(), offset.into()])
+            (
+                format!("{sql_base} ORDER BY id DESC LIMIT ?1 OFFSET ?2"),
+                vec![limit.into(), offset.into()],
+            )
         }
     } else {
         let pattern = format!("%{}%", filter).into();
         if errors_only {
             (format!("{sql_base} WHERE (status < 200 OR status >= 400) AND {filter_clause} ORDER BY id DESC LIMIT ?2 OFFSET ?3"), vec![pattern, limit.into(), offset.into()])
         } else {
-            (format!("{sql_base} WHERE {filter_clause} ORDER BY id DESC LIMIT ?2 OFFSET ?3"), vec![pattern, limit.into(), offset.into()])
+            (
+                format!("{sql_base} WHERE {filter_clause} ORDER BY id DESC LIMIT ?2 OFFSET ?3"),
+                vec![pattern, limit.into(), offset.into()],
+            )
         }
     };
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let logs_iter = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
-        Ok(ProxyLogSummary {
-            id: row.get(0)?,
-            timestamp: row.get(1)?,
-            method: row.get(2)?,
-            path: row.get(3)?,
-            status: row.get::<_, i64>(4)? as u16,
-            duration_ms: row.get::<_, i64>(5)? as u64,
-            proxy_account_id: row.get(6)?,
-            account_id: row.get(7)?,
-            error: row.get(8)?,
-            model: row.get(9)?,
+    let logs_iter = stmt
+        .query_map(rusqlite::params_from_iter(params_vec), |row| {
+            Ok(ProxyLogSummary {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                method: row.get(2)?,
+                path: row.get(3)?,
+                status: row.get::<_, i64>(4)? as u16,
+                duration_ms: row.get::<_, i64>(5)? as u64,
+                proxy_account_id: row.get(6)?,
+                account_id: row.get(7)?,
+                error: row.get(8)?,
+                model: row.get(9)?,
+            })
         })
-    }).map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
     let mut logs = Vec::new();
     for log in logs_iter {
         logs.push(log.map_err(|e| e.to_string())?);
@@ -9102,37 +11290,39 @@ fn get_proxy_log_detail(log_id: i64) -> Result<ProxyLogDetail, String> {
     let mut stmt = conn.prepare(
         "SELECT id, timestamp, method, path, request_url, status, duration_ms, proxy_account_id, account_id, error, model, request_headers, response_headers, request_body, response_body, input_tokens, output_tokens, cache_status, cache_key, cache_eligible, cache_bypass_reason, local_cached_input_tokens, provider_cached_input_tokens FROM request_logs WHERE id = ?1",
     ).map_err(|e| e.to_string())?;
-    let log = stmt.query_row(params![log_id], |row| {
-        Ok(ProxyLogDetail {
-            id: row.get(0)?,
-            timestamp: row.get(1)?,
-            method: row.get(2)?,
-            path: row.get(3)?,
-            request_url: row.get(4)?,
-            status: row.get::<_, i64>(5)? as u16,
-            duration_ms: row.get::<_, i64>(6)? as u64,
-            proxy_account_id: row.get(7)?,
-            account_id: row.get(8)?,
-            error: row.get(9)?,
-            model: row.get(10)?,
-            request_headers: row.get(11)?,
-            response_headers: row.get(12)?,
-            request_body: row.get(13)?,
-            response_body: row.get(14)?,
-            input_tokens: row.get(15)?,
-            output_tokens: row.get(16)?,
-            cache_status: row.get(17)?,
-            cache_key: row.get(18)?,
-            cache_eligible: row.get::<_, Option<i64>>(19)?.map(|v| v != 0),
-            cache_bypass_reason: row.get(20)?,
-            local_cached_input_tokens: row.get(21)?,
-            provider_cached_input_tokens: row.get(22)?,
+    let log = stmt
+        .query_row(params![log_id], |row| {
+            Ok(ProxyLogDetail {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                method: row.get(2)?,
+                path: row.get(3)?,
+                request_url: row.get(4)?,
+                status: row.get::<_, i64>(5)? as u16,
+                duration_ms: row.get::<_, i64>(6)? as u64,
+                proxy_account_id: row.get(7)?,
+                account_id: row.get(8)?,
+                error: row.get(9)?,
+                model: row.get(10)?,
+                request_headers: row.get(11)?,
+                response_headers: row.get(12)?,
+                request_body: row.get(13)?,
+                response_body: row.get(14)?,
+                input_tokens: row.get(15)?,
+                output_tokens: row.get(16)?,
+                cache_status: row.get(17)?,
+                cache_key: row.get(18)?,
+                cache_eligible: row.get::<_, Option<i64>>(19)?.map(|v| v != 0),
+                cache_bypass_reason: row.get(20)?,
+                local_cached_input_tokens: row.get(21)?,
+                provider_cached_input_tokens: row.get(22)?,
+            })
         })
-    }).map_err(|e| {
-        let msg = format!("日志详情查询失败 (id={log_id}): {e}");
-        log_proxy(&msg);
-        msg
-    })?;
+        .map_err(|e| {
+            let msg = format!("日志详情查询失败 (id={log_id}): {e}");
+            log_proxy(&msg);
+            msg
+        })?;
     Ok(log)
 }
 
@@ -9376,7 +11566,10 @@ fn get_ai_cache_trend(hours: Option<i64>) -> Result<Vec<AICacheTrendPoint>, Stri
 }
 
 #[tauri::command]
-fn list_ai_cache_entries(limit: Option<i64>, offset: Option<i64>) -> Result<Vec<AICacheEntrySummary>, String> {
+fn list_ai_cache_entries(
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<AICacheEntrySummary>, String> {
     let conn = proxy_log_db()?;
     let mut stmt = conn
         .prepare(
@@ -9388,24 +11581,30 @@ fn list_ai_cache_entries(limit: Option<i64>, offset: Option<i64>) -> Result<Vec<
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(params![limit.unwrap_or(50).clamp(1, 200), offset.unwrap_or(0).max(0)], |row| {
-            Ok(AICacheEntrySummary {
-                id: row.get(0)?,
-                cache_key: row.get(1)?,
-                path: row.get(2)?,
-                model: row.get(3)?,
-                cache_type: row.get(4)?,
-                hit_count: row.get(5)?,
-                input_tokens: row.get(6)?,
-                output_tokens: row.get(7)?,
-                local_cached_input_tokens: row.get(8)?,
-                provider_cached_input_tokens: row.get(9)?,
-                created_at: row.get(10)?,
-                last_hit_at: row.get(11)?,
-                expires_at: row.get(12)?,
-                response_preview: row.get(13)?,
-            })
-        })
+        .query_map(
+            params![
+                limit.unwrap_or(50).clamp(1, 200),
+                offset.unwrap_or(0).max(0)
+            ],
+            |row| {
+                Ok(AICacheEntrySummary {
+                    id: row.get(0)?,
+                    cache_key: row.get(1)?,
+                    path: row.get(2)?,
+                    model: row.get(3)?,
+                    cache_type: row.get(4)?,
+                    hit_count: row.get(5)?,
+                    input_tokens: row.get(6)?,
+                    output_tokens: row.get(7)?,
+                    local_cached_input_tokens: row.get(8)?,
+                    provider_cached_input_tokens: row.get(9)?,
+                    created_at: row.get(10)?,
+                    last_hit_at: row.get(11)?,
+                    expires_at: row.get(12)?,
+                    response_preview: row.get(13)?,
+                })
+            },
+        )
         .map_err(|e| e.to_string())?;
     let mut items = Vec::new();
     for row in rows {
@@ -9430,7 +11629,7 @@ struct AccountUsage {
     // primary window (短窗口，约5小时)
     used_percent: Option<f64>,
     window_minutes: Option<u64>,
-    resets_at: Option<i64>,       // unix timestamp seconds
+    resets_at: Option<i64>, // unix timestamp seconds
     // secondary window (长窗口，约7天)
     secondary_used_percent: Option<f64>,
     secondary_window_minutes: Option<u64>,
@@ -9479,23 +11678,32 @@ async fn fetch_account_usage_by_id(id: &str) -> Result<AccountUsage, String> {
     let pw = json.pointer("/rate_limit/primary_window");
     let sw = json.pointer("/rate_limit/secondary_window");
 
-    let used_percent           = pw.and_then(|v| v.get("used_percent")).and_then(|v| v.as_f64());
-    let window_secs            = pw.and_then(|v| v.get("limit_window_seconds")).and_then(|v| v.as_u64());
-    let window_minutes         = window_secs.map(|s| (s + 59) / 60);
-    let resets_at              = pw.and_then(|v| v.get("reset_at")).and_then(|v| v.as_i64());
+    let used_percent = pw
+        .and_then(|v| v.get("used_percent"))
+        .and_then(|v| v.as_f64());
+    let window_secs = pw
+        .and_then(|v| v.get("limit_window_seconds"))
+        .and_then(|v| v.as_u64());
+    let window_minutes = window_secs.map(|s| (s + 59) / 60);
+    let resets_at = pw.and_then(|v| v.get("reset_at")).and_then(|v| v.as_i64());
 
-    let secondary_used_percent = sw.and_then(|v| v.get("used_percent")).and_then(|v| v.as_f64());
-    let secondary_secs         = sw.and_then(|v| v.get("limit_window_seconds")).and_then(|v| v.as_u64());
+    let secondary_used_percent = sw
+        .and_then(|v| v.get("used_percent"))
+        .and_then(|v| v.as_f64());
+    let secondary_secs = sw
+        .and_then(|v| v.get("limit_window_seconds"))
+        .and_then(|v| v.as_u64());
     let secondary_window_minutes = secondary_secs.map(|s| (s + 59) / 60);
-    let secondary_resets_at    = sw.and_then(|v| v.get("reset_at")).and_then(|v| v.as_i64());
+    let secondary_resets_at = sw.and_then(|v| v.get("reset_at")).and_then(|v| v.as_i64());
 
     let availability = match (used_percent, secondary_used_percent) {
-        (None, _)                                       => "unknown",
-        (Some(p), _) if p >= 100.0                      => "unavailable",
-        (Some(_), None)                                 => "primary_window_available_only",
-        (Some(_), Some(s)) if s >= 100.0                => "unavailable",
-        _                                               => "available",
-    }.to_string();
+        (None, _) => "unknown",
+        (Some(p), _) if p >= 100.0 => "unavailable",
+        (Some(_), None) => "primary_window_available_only",
+        (Some(_), Some(s)) if s >= 100.0 => "unavailable",
+        _ => "available",
+    }
+    .to_string();
 
     let captured_at = chrono::Utc::now().timestamp();
 
@@ -9541,7 +11749,14 @@ async fn select_highest_quota_account_excluding(
             .iter()
             .enumerate()
             .filter(|(idx, acc)| !exclude.contains(idx) && acc.health == AccountHealth::Active)
-            .map(|(idx, acc)| (idx, acc.id.clone(), acc.access_token.clone(), acc.account_id.clone()))
+            .map(|(idx, acc)| {
+                (
+                    idx,
+                    acc.id.clone(),
+                    acc.access_token.clone(),
+                    acc.account_id.clone(),
+                )
+            })
             .collect::<Vec<_>>()
     };
 
@@ -9578,10 +11793,10 @@ async fn list_codex_models() -> Result<Vec<String>, String> {
         if !configured.is_empty() {
             return Ok(configured);
         }
-        let base_url = custom_openai_base_url(&cfg)
-            .ok_or_else(|| "未配置自定义 OpenAI 地址".to_string())?;
-        let api_key = custom_openai_api_key(&cfg)
-            .ok_or_else(|| "未配置自定义 OpenAI API Key".to_string())?;
+        let base_url =
+            custom_openai_base_url(&cfg).ok_or_else(|| "未配置自定义 OpenAI 地址".to_string())?;
+        let api_key =
+            custom_openai_api_key(&cfg).ok_or_else(|| "未配置自定义 OpenAI API Key".to_string())?;
         let client = reqwest::Client::new();
         let url = build_upstream_url_with_base(&base_url, "/v1/models");
         log_proxy(&format!("models: custom request -> {url}"));
@@ -9598,14 +11813,20 @@ async fn list_codex_models() -> Result<Vec<String>, String> {
         let body_text = truncate_body(&body_bytes);
         log_proxy(&format!("models: custom status {status} body={body_text}"));
         if !(200..300).contains(&status) {
-            return Err(format!("获取模型失败 (HTTP {status})，且未配置模型覆盖。请直接填写模型名称，例如 glm-5。"));
+            return Err(format!(
+                "获取模型失败 (HTTP {status})，且未配置模型覆盖。请直接填写模型名称，例如 glm-5。"
+            ));
         }
         let body: Value = serde_json::from_slice(&body_bytes).map_err(|e| e.to_string())?;
         let mut models: Vec<String> = Vec::new();
         if let Some(arr) = body.get("data").and_then(|v| v.as_array()) {
             for item in arr {
                 for field in ["id", "model", "slug"] {
-                    if let Some(id) = item.get(field).and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+                    if let Some(id) = item
+                        .get(field)
+                        .and_then(|v| v.as_str())
+                        .filter(|v| !v.is_empty())
+                    {
                         models.push(id.to_string());
                         break;
                     }
@@ -9710,7 +11931,11 @@ async fn list_codex_models() -> Result<Vec<String>, String> {
                 }
             }
         }
-    } else if let Some(arr) = body.get("result").and_then(|v| v.get("models")).and_then(|v| v.as_array()) {
+    } else if let Some(arr) = body
+        .get("result")
+        .and_then(|v| v.get("models"))
+        .and_then(|v| v.as_array())
+    {
         for item in arr {
             if let Some(id) = item.as_str() {
                 if !id.is_empty() {
@@ -9722,7 +11947,9 @@ async fn list_codex_models() -> Result<Vec<String>, String> {
     models.sort();
     models.dedup();
     if models.is_empty() {
-        return Err(format!("模型列表为空，请检查账号权限或稍后重试。响应：{body_text}"));
+        return Err(format!(
+            "模型列表为空，请检查账号权限或稍后重试。响应：{body_text}"
+        ));
     }
     Ok(models)
 }
@@ -9761,6 +11988,7 @@ pub fn run() {
             update_openai_compat_config,
             delete_openai_compat_config,
             list_openai_compat_provider_models,
+            probe_openai_compat_config,
             start_openai_compat_proxy,
             stop_openai_compat_proxy,
             get_openai_compat_proxy_status,

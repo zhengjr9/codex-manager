@@ -48,6 +48,35 @@ export interface OpenAICompatProxyStatus {
   provider_name: string | null
 }
 
+export interface OpenAICompatProbeCheck {
+  name: string
+  method: string
+  path: string
+  status: number
+  ok: boolean
+  duration_ms: number
+  summary: string
+  response_excerpt: string | null
+}
+
+export interface OpenAICompatProbeResult {
+  provider_name: string
+  base_url: string
+  requested_model: string
+  effective_model: string
+  checked_at: number
+  supports_models: boolean
+  supports_chat_completions: boolean
+  supports_responses: boolean
+  supports_messages: boolean
+  chat_tool_call_ok: boolean
+  responses_tool_call_ok: boolean
+  streaming_tool_call_ok: boolean
+  recommended_strategy: string
+  recommendations: string[]
+  checks: OpenAICompatProbeCheck[]
+}
+
 export interface ProxyConfig {
   api_key: string | null
   enable_logging: boolean
@@ -267,6 +296,8 @@ export const accountService = {
   deleteOpenAICompatConfig: (id: string) => invoke<boolean>('delete_openai_compat_config', { id }),
   listOpenAICompatProviderModels: (configId: string) =>
     invoke<string[]>('list_openai_compat_provider_models', { configId }),
+  probeOpenAICompatConfig: (configId: string) =>
+    invoke<OpenAICompatProbeResult>('probe_openai_compat_config', { configId }),
   startOpenAICompatProxy: (configId: string, port?: number) =>
     invoke<{ success: boolean; port: number; base_url: string; config_id: string; provider_name: string }>('start_openai_compat_proxy', {
       configId,
