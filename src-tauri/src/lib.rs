@@ -507,7 +507,14 @@ fn map_openai_compat_model(
     }
 }
 
-const GLM_CODING_AGENT_TOOL_BIAS_PROMPT: &str = "You are operating inside a tool-using coding agent runtime. When tools are available and the task requires inspection, editing, searching, execution, or patching, emit tool calls instead of describing what you would do. Prefer apply_patch for file edits. If the user explicitly requests a tool, call it before prose. Tool arguments must be valid JSON and complete.";
+const GLM_CODING_AGENT_TOOL_BIAS_PROMPT: &str = "You are operating inside a tool-using coding agent runtime. When tools are available and the task requires inspection, editing, searching, execution, or patching, emit tool calls instead of describing what you would do. Prefer apply_patch for file edits. If the user explicitly requests a tool, call it before prose. Tool arguments must be valid JSON and complete. For exec_command, produce shell commands with normal spaces between commands, flags, operators, pipes, and values. Never concatenate tokens such as `head-50`, `-typef-name`, `--files-g`, `find .-type`, `mkdir -pdir`, or `cmd1&&cmd2`. Prefer `rg --files -g '*.ts' | head -n 50` over fragile `find` pipelines when searching for files, and write multi-directory mkdir commands as `mkdir -p dir1 dir2 dir3`. File creation or file content editing must use apply_patch, not exec_command. Do not use exec_command with heredocs, redirection, tee, cat >, echo >, echo >>, printf >, or printf >> to write files. Before calling exec_command, quickly self-check the shell syntax.";
+const GLM_APPLY_PATCH_TOOL_GUIDE: &str = "When you need to create or edit files, use apply_patch. Provide a single `patch` string using the patch envelope: `*** Begin Patch` ... file operations ... `*** End Patch`. Use `*** Add File: path` for new files, `*** Update File: path` for edits, and `*** Delete File: path` for removals. In hunks, prefix kept lines with a space, removed lines with `-`, and added lines with `+`. Do not use absolute paths inside the patch.";
+
+const GLM_EXEC_COMMAND_DESCRIPTION_SUFFIX: &str = " Use this tool for inspection, search, builds, tests, and other command execution. Do not create or edit file contents with shell redirection, heredocs, tee, cat >, echo >, echo >>, printf >, or printf >>. Use apply_patch for any file content changes.";
+const GLM_APPLY_PATCH_DESCRIPTION_SUFFIX: &str =
+    " Primary tool for creating files and editing file contents.";
+const GLM_BLOCKED_FILE_WRITE_COMMAND: &str =
+    "printf '%s\\n' '[proxy] exec_command file writes are blocked for glm-5; use apply_patch instead.' 1>&2; exit 2";
 
 fn maybe_inject_glm_coding_agent_bias(
     config: &OpenAICompatProviderConfig,
@@ -526,29 +533,89 @@ fn maybe_inject_glm_coding_agent_bias(
         return false;
     }
 
-    let Some(messages) = chat_request
-        .get_mut("messages")
-        .and_then(|v| v.as_array_mut())
-    else {
-        return false;
-    };
+    let apply_patch_guide_present = chat_request
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .map(|messages| {
+            messages.iter().any(|message| {
+                let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                role == "system"
+                    && response_message_text(message.get("content").unwrap_or(&Value::Null))
+                        .contains(GLM_APPLY_PATCH_TOOL_GUIDE)
+            })
+        })
+        .unwrap_or(false);
 
-    let already_present = messages.iter().any(|message| {
-        let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        if role != "system" {
+    {
+        let Some(messages) = chat_request.get_mut("messages").and_then(|v| v.as_array_mut()) else {
             return false;
+        };
+
+        let already_present = messages.iter().any(|message| {
+            let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            if role != "system" {
+                return false;
+            }
+            response_message_text(message.get("content").unwrap_or(&Value::Null))
+                .contains(GLM_CODING_AGENT_TOOL_BIAS_PROMPT)
+        });
+        if !already_present {
+            messages.insert(
+                0,
+                serde_json::json!({
+                    "role": "system",
+                    "content": GLM_CODING_AGENT_TOOL_BIAS_PROMPT,
+                }),
+            );
         }
-        response_message_text(message.get("content").unwrap_or(&Value::Null))
-            .contains(GLM_CODING_AGENT_TOOL_BIAS_PROMPT)
-    });
-    if !already_present {
-        messages.insert(
-            0,
-            serde_json::json!({
-                "role": "system",
-                "content": GLM_CODING_AGENT_TOOL_BIAS_PROMPT,
-            }),
-        );
+    }
+    let mut has_apply_patch = false;
+    if let Some(tools) = chat_request.get_mut("tools").and_then(|v| v.as_array_mut()) {
+        for tool in tools {
+            let Some(function) = tool.get_mut("function").and_then(|v| v.as_object_mut()) else {
+                continue;
+            };
+            let Some(name) = function.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("apply_patch") {
+                has_apply_patch = true;
+            }
+            let suffix = if name.eq_ignore_ascii_case("exec_command") {
+                Some(GLM_EXEC_COMMAND_DESCRIPTION_SUFFIX)
+            } else if name.eq_ignore_ascii_case("apply_patch") {
+                Some(GLM_APPLY_PATCH_DESCRIPTION_SUFFIX)
+            } else {
+                None
+            };
+            let Some(suffix) = suffix else {
+                continue;
+            };
+            let existing = function
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if existing.contains(suffix.trim()) {
+                continue;
+            }
+            let merged = if existing.trim().is_empty() {
+                suffix.trim().to_string()
+            } else {
+                format!("{}{}", existing.trim_end(), suffix)
+            };
+            function.insert("description".to_string(), Value::String(merged));
+        }
+    }
+    if has_apply_patch && !apply_patch_guide_present {
+        if let Some(messages) = chat_request.get_mut("messages").and_then(|v| v.as_array_mut()) {
+            messages.insert(
+                1.min(messages.len()),
+                serde_json::json!({
+                    "role": "system",
+                    "content": GLM_APPLY_PATCH_TOOL_GUIDE,
+                }),
+            );
+        }
     }
 
     if chat_request.get("temperature").is_none() {
@@ -557,9 +624,7 @@ fn maybe_inject_glm_coding_agent_bias(
     if chat_request.get("tool_choice").is_none() {
         chat_request["tool_choice"] = serde_json::json!("auto");
     }
-    if chat_request.get("parallel_tool_calls").is_none() {
-        chat_request["parallel_tool_calls"] = serde_json::json!(true);
-    }
+    chat_request["parallel_tool_calls"] = serde_json::json!(false);
     true
 }
 
@@ -1882,9 +1947,67 @@ fn compact_middle_text(text: &str, max_chars: usize, head_chars: usize, tail_cha
     )
 }
 
-fn text_fingerprint(text: &str) -> String {
-    let hex = format!("{:x}", Sha256::digest(text.as_bytes()));
-    hex[..16.min(hex.len())].to_string()
+fn summarize_claude_rule_filenames(text: &str) -> Option<String> {
+    let marker = "Contents of ";
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with(marker) || !trimmed.contains("/.claude/rules/") {
+            continue;
+        }
+        let path_part = trimmed[marker.len()..]
+            .split(" (")
+            .next()
+            .unwrap_or("")
+            .trim();
+        let name = path_part.rsplit('/').next().unwrap_or("").trim();
+        if !name.is_empty() && !names.iter().any(|existing| existing == name) {
+            names.push(name.to_string());
+        }
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names.join(", "))
+    }
+}
+
+fn compact_claude_md_context(text: &str) -> Option<String> {
+    if !text.contains("# claudeMd") || !text.contains("/.claude/rules/") {
+        return None;
+    }
+    let rules = summarize_claude_rule_filenames(text)?;
+    let mut summary = String::from(
+        "<system-reminder>\nClaude global rules omitted for context efficiency. Rule files present: ",
+    );
+    summary.push_str(&rules);
+    summary.push_str(". Follow the user's global coding, git workflow, testing, performance, patterns, and hooks rules at a high level.\n</system-reminder>");
+    Some(summary)
+}
+
+fn compact_persisted_output_block(text: &str) -> Option<String> {
+    if !text.contains("<persisted-output>") {
+        return None;
+    }
+    let path_line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("Output too large"))
+        .map(|line| line.trim());
+    let preview_pos = text.find("Preview (first");
+    let preview = preview_pos
+        .map(|idx| &text[idx..])
+        .unwrap_or(text);
+    let compact_preview = compact_middle_text(preview.trim(), 1200, 700, 250);
+    let mut out = String::from("<persisted-output>\n");
+    if let Some(path_line) = path_line {
+        out.push_str(path_line);
+        out.push('\n');
+    } else {
+        out.push_str("Large persisted output omitted for context efficiency.\n");
+    }
+    out.push_str(&compact_preview);
+    out.push_str("\n</persisted-output>");
+    Some(out)
 }
 
 fn extract_system_reminder_tool_name(text: &str, prefix: &str, suffix: &str) -> Option<String> {
@@ -1911,6 +2034,10 @@ fn compact_system_reminder_text(text: &str) -> String {
     let trimmed = text.trim();
     if !trimmed.starts_with("<system-reminder>") || !trimmed.ends_with("</system-reminder>") {
         return text.to_string();
+    }
+
+    if let Some(compacted) = compact_claude_md_context(trimmed) {
+        return compacted;
     }
 
     if trimmed.contains("The following skills are available for use with the Skill tool:") {
@@ -2001,6 +2128,7 @@ fn compact_anthropic_text_content(text: &str) -> String {
 
 fn compact_anthropic_tool_result_content(text: &str) -> String {
     let normalized = compact_embedded_system_reminders(text);
+    let normalized = compact_persisted_output_block(&normalized).unwrap_or(normalized);
     const MAX_TOOL_RESULT_CHARS: usize = 8000;
     const HEAD_CHARS: usize = 4200;
     const TAIL_CHARS: usize = 1400;
@@ -2263,38 +2391,609 @@ fn normalize_openai_tool_choice_for_chat(value: &Value) -> Option<Value> {
     }
 }
 
-fn convert_claude_tool_choice(
-    value: &Value,
+fn anthropic_compacted_system_parts(value: &Value) -> Vec<String> {
+    anthropic_system_parts(value)
+        .into_iter()
+        .map(|part| {
+            compact_claude_md_context(&part)
+                .unwrap_or_else(|| compact_anthropic_text_content(&part))
+        })
+        .filter(|part| !part.trim().is_empty())
+        .collect()
+}
+
+fn anthropic_thinking_text(item: &Value) -> Option<String> {
+    item.get("thinking")
+        .and_then(|v| v.as_str())
+        .or_else(|| item.get("text").and_then(|v| v.as_str()))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn convert_anthropic_part_to_openai_chat_content(item: &Value, role: &str) -> Option<Value> {
+    match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "text" => {
+            let text = item.get("text").and_then(|v| v.as_str())?;
+            let normalized = compact_anthropic_text_content(text);
+            if normalized.trim().is_empty() {
+                None
+            } else {
+                Some(serde_json::json!({
+                    "type": "text",
+                    "text": normalized,
+                }))
+            }
+        }
+        "image" => {
+            let url = anthropic_image_url(item)?;
+            Some(serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": url },
+            }))
+        }
+        "thinking" if role == "assistant" => None,
+        "redacted_thinking" => None,
+        _ => None,
+    }
+}
+
+fn build_openai_chat_request_from_claude(
+    body: &Value,
+    model: &str,
     short_map: &HashMap<String, String>,
-) -> Option<(Value, Option<bool>)> {
-    let Value::Object(obj) = value else {
-        return None;
-    };
-    let disable_parallel = obj
-        .get("disable_parallel_tool_use")
-        .and_then(|v| v.as_bool());
-    let choice = match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-        "auto" => Value::String("auto".to_string()),
-        "any" => Value::String("required".to_string()),
-        "none" => Value::String("none".to_string()),
-        "tool" => {
-            let raw_name = obj
+) -> Result<(Value, bool, bool), String> {
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut out = serde_json::json!({
+        "model": model,
+        "messages": [],
+        "stream": stream,
+    });
+
+    if let Some(max_tokens) = body.get("max_tokens").and_then(|v| v.as_i64()) {
+        out["max_tokens"] = serde_json::json!(max_tokens);
+    }
+    if let Some(temperature) = body.get("temperature").and_then(|v| v.as_f64()) {
+        out["temperature"] = serde_json::json!(temperature);
+    } else if let Some(top_p) = body.get("top_p").and_then(|v| v.as_f64()) {
+        out["top_p"] = serde_json::json!(top_p);
+    }
+    if let Some(stop_sequences) = body.get("stop_sequences") {
+        if let Some(arr) = stop_sequences.as_array() {
+            let stops: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            match stops.as_slice() {
+                [single] => out["stop"] = serde_json::json!(single),
+                [] => {}
+                _ => out["stop"] = serde_json::json!(stops),
+            }
+        }
+    }
+
+    let mut parallel_tool_calls = true;
+    if let Some(tool_choice) = body.get("tool_choice") {
+        let disable_parallel = tool_choice
+            .get("disable_parallel_tool_use")
+            .and_then(|v| v.as_bool());
+        if disable_parallel == Some(true) {
+            parallel_tool_calls = false;
+        }
+        match tool_choice.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "auto" => out["tool_choice"] = serde_json::json!("auto"),
+            "any" => out["tool_choice"] = serde_json::json!("required"),
+            "none" => out["tool_choice"] = serde_json::json!("none"),
+            "tool" => {
+                if let Some(raw_name) = tool_choice
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.trim())
+                    .filter(|v| !v.is_empty())
+                {
+                    let mapped_name = short_map
+                        .get(raw_name)
+                        .cloned()
+                        .unwrap_or_else(|| shorten_name_if_needed(raw_name));
+                    out["tool_choice"] = serde_json::json!({
+                        "type": "function",
+                        "function": { "name": mapped_name },
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(thinking) = body.get("thinking") {
+        if let Some(t_type) = thinking.get("type").and_then(|v| v.as_str()) {
+            let effort = match t_type {
+                "enabled" => thinking
+                    .get("budget_tokens")
+                    .and_then(|v| v.as_i64())
+                    .and_then(convert_budget_to_effort)
+                    .unwrap_or("auto"),
+                "adaptive" => "xhigh",
+                "disabled" => "none",
+                _ => "medium",
+            };
+            let normalized = if effort == "xhigh" { "high" } else { effort };
+            out["reasoning_effort"] = serde_json::json!(normalized);
+        }
+    }
+
+    if let Some(system) = body.get("system") {
+        let system_parts = anthropic_compacted_system_parts(system);
+        if !system_parts.is_empty() {
+            let content: Vec<Value> = system_parts
+                .into_iter()
+                .map(|text| serde_json::json!({ "type": "text", "text": text }))
+                .collect();
+            if let Some(messages) = out.get_mut("messages").and_then(|v| v.as_array_mut()) {
+                messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": content,
+                }));
+            }
+        }
+    }
+
+    if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
+        for message in messages {
+            let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let content_value = message.get("content").unwrap_or(&Value::Null);
+            match content_value {
+                Value::Array(parts) => {
+                    let mut content_items: Vec<Value> = Vec::new();
+                    let mut tool_calls: Vec<Value> = Vec::new();
+                    let mut tool_results: Vec<Value> = Vec::new();
+                    let mut reasoning_parts: Vec<String> = Vec::new();
+
+                    for part in parts {
+                        match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                            "thinking" => {
+                                if role == "assistant" {
+                                    if let Some(thinking_text) = anthropic_thinking_text(part) {
+                                        reasoning_parts.push(thinking_text);
+                                    }
+                                }
+                            }
+                            "redacted_thinking" => {}
+                            "text" | "image" => {
+                                if let Some(content_item) =
+                                    convert_anthropic_part_to_openai_chat_content(part, role)
+                                {
+                                    content_items.push(content_item);
+                                }
+                            }
+                            "tool_use" => {
+                                if role != "assistant" {
+                                    continue;
+                                }
+                                let id = part
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let raw_name = part
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string();
+                                if id.is_empty() || raw_name.is_empty() {
+                                    continue;
+                                }
+                                let mapped_name = short_map
+                                    .get(&raw_name)
+                                    .cloned()
+                                    .unwrap_or_else(|| shorten_name_if_needed(&raw_name));
+                                let raw_arguments = if let Some(input) = part.get("input") {
+                                    if input.is_null() {
+                                        "{}".to_string()
+                                    } else {
+                                        serde_json::to_string(input)
+                                            .unwrap_or_else(|_| "{}".to_string())
+                                    }
+                                } else {
+                                    "{}".to_string()
+                                };
+                                let arguments = normalize_tool_arguments_for_tool(
+                                    Some(&mapped_name),
+                                    &raw_arguments,
+                                )
+                                .unwrap_or(raw_arguments);
+                                tool_calls.push(serde_json::json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": mapped_name,
+                                        "arguments": arguments,
+                                    }
+                                }));
+                            }
+                            "tool_result" => {
+                                let tool_use_id = part
+                                    .get("tool_use_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if tool_use_id.is_empty() {
+                                    continue;
+                                }
+                                let output = compact_anthropic_tool_result_content(
+                                    &anthropic_tool_result_content(
+                                        part.get("content").unwrap_or(&Value::Null),
+                                    ),
+                                );
+                                tool_results.push(serde_json::json!({
+                                    "role": "tool",
+                                    "tool_call_id": tool_use_id,
+                                    "content": output,
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if let Some(out_messages) = out.get_mut("messages").and_then(|v| v.as_array_mut())
+                    {
+                        for tool_result in tool_results {
+                            out_messages.push(tool_result);
+                        }
+
+                        if role == "assistant" {
+                            let has_content = !content_items.is_empty();
+                            let has_reasoning = !reasoning_parts.is_empty();
+                            let has_tool_calls = !tool_calls.is_empty();
+                            if has_content || has_reasoning || has_tool_calls {
+                                let mut assistant_message = serde_json::json!({
+                                    "role": "assistant",
+                                    "content": Value::Array(content_items),
+                                });
+                                if !has_content {
+                                    assistant_message["content"] = Value::String(String::new());
+                                }
+                                if has_reasoning {
+                                    assistant_message["reasoning_content"] = serde_json::json!(
+                                        reasoning_parts.join("\n\n")
+                                    );
+                                }
+                                if has_tool_calls {
+                                    assistant_message["tool_calls"] = Value::Array(tool_calls);
+                                }
+                                out_messages.push(assistant_message);
+                            }
+                        } else if !content_items.is_empty() {
+                            out_messages.push(serde_json::json!({
+                                "role": role,
+                                "content": Value::Array(content_items),
+                            }));
+                        }
+                    }
+                }
+                Value::String(text) => {
+                    let normalized = compact_anthropic_text_content(text);
+                    if normalized.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(out_messages) = out.get_mut("messages").and_then(|v| v.as_array_mut())
+                    {
+                        out_messages.push(serde_json::json!({
+                            "role": role,
+                            "content": normalized,
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut has_tools = false;
+    if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
+        let mut out_tools = Vec::new();
+        for tool in tools {
+            if tool.get("type").and_then(|v| v.as_str()) == Some("web_search_20250305") {
+                out_tools.push(serde_json::json!({ "type": "web_search" }));
+                continue;
+            }
+            let mut name = tool
                 .get("name")
                 .and_then(|v| v.as_str())
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())?;
-            let mapped_name = short_map
-                .get(raw_name)
-                .cloned()
-                .unwrap_or_else(|| shorten_name_if_needed(raw_name));
-            serde_json::json!({
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(short) = short_map.get(&name) {
+                name = short.clone();
+            } else {
+                name = shorten_name_if_needed(&name);
+            }
+            let description = tool
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let parameters =
+                normalize_tool_parameters(tool.get("input_schema").unwrap_or(&Value::Null));
+            out_tools.push(serde_json::json!({
                 "type": "function",
-                "name": mapped_name,
-            })
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                }
+            }));
         }
-        _ => return None,
-    };
-    Some((choice, disable_parallel))
+        if !out_tools.is_empty() {
+            has_tools = true;
+            out["tools"] = Value::Array(out_tools);
+        }
+    }
+    if has_tools {
+        out["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
+        if out.get("tool_choice").is_none() {
+            out["tool_choice"] = serde_json::json!("auto");
+        }
+    }
+    if stream {
+        out["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
+
+    Ok((out, stream, has_tools))
+}
+
+fn convert_openai_chat_request_to_responses(
+    chat_request: &Value,
+) -> Result<(Value, bool), String> {
+    let model = chat_request
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if model.is_empty() {
+        return Err("未配置模型。请在代理设置中填写模型名称，例如 glm-5。".to_string());
+    }
+
+    // Codex upstream expects responses requests to stream. Non-stream callers are
+    // handled by aggregating the upstream SSE response locally.
+    let stream = true;
+    let mut out = serde_json::json!({
+        "model": model,
+        "instructions": "",
+        "input": [],
+        "stream": stream,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "parallel_tool_calls": true,
+    });
+
+    if let Some(messages) = chat_request.get("messages").and_then(|v| v.as_array()) {
+        for message in messages {
+            let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            match role {
+                "tool" => {
+                    let call_id = message
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if call_id.is_empty() {
+                        continue;
+                    }
+                    let output = message
+                        .get("content")
+                        .map(|v| {
+                            if let Some(text) = v.as_str() {
+                                text.to_string()
+                            } else {
+                                serde_json::to_string(v).unwrap_or_default()
+                            }
+                        })
+                        .unwrap_or_default();
+                    if let Some(input) = out.get_mut("input").and_then(|v| v.as_array_mut()) {
+                        input.push(serde_json::json!({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": output,
+                        }));
+                    }
+                }
+                "assistant" => {
+                    let mut content_parts = Vec::new();
+                    match message.get("content") {
+                        Some(Value::String(text)) => {
+                            if !text.trim().is_empty() {
+                                content_parts.push(serde_json::json!({
+                                    "type": "output_text",
+                                    "text": text,
+                                }));
+                            }
+                        }
+                        Some(Value::Array(items)) => {
+                            for item in items {
+                                match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                                    "text" => {
+                                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                            if !text.trim().is_empty() {
+                                                content_parts.push(serde_json::json!({
+                                                    "type": "output_text",
+                                                    "text": text,
+                                                }));
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    if !content_parts.is_empty() {
+                        if let Some(input) = out.get_mut("input").and_then(|v| v.as_array_mut()) {
+                            input.push(serde_json::json!({
+                                "type": "message",
+                                "role": "assistant",
+                                "content": content_parts,
+                            }));
+                        }
+                    }
+                    if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
+                        if let Some(input) = out.get_mut("input").and_then(|v| v.as_array_mut()) {
+                            for tool_call in tool_calls {
+                                let call_id = tool_call
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let name = tool_call
+                                    .get("function")
+                                    .and_then(|v| v.get("name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if call_id.is_empty() || name.is_empty() {
+                                    continue;
+                                }
+                                let arguments = tool_call
+                                    .get("function")
+                                    .and_then(|v| v.get("arguments"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("{}");
+                                input.push(serde_json::json!({
+                                    "type": "function_call",
+                                    "call_id": call_id,
+                                    "name": name,
+                                    "arguments": arguments,
+                                }));
+                            }
+                        }
+                    }
+                }
+                "system" | "user" => {
+                    let responses_role = if role == "system" { "developer" } else { role };
+                    let mut content_parts = Vec::new();
+                    match message.get("content") {
+                        Some(Value::String(text)) => {
+                            if !text.trim().is_empty() {
+                                content_parts.push(serde_json::json!({
+                                    "type": "input_text",
+                                    "text": text,
+                                }));
+                            }
+                        }
+                        Some(Value::Array(items)) => {
+                            for item in items {
+                                match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                                    "text" => {
+                                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                            if !text.trim().is_empty() {
+                                                content_parts.push(serde_json::json!({
+                                                    "type": "input_text",
+                                                    "text": text,
+                                                }));
+                                            }
+                                        }
+                                    }
+                                    "image_url" => {
+                                        if let Some(url) = item
+                                            .get("image_url")
+                                            .and_then(|v| v.get("url"))
+                                            .and_then(|v| v.as_str())
+                                        {
+                                            content_parts.push(serde_json::json!({
+                                                "type": "input_image",
+                                                "image_url": url,
+                                            }));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    if !content_parts.is_empty() {
+                        if let Some(input) = out.get_mut("input").and_then(|v| v.as_array_mut()) {
+                            input.push(serde_json::json!({
+                                "type": "message",
+                                "role": responses_role,
+                                "content": content_parts,
+                            }));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(tools) = chat_request.get("tools").and_then(|v| v.as_array()) {
+        let mut responses_tools = Vec::new();
+        for tool in tools {
+            if tool.get("type").and_then(|v| v.as_str()) == Some("web_search") {
+                responses_tools.push(serde_json::json!({ "type": "web_search" }));
+                continue;
+            }
+            let function = tool.get("function").unwrap_or(&Value::Null);
+            let name = function.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let description = function
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let parameters =
+                normalize_tool_parameters(function.get("parameters").unwrap_or(&Value::Null));
+            responses_tools.push(serde_json::json!({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+                "strict": false,
+            }));
+        }
+        if !responses_tools.is_empty() {
+            out["tools"] = Value::Array(responses_tools);
+        }
+    }
+    if let Some(tool_choice) = chat_request.get("tool_choice") {
+        match tool_choice {
+            Value::String(s) => out["tool_choice"] = Value::String(s.clone()),
+            Value::Object(obj) => {
+                let choice_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if choice_type == "function" {
+                    let name = obj
+                        .get("function")
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .or_else(|| obj.get("name").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    if !name.is_empty() {
+                        out["tool_choice"] = serde_json::json!({
+                            "type": "function",
+                            "name": name,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(effort) = chat_request
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .and_then(normalize_reasoning_effort)
+    {
+        out["reasoning"] = serde_json::json!({
+            "effort": effort,
+            "summary": "auto",
+        });
+    }
+
+    Ok((out, stream))
 }
 
 fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, String>, bool), String> {
@@ -2310,12 +3009,6 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
             model = trimmed.to_string();
         }
     }
-    let mut template = serde_json::json!({
-        "model": model,
-        "instructions": "",
-        "input": [],
-    });
-
     let reverse_map = build_reverse_tool_map(body);
     let mut short_map = HashMap::new();
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
@@ -2329,296 +3022,42 @@ fn convert_claude_to_codex(body: &Value) -> Result<(Value, HashMap<String, Strin
         }
         short_map = build_short_name_map(&names);
     }
-
-    let mut system_parts = if let Some(system) = body.get("system") {
-        anthropic_system_parts(system)
-    } else {
-        Vec::new()
-    };
-    if system_parts.first().map(|s| s.as_str()) != Some(CLAUDE_CODE_SYSTEM_PROMPT) {
-        system_parts.insert(0, CLAUDE_CODE_SYSTEM_PROMPT.to_string());
-    }
-    {
-        let mut seen_system_parts = HashSet::new();
-        system_parts.retain(|part| seen_system_parts.insert(part.clone()));
-    }
-    if !system_parts.is_empty() {
-        let mut msg = serde_json::json!({
-            "type": "message",
-            "role": "developer",
-            "content": []
+    let (mut chat_request, stream, _has_tools) =
+        build_openai_chat_request_from_claude(body, &model, &short_map)?;
+    if let Some(messages) = chat_request.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        let already_present = messages.iter().any(|message| {
+            message.get("role").and_then(|v| v.as_str()) == Some("system")
+                && response_message_text(message.get("content").unwrap_or(&Value::Null))
+                    .contains(CLAUDE_CODE_SYSTEM_PROMPT)
         });
-        let mut content = Vec::new();
-        for part in system_parts {
-            content.push(serde_json::json!({
-                "type": "input_text",
-                "text": part
-            }));
-        }
-        msg["content"] = Value::Array(content);
-        template["input"].as_array_mut().unwrap().push(msg);
-    }
-
-    if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
-        let mut seen_reminder_fingerprints: HashSet<String> = HashSet::new();
-        let mut seen_tool_output_fingerprints: HashSet<String> = HashSet::new();
-        for msg in messages {
-            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-            let mut message = serde_json::json!({
-                "type": "message",
-                "role": role,
-                "content": []
-            });
-            let mut has_content = false;
-
-            let mut flush_message =
-                |template: &mut Value, message: &mut Value, has_content: &mut bool| {
-                    if *has_content {
-                        if let Some(arr) = template["input"].as_array_mut() {
-                            arr.push(message.clone());
-                        }
-                        message["content"] = Value::Array(vec![]);
-                        *has_content = false;
-                    }
-                };
-
-            let mut append_text = |text: &str, message: &mut Value, has_content: &mut bool| {
-                let normalized_text = compact_anthropic_text_content(text);
-                if normalized_text.is_empty() {
-                    return;
-                }
-                if normalized_text.contains("<system-reminder>") {
-                    let fingerprint = text_fingerprint(&normalized_text);
-                    if !seen_reminder_fingerprints.insert(fingerprint) {
-                        return;
-                    }
-                }
-                let part_type = if role == "assistant" {
-                    "output_text"
-                } else {
-                    "input_text"
-                };
-                if let Some(arr) = message["content"].as_array_mut() {
-                    arr.push(serde_json::json!({ "type": part_type, "text": normalized_text }));
-                }
-                *has_content = true;
-            };
-
-            let mut append_image = |url: &str, message: &mut Value, has_content: &mut bool| {
-                if let Some(arr) = message["content"].as_array_mut() {
-                    arr.push(serde_json::json!({ "type": "input_image", "image_url": url }));
-                }
-                *has_content = true;
-            };
-
-            let content_value = msg.get("content").unwrap_or(&Value::Null);
-            match content_value {
-                Value::Array(items) => {
-                    for item in items {
-                        let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        match kind {
-                            "text" => {
-                                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                                    if !text.is_empty() {
-                                        append_text(text, &mut message, &mut has_content);
-                                    }
-                                }
-                            }
-                            "image" => {
-                                if let Some(url) = anthropic_image_url(item) {
-                                    append_image(&url, &mut message, &mut has_content);
-                                }
-                            }
-                            "tool_use" => {
-                                let id = item
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let name_raw = item
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                if id.is_empty() || name_raw.is_empty() {
-                                    continue;
-                                }
-                                flush_message(&mut template, &mut message, &mut has_content);
-                                let mut name = name_raw;
-                                if let Some(short) = short_map.get(&name) {
-                                    name = short.clone();
-                                } else {
-                                    name = shorten_name_if_needed(&name);
-                                }
-                                let input = item.get("input").cloned().unwrap_or(Value::Null);
-                                let args_string = if input.is_null() {
-                                    "{}".to_string()
-                                } else {
-                                    serde_json::to_string(&input)
-                                        .unwrap_or_else(|_| "{}".to_string())
-                                };
-                                let mut fn_call = serde_json::json!({
-                                    "type": "function_call",
-                                    "call_id": id,
-                                    "name": name,
-                                    "arguments": args_string,
-                                });
-                                if let Some(arr) = template["input"].as_array_mut() {
-                                    arr.push(fn_call.take());
-                                }
-                            }
-                            "tool_result" => {
-                                let tool_use_id = item
-                                    .get("tool_use_id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                if tool_use_id.is_empty() {
-                                    continue;
-                                }
-                                flush_message(&mut template, &mut message, &mut has_content);
-                                let content = item.get("content").unwrap_or(&Value::Null);
-                                let mut output_string =
-                                    compact_anthropic_tool_result_content(&anthropic_tool_result_content(content));
-                                if output_string.is_empty() {
-                                    continue;
-                                }
-                                if output_string.len() > 512 {
-                                    let fingerprint = text_fingerprint(&output_string);
-                                    if !seen_tool_output_fingerprints.insert(fingerprint) {
-                                        output_string = format!(
-                                            "[duplicate tool output omitted; identical content already provided, original size {} chars]",
-                                            output_string.len()
-                                        );
-                                    }
-                                }
-                                let mut fn_out = serde_json::json!({
-                                    "type": "function_call_output",
-                                    "call_id": tool_use_id,
-                                    "output": output_string,
-                                });
-                                if let Some(arr) = template["input"].as_array_mut() {
-                                    arr.push(fn_out.take());
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    flush_message(&mut template, &mut message, &mut has_content);
-                }
-                Value::String(text) => {
-                    if !text.is_empty() {
-                        append_text(text, &mut message, &mut has_content);
-                    }
-                    flush_message(&mut template, &mut message, &mut has_content);
-                }
-                _ => {
-                    flush_message(&mut template, &mut message, &mut has_content);
-                }
-            }
+        if !already_present {
+            messages.insert(
+                0,
+                serde_json::json!({
+                    "role": "system",
+                    "content": CLAUDE_CODE_SYSTEM_PROMPT,
+                }),
+            );
         }
     }
 
-    let mut parallel_tool_calls = true;
-    if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
-        let mut out_tools: Vec<Value> = Vec::new();
-        for tool in tools {
-            if tool.get("type").and_then(|v| v.as_str()) == Some("web_search_20250305") {
-                out_tools.push(serde_json::json!({ "type": "web_search" }));
-                continue;
-            }
-            let mut name = tool
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if let Some(short) = short_map.get(&name) {
-                name = short.clone();
-            } else if !name.is_empty() {
-                name = shorten_name_if_needed(&name);
-            }
-            let desc = tool
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let params =
-                normalize_tool_parameters(tool.get("input_schema").unwrap_or(&Value::Null));
-            let mut entry = serde_json::json!({
-                "type": "function",
-                "name": name,
-                "description": desc,
-                "parameters": params,
-                "strict": false
-            });
-            if let Some(obj) = entry.as_object_mut() {
-                if let Some(params_obj) = obj.get_mut("parameters").and_then(|v| v.as_object_mut())
-                {
-                    params_obj.remove("$schema");
-                }
-            }
-            out_tools.push(entry);
-        }
-        if !out_tools.is_empty() {
-            template["tools"] = Value::Array(out_tools);
-            template["tool_choice"] = serde_json::json!("auto");
-        }
-    }
-
-    if let Some(tool_choice) = body.get("tool_choice") {
-        if let Some((choice, disable_parallel)) =
-            convert_claude_tool_choice(tool_choice, &short_map)
-        {
-            template["tool_choice"] = choice;
-            if disable_parallel == Some(true) {
-                parallel_tool_calls = false;
-            }
-        }
-    }
-
-    template["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
-
-    let mut reasoning_effort = "medium".to_string();
-    if let Some(thinking) = body.get("thinking") {
-        if let Some(t_type) = thinking.get("type").and_then(|v| v.as_str()) {
-            match t_type {
-                "enabled" => {
-                    if let Some(budget) = thinking.get("budget_tokens").and_then(|v| v.as_i64()) {
-                        if let Some(level) = convert_budget_to_effort(budget) {
-                            reasoning_effort = level.to_string();
-                        }
-                    }
-                }
-                "adaptive" => reasoning_effort = "xhigh".to_string(),
-                "disabled" => reasoning_effort = "none".to_string(),
-                _ => {}
-            }
-        }
-    }
+    let (mut template, _) = convert_openai_chat_request_to_responses(&chat_request)?;
     if let Some(override_effort) = cfg.reasoning_effort_override.as_ref() {
         if let Some(normalized) = normalize_reasoning_effort(override_effort) {
-            reasoning_effort = normalized;
+            let model_lc = model.to_lowercase();
+            let mut effort = normalized;
+            if effort == "minimal" {
+                effort = "low".to_string();
+            }
+            if effort == "xhigh" && model_lc.starts_with("gpt-5.1") {
+                effort = "high".to_string();
+            }
+            template["reasoning"] = serde_json::json!({
+                "effort": effort,
+                "summary": "auto"
+            });
         }
     }
-    let model_lc = model.to_lowercase();
-    if reasoning_effort == "minimal" {
-        reasoning_effort = "low".to_string();
-    }
-    if reasoning_effort == "xhigh" && model_lc.starts_with("gpt-5.1") {
-        reasoning_effort = "high".to_string();
-    }
-    template["reasoning"] = serde_json::json!({
-        "effort": reasoning_effort,
-        "summary": "auto"
-    });
-
-    let stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    template["stream"] = serde_json::json!(stream);
-    template["store"] = serde_json::json!(false);
-    template["include"] = serde_json::json!(["reasoning.encrypted_content"]);
 
     Ok((template, reverse_map, stream))
 }
@@ -2973,6 +3412,307 @@ fn repair_tool_arguments_json(args: &str) -> Option<String> {
     .or_else(|| parse_tagged_tool_arguments(trimmed))
 }
 
+fn rewrite_compact_count_flag(command: &str, program: &str) -> String {
+    let bytes = command.as_bytes();
+    let mut out = String::with_capacity(command.len() + 8);
+    let mut idx = 0;
+
+    while idx < bytes.len() {
+        if command[idx..].starts_with(program) {
+            let prev_ok = idx == 0
+                || matches!(
+                    bytes[idx - 1],
+                    b' ' | b'\t' | b'\n' | b'|' | b';' | b'(' | b'&'
+                );
+            let dash_idx = idx + program.len();
+            if prev_ok && dash_idx < bytes.len() && bytes[dash_idx] == b'-' {
+                let mut digit_idx = dash_idx + 1;
+                while digit_idx < bytes.len() && bytes[digit_idx].is_ascii_digit() {
+                    digit_idx += 1;
+                }
+                let next_ok = digit_idx > dash_idx + 1
+                    && (digit_idx == bytes.len()
+                        || matches!(
+                            bytes[digit_idx],
+                            b' ' | b'\t' | b'\n' | b'|' | b';' | b')' | b'&'
+                        ));
+                if next_ok {
+                    out.push_str(program);
+                    out.push_str(" -n ");
+                    out.push_str(&command[dash_idx + 1..digit_idx]);
+                    idx = digit_idx;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[idx] as char);
+        idx += 1;
+    }
+
+    out
+}
+
+fn collapse_plain_whitespace(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut prev_space = false;
+    for ch in command.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn rewrite_shell_operator_spacing(command: &str) -> String {
+    let mut out = String::with_capacity(command.len() + 8);
+    let chars: Vec<char> = command.chars().collect();
+    let mut idx = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while idx < chars.len() {
+        let ch = chars[idx];
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                out.push(ch);
+                idx += 1;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                out.push(ch);
+                idx += 1;
+            }
+            '&' if !in_single && !in_double && idx + 1 < chars.len() && chars[idx + 1] == '&' => {
+                out.push(' ');
+                out.push('&');
+                out.push('&');
+                out.push(' ');
+                idx += 2;
+            }
+            '|' if !in_single && !in_double && idx + 1 < chars.len() && chars[idx + 1] == '|' => {
+                out.push(' ');
+                out.push('|');
+                out.push('|');
+                out.push(' ');
+                idx += 2;
+            }
+            '|' if !in_single && !in_double => {
+                out.push(' ');
+                out.push('|');
+                out.push(' ');
+                idx += 1;
+            }
+            ';' if !in_single && !in_double => {
+                out.push(' ');
+                out.push(';');
+                out.push(' ');
+                idx += 1;
+            }
+            _ => {
+                out.push(ch);
+                idx += 1;
+            }
+        }
+    }
+
+    out
+}
+
+fn rewrite_compact_mkdir(command: &str) -> String {
+    let bytes = command.as_bytes();
+    let mut out = String::with_capacity(command.len() + 8);
+    let mut idx = 0;
+
+    while idx < bytes.len() {
+        if command[idx..].starts_with("mkdir-p") {
+            out.push_str("mkdir -p");
+            let next = idx + "mkdir-p".len();
+            if next < bytes.len() && !bytes[next].is_ascii_whitespace() {
+                out.push(' ');
+            }
+            idx = next;
+            continue;
+        }
+
+        if command[idx..].starts_with("mkdir -p") {
+            out.push_str("mkdir -p");
+            let next = idx + "mkdir -p".len();
+            if next < bytes.len() && !bytes[next].is_ascii_whitespace() {
+                out.push(' ');
+            }
+            idx = next;
+            continue;
+        }
+
+        out.push(bytes[idx] as char);
+        idx += 1;
+    }
+
+    out
+}
+
+fn split_repeated_path_roots_in_token(token: &str) -> String {
+    let Some(first_slash) = token.find('/') else {
+        return token.to_string();
+    };
+    let prefix = &token[..=first_slash];
+    if prefix.len() < 3 {
+        return token.to_string();
+    }
+
+    let mut out = String::with_capacity(token.len() + 8);
+    let mut cursor = 0;
+    let mut changed = false;
+    while let Some(rel_pos) = token[cursor + 1..].find(prefix) {
+        let absolute = cursor + 1 + rel_pos;
+        out.push_str(&token[cursor..absolute]);
+        out.push(' ');
+        cursor = absolute;
+        changed = true;
+    }
+    if !changed {
+        return token.to_string();
+    }
+    out.push_str(&token[cursor..]);
+    out
+}
+
+fn rewrite_unquoted_tokens(command: &str, mut f: impl FnMut(&str) -> String) -> String {
+    let mut out = String::with_capacity(command.len() + 8);
+    let mut token = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    for ch in command.chars() {
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                token.push(ch);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                token.push(ch);
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !token.is_empty() {
+                    out.push_str(&f(&token));
+                    token.clear();
+                }
+                out.push(c);
+            }
+            _ => token.push(ch),
+        }
+    }
+
+    if !token.is_empty() {
+        out.push_str(&f(&token));
+    }
+    out
+}
+
+fn repair_exec_command_shell(command: &str) -> String {
+    let mut repaired = command.trim().to_string();
+    if repaired.is_empty() {
+        return repaired;
+    }
+
+    let replacements = [
+        ("find .-type", "find . -type"),
+        ("find .-name", "find . -name"),
+        ("-typef-name", "-type f -name "),
+        ("-typef -name", "-type f -name "),
+        (" -name\"", " -name \""),
+        (" -name'", " -name '"),
+        (" --files-g", " --files -g "),
+        ("--files-g", "--files -g "),
+        ("|head", "| head"),
+        ("|tail", "| tail"),
+        ("|sed", "| sed"),
+        ("|grep", "| grep"),
+        ("|rg", "| rg"),
+        ("|awk", "| awk"),
+        ("|sort", "| sort"),
+        ("head -", "head -"),
+        ("tail -", "tail -"),
+    ];
+    for (from, to) in replacements {
+        repaired = repaired.replace(from, to);
+    }
+
+    repaired = rewrite_shell_operator_spacing(&repaired);
+    repaired = rewrite_compact_mkdir(&repaired);
+    repaired = rewrite_compact_count_flag(&repaired, "head");
+    repaired = rewrite_compact_count_flag(&repaired, "tail");
+    repaired = rewrite_unquoted_tokens(&repaired, split_repeated_path_roots_in_token);
+    repaired = collapse_plain_whitespace(&repaired);
+    repaired
+}
+
+fn command_writes_file_contents(command: &str) -> bool {
+    let normalized = command.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized.contains("[proxy] exec_command file writes are blocked") {
+        return false;
+    }
+    if normalized.contains("<<") {
+        return true;
+    }
+    if normalized.contains("cat >") || normalized.contains("cat>>") {
+        return true;
+    }
+    if normalized.contains("| tee ") || normalized.starts_with("tee ") || normalized.contains(" tee ")
+    {
+        return true;
+    }
+    if normalized.contains("echo ") && (normalized.contains(">>") || normalized.contains(" >")) {
+        return true;
+    }
+    if normalized.contains("printf ") && (normalized.contains(">>") || normalized.contains(" >")) {
+        return true;
+    }
+    false
+}
+
+fn normalize_tool_arguments_for_tool(tool_name: Option<&str>, args: &str) -> Option<String> {
+    let repaired = repair_tool_arguments_json(args)?;
+    let Some(tool_name) = tool_name.map(|v| v.trim()).filter(|v| !v.is_empty()) else {
+        return Some(repaired);
+    };
+
+    if !tool_name.eq_ignore_ascii_case("exec_command") {
+        return Some(repaired);
+    }
+
+    let mut value: Value = serde_json::from_str(&repaired).ok()?;
+    let mut changed = false;
+    if let Some(obj) = value.as_object_mut() {
+        for key in ["cmd", "command"] {
+            if let Some(cmd) = obj.get_mut(key).and_then(|v| v.as_str()) {
+                let mut normalized = repair_exec_command_shell(cmd);
+                if command_writes_file_contents(&normalized) {
+                    normalized = GLM_BLOCKED_FILE_WRITE_COMMAND.to_string();
+                }
+                if normalized != cmd {
+                    *obj.get_mut(key).unwrap() = Value::String(normalized);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if changed {
+        serde_json::to_string(&value).ok()
+    } else {
+        Some(repaired)
+    }
+}
+
 fn parse_tool_arguments_json(args: &str) -> Result<Value, String> {
     let repaired = repair_tool_arguments_json(args).ok_or_else(|| {
         format!(
@@ -2988,6 +3728,415 @@ fn parse_tool_arguments_json(args: &str) -> Result<Value, String> {
     })
 }
 
+#[cfg(test)]
+mod tool_argument_normalization_tests {
+    use super::*;
+
+    fn drain_claude_pending(state: &mut CodexToClaudeStreamState) -> String {
+        let mut out = String::new();
+        while let Some(bytes) = state.pending.pop_front() {
+            out.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        out
+    }
+
+    fn new_codex_to_claude_test_state() -> CodexToClaudeStreamState {
+        CodexToClaudeStreamState {
+            buffer: String::new(),
+            pending: std::collections::VecDeque::new(),
+            has_tool_call: false,
+            next_block_index: 0,
+            text_block_index: None,
+            thinking_block_index: None,
+            tool_block_indexes: HashMap::new(),
+            tool_arguments: HashMap::new(),
+            tool_names: HashMap::new(),
+            reverse_tool_map: HashMap::new(),
+            usage_input: None,
+            usage_output: None,
+            cached_tokens: None,
+            finish_reason: None,
+            message_started: false,
+            message_delta_sent: false,
+            message_stop_sent: false,
+            done: false,
+            captured: String::new(),
+            log_entry: None,
+        }
+    }
+
+    #[test]
+    fn normalizes_find_compaction_for_exec_command() {
+        let normalized = normalize_tool_arguments_for_tool(
+            Some("exec_command"),
+            r#"{"cmd":"find . -typef-name\"*.ts\" | head-50"}"#,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(
+            value.get("cmd").and_then(|v| v.as_str()),
+            Some(r#"find . -type f -name "*.ts" | head -n 50"#)
+        );
+    }
+
+    #[test]
+    fn normalizes_rg_compaction_for_exec_command() {
+        let normalized = normalize_tool_arguments_for_tool(
+            Some("exec_command"),
+            r#"{"cmd":"rg --files-g\"*.ts\"| head-50"}"#,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(
+            value.get("cmd").and_then(|v| v.as_str()),
+            Some(r#"rg --files -g "*.ts" | head -n 50"#)
+        );
+    }
+
+    #[test]
+    fn leaves_other_tools_untouched() {
+        let original = r#"{"patch":"*** Begin Patch\n*** End Patch\n"}"#;
+        let normalized = normalize_tool_arguments_for_tool(Some("apply_patch"), original).unwrap();
+        assert_eq!(normalized, original);
+    }
+
+    #[test]
+    fn normalizes_compact_mkdir_arguments() {
+        let normalized = normalize_tool_arguments_for_tool(
+            Some("exec_command"),
+            r#"{"cmd":"mkdir -pgo-opencode/cmd/opencode&&mkdir-pgo-opencode/internal/agent"}"#,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(
+            value.get("cmd").and_then(|v| v.as_str()),
+            Some("mkdir -p go-opencode/cmd/opencode && mkdir -p go-opencode/internal/agent")
+        );
+    }
+
+    #[test]
+    fn splits_repeated_path_roots_in_mkdir_payload() {
+        let normalized = normalize_tool_arguments_for_tool(
+            Some("exec_command"),
+            r#"{"cmd":"mkdir -pgo-opencode/internal/agentgo-opencode/internal/cli go-opencode/internal/toolgo-opencode/internal/util"}"#,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(
+            value.get("cmd").and_then(|v| v.as_str()),
+            Some(
+                "mkdir -p go-opencode/internal/agent go-opencode/internal/cli go-opencode/internal/tool go-opencode/internal/util"
+            )
+        );
+    }
+
+    #[test]
+    fn blocks_heredoc_file_writes_for_exec_command() {
+        let normalized = normalize_tool_arguments_for_tool(
+            Some("exec_command"),
+            r#"{"cmd":"cat > go-opencode/go.mod << 'EOF' module github.com/example EOF"}"#,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(
+            value.get("cmd").and_then(|v| v.as_str()),
+            Some(GLM_BLOCKED_FILE_WRITE_COMMAND)
+        );
+    }
+
+    #[test]
+    fn blocks_printf_redirection_file_writes_for_exec_command() {
+        let normalized = normalize_tool_arguments_for_tool(
+            Some("exec_command"),
+            r#"{"cmd":"printf '%s\n' 'module github.com/example' > go.mod"}"#,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(
+            value.get("cmd").and_then(|v| v.as_str()),
+            Some(GLM_BLOCKED_FILE_WRITE_COMMAND)
+        );
+    }
+
+    #[test]
+    fn compacts_claude_md_system_reminder() {
+        let input = "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\nContents of /Users/test/.claude/rules/coding-style.md (user rules)\n\n# Coding Style\n...\nContents of /Users/test/.claude/rules/testing.md (user rules)\n\n# Testing Requirements\n...\n</system-reminder>";
+        let compacted = compact_anthropic_text_content(input);
+        assert!(compacted.contains("Claude global rules omitted for context efficiency"));
+        assert!(compacted.contains("coding-style.md"));
+        assert!(compacted.contains("testing.md"));
+    }
+
+    #[test]
+    fn compacts_persisted_output_tool_result() {
+        let input = "<persisted-output>\nOutput too large (19.6KB). Full output saved to: /tmp/tool.txt\n\nPreview (first 2KB):\n0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz\n</persisted-output>";
+        let compacted = compact_anthropic_tool_result_content(input);
+        assert!(compacted.contains("Output too large (19.6KB). Full output saved to: /tmp/tool.txt"));
+        assert!(compacted.contains("</persisted-output>"));
+    }
+
+    #[test]
+    fn convert_claude_to_codex_compacts_top_level_system_context() {
+        let body = serde_json::json!({
+            "model": "gpt-5.4",
+            "system": [{
+                "type": "text",
+                "text": "# claudeMd\nContents of /Users/test/.claude/rules/coding-style.md (user rules)\n\n# Coding Style\n...\nContents of /Users/test/.claude/rules/testing.md (user rules)\n\n# Testing Requirements\n..."
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "hello"}]
+            }]
+        });
+        let (converted, _, _) = convert_claude_to_codex(&body).unwrap();
+        assert_eq!(
+            converted.get("instructions").and_then(|v| v.as_str()),
+            Some("")
+        );
+        let input = converted.get("input").and_then(|v| v.as_array()).unwrap();
+        let text = input
+            .iter()
+            .filter(|item| item.get("role").and_then(|v| v.as_str()) == Some("developer"))
+            .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
+            .flat_map(|items| items.iter())
+            .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Claude global rules omitted for context efficiency"));
+        assert!(text.contains("coding-style.md"));
+        assert!(text.contains("testing.md"));
+    }
+
+    #[test]
+    fn convert_claude_to_codex_places_tool_output_before_following_user_text() {
+        let body = serde_json::json!({
+            "model": "gpt-5.4",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "call_1", "name": "do_work", "input": {"a": 1}}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "before"},
+                        {"type": "tool_result", "tool_use_id": "call_1", "content": [{"type": "text", "text": "tool ok"}]},
+                        {"type": "text", "text": "after"}
+                    ]
+                }
+            ]
+        });
+        let (converted, _, _) = convert_claude_to_codex(&body).unwrap();
+        let input = converted.get("input").and_then(|v| v.as_array()).unwrap();
+        let function_call_idx = input
+            .iter()
+            .position(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call"))
+            .unwrap();
+        let tool_output_idx = input
+            .iter()
+            .position(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call_output"))
+            .unwrap();
+        let user_message_idx = input
+            .iter()
+            .position(|item| {
+                item.get("type").and_then(|v| v.as_str()) == Some("message")
+                    && item.get("role").and_then(|v| v.as_str()) == Some("user")
+            })
+            .unwrap();
+        assert!(function_call_idx < tool_output_idx);
+        assert!(tool_output_idx < user_message_idx);
+        let user_message = &input[user_message_idx];
+        let texts: Vec<&str> = user_message
+            .get("content")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(texts, vec!["before", "after"]);
+    }
+
+    #[test]
+    fn convert_claude_to_codex_keeps_assistant_text_together_around_tool_calls() {
+        let body = serde_json::json!({
+            "model": "gpt-5.4",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "pre"},
+                    {"type": "tool_use", "id": "call_1", "name": "do_work", "input": {"a": 1}},
+                    {"type": "text", "text": "post"}
+                ]
+            }]
+        });
+        let (converted, _, _) = convert_claude_to_codex(&body).unwrap();
+        let input = converted.get("input").and_then(|v| v.as_array()).unwrap();
+        let assistant_message_idx = input
+            .iter()
+            .position(|item| {
+                item.get("type").and_then(|v| v.as_str()) == Some("message")
+                    && item.get("role").and_then(|v| v.as_str()) == Some("assistant")
+            })
+            .unwrap();
+        let function_call_idx = input
+            .iter()
+            .position(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call"))
+            .unwrap();
+        assert!(assistant_message_idx < function_call_idx);
+        let assistant_message = &input[assistant_message_idx];
+        let texts: Vec<&str> = assistant_message
+            .get("content")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(texts, vec!["pre", "post"]);
+    }
+
+    #[test]
+    fn maps_stop_reason_stop_to_end_turn_for_non_stream_claude() {
+        let response = serde_json::json!({
+            "id": "resp_1",
+            "model": "gpt-5.4",
+            "stop_reason": "stop",
+            "usage": { "input_tokens": 10, "output_tokens": 5 },
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "hello" }]
+            }]
+        });
+        let converted =
+            convert_codex_non_stream_to_claude(&response, &HashMap::new(), "gpt-5.4").unwrap();
+        assert_eq!(
+            converted.get("stop_reason").and_then(|v| v.as_str()),
+            Some("end_turn")
+        );
+    }
+
+    #[test]
+    fn convert_openai_chat_request_to_responses_omits_token_limit_for_codex_upstream() {
+        let chat_request = serde_json::json!({
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 321,
+            "stream": false,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "parallel_tool_calls": false
+        });
+        let (converted, stream) = convert_openai_chat_request_to_responses(&chat_request).unwrap();
+        assert_eq!(stream, true);
+        assert_eq!(converted.get("stream").and_then(|v| v.as_bool()), Some(true));
+        assert!(converted.get("max_tokens").is_none());
+        assert!(converted.get("max_output_tokens").is_none());
+        assert!(converted.get("temperature").is_none());
+        assert!(converted.get("top_p").is_none());
+        assert_eq!(
+            converted.get("parallel_tool_calls").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn codex_stream_stops_thinking_before_text_block() {
+        let mut state = new_codex_to_claude_test_state();
+        codex_event_to_claude(
+            &mut state,
+            &serde_json::json!({
+                "type": "response.created",
+                "response": { "id": "resp_1", "model": "gpt-5.4" }
+            }),
+        );
+        codex_event_to_claude(
+            &mut state,
+            &serde_json::json!({
+                "type": "response.reasoning_summary_part.added"
+            }),
+        );
+        codex_event_to_claude(
+            &mut state,
+            &serde_json::json!({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "thinking"
+            }),
+        );
+        codex_event_to_claude(
+            &mut state,
+            &serde_json::json!({
+                "type": "response.content_part.added"
+            }),
+        );
+        let output = drain_claude_pending(&mut state);
+        let thinking_start = output.find("\"type\":\"thinking\"").unwrap();
+        let thinking_stop = output.find("event: content_block_stop").unwrap();
+        let text_start = output.rfind("\"type\":\"text\"").unwrap();
+        assert!(thinking_start < thinking_stop);
+        assert!(thinking_stop < text_start);
+    }
+
+    #[test]
+    fn codex_stream_emits_tool_json_on_done_and_end_turn_message_delta() {
+        let mut state = new_codex_to_claude_test_state();
+        codex_event_to_claude(
+            &mut state,
+            &serde_json::json!({
+                "type": "response.created",
+                "response": { "id": "resp_1", "model": "gpt-5.4" }
+            }),
+        );
+        codex_event_to_claude(
+            &mut state,
+            &serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read"
+                }
+            }),
+        );
+        codex_event_to_claude(
+            &mut state,
+            &serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{\"path\":\"a\"}"
+            }),
+        );
+        codex_event_to_claude(
+            &mut state,
+            &serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read"
+                }
+            }),
+        );
+        codex_event_to_claude(
+            &mut state,
+            &serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "stop_reason": "stop",
+                    "usage": { "input_tokens": 11, "output_tokens": 7 }
+                }
+            }),
+        );
+        let output = drain_claude_pending(&mut state);
+        assert!(output.contains("\"type\":\"input_json_delta\""));
+        assert!(output.contains("\\\"path\\\":\\\"a\\\""));
+        assert!(output.contains("\"stop_reason\":\"tool_use\""));
+        assert!(output.contains("event: message_stop"));
+    }
+}
+
 fn normalize_chat_completion_tool_arguments_value(root: &mut Value) -> bool {
     let mut changed = false;
     if let Some(choices) = root.get_mut("choices").and_then(|v| v.as_array_mut()) {
@@ -2998,12 +4147,19 @@ fn normalize_chat_completion_tool_arguments_value(root: &mut Value) -> bool {
                 .and_then(|v| v.as_array_mut())
             {
                 for tool_call in tool_calls {
+                    let tool_name = tool_call
+                        .get("function")
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.to_string());
                     if let Some(arguments_value) = tool_call
                         .get_mut("function")
                         .and_then(|v| v.get_mut("arguments"))
                     {
                         if let Some(arguments) = arguments_value.as_str() {
-                            if let Some(repaired) = repair_tool_arguments_json(arguments) {
+                            if let Some(repaired) =
+                                normalize_tool_arguments_for_tool(tool_name.as_deref(), arguments)
+                            {
                                 if repaired != arguments {
                                     *arguments_value = Value::String(repaired);
                                     changed = true;
@@ -3201,7 +4357,8 @@ fn parse_probe_chat_stream_tool_call(body: &str) -> (bool, String) {
                     .and_then(|v| v.get("arguments"))
                     .and_then(|v| v.as_str())
                 {
-                    let (merged, _) = merge_custom_tool_arguments(&call_args, arguments);
+                    let (merged, _) =
+                        merge_custom_tool_arguments(Some(&call_name), &call_args, arguments);
                     call_args = merged;
                 }
             }
@@ -4250,7 +5407,8 @@ fn convert_chat_completions_non_stream_to_responses(
                         .and_then(|v| v.get("arguments"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
-                    let normalized_arguments = repair_tool_arguments_json(arguments)
+                    let normalized_arguments =
+                        normalize_tool_arguments_for_tool(Some(name), arguments)
                         .unwrap_or_else(|| arguments.to_string());
                     output.push(serde_json::json!({
                         "id": format!("fc_{call_id}"),
@@ -4528,7 +5686,10 @@ fn convert_codex_non_stream_to_claude(
                     }
                     let mut input_raw = serde_json::json!({});
                     if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
-                        input_raw = parse_tool_arguments_json(args)?;
+                        let normalized_args =
+                            normalize_tool_arguments_for_tool(Some(&name), args)
+                                .unwrap_or_else(|| args.to_string());
+                        input_raw = parse_tool_arguments_json(&normalized_args)?;
                     }
                     if let Some(arr) = out["content"].as_array_mut() {
                         arr.push(serde_json::json!({
@@ -4544,15 +5705,14 @@ fn convert_codex_non_stream_to_claude(
         }
     }
 
-    if let Some(stop_reason) = response.get("stop_reason").and_then(|v| v.as_str()) {
-        if !stop_reason.is_empty() {
-            out["stop_reason"] = serde_json::json!(stop_reason);
-        }
-    } else if has_tool_call {
-        out["stop_reason"] = serde_json::json!("tool_use");
-    } else {
-        out["stop_reason"] = serde_json::json!("end_turn");
-    }
+    let mapped_stop_reason = map_codex_stop_reason_to_anthropic(
+        response
+            .get("stop_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        has_tool_call,
+    );
+    out["stop_reason"] = serde_json::json!(mapped_stop_reason);
     if let Some(stop_sequence) = response.get("stop_sequence") {
         out["stop_sequence"] = stop_sequence.clone();
     }
@@ -4631,13 +5791,20 @@ struct CodexToClaudeStreamState {
     buffer: String,
     pending: std::collections::VecDeque<Bytes>,
     has_tool_call: bool,
-    block_index: i64,
-    active_tool_block_index: Option<i64>,
-    active_tool_arguments: String,
+    next_block_index: i64,
+    text_block_index: Option<i64>,
+    thinking_block_index: Option<i64>,
+    tool_block_indexes: HashMap<i64, i64>,
+    tool_arguments: HashMap<i64, String>,
+    tool_names: HashMap<i64, String>,
     reverse_tool_map: HashMap<String, String>,
     usage_input: Option<i64>,
     usage_output: Option<i64>,
     cached_tokens: Option<i64>,
+    finish_reason: Option<String>,
+    message_started: bool,
+    message_delta_sent: bool,
+    message_stop_sent: bool,
     done: bool,
     captured: String,
     log_entry: Option<ProxyLogEntry>,
@@ -4664,144 +5831,265 @@ fn push_claude_sse(state: &mut CodexToClaudeStreamState, event: &str, payload: &
     state.pending.push_back(Bytes::from(line));
 }
 
+fn alloc_claude_block_index(state: &mut CodexToClaudeStreamState) -> i64 {
+    let idx = state.next_block_index;
+    state.next_block_index += 1;
+    idx
+}
+
+fn map_codex_stop_reason_to_anthropic(stop_reason: &str, has_tool_call: bool) -> &'static str {
+    if has_tool_call {
+        return "tool_use";
+    }
+    match stop_reason {
+        "max_tokens" | "length" => "max_tokens",
+        "tool_use" | "tool_calls" | "function_call" => "tool_use",
+        "stop" | "end_turn" | "" => "end_turn",
+        _ => "end_turn",
+    }
+}
+
+fn stop_claude_text_block(state: &mut CodexToClaudeStreamState) {
+    let Some(index) = state.text_block_index.take() else {
+        return;
+    };
+    let payload = serde_json::json!({
+        "type": "content_block_stop",
+        "index": index
+    });
+    push_claude_sse(state, "content_block_stop", &payload);
+}
+
+fn stop_claude_thinking_block(state: &mut CodexToClaudeStreamState) {
+    let Some(index) = state.thinking_block_index.take() else {
+        return;
+    };
+    let payload = serde_json::json!({
+        "type": "content_block_stop",
+        "index": index
+    });
+    push_claude_sse(state, "content_block_stop", &payload);
+}
+
+fn ensure_claude_message_started(state: &mut CodexToClaudeStreamState, event: &Value) {
+    if state.message_started {
+        return;
+    }
+    let message = serde_json::json!({
+        "type": "message_start",
+        "message": {
+            "id": event.get("response").and_then(|v| v.get("id")).and_then(|v| v.as_str()).unwrap_or(""),
+            "type": "message",
+            "role": "assistant",
+            "model": event.get("response").and_then(|v| v.get("model")).and_then(|v| v.as_str()).unwrap_or(""),
+            "stop_sequence": null,
+            "usage": { "input_tokens": 0, "output_tokens": 0 },
+            "content": [],
+            "stop_reason": null
+        }
+    });
+    push_claude_sse(state, "message_start", &message);
+    state.message_started = true;
+}
+
+fn ensure_claude_thinking_block(state: &mut CodexToClaudeStreamState) -> i64 {
+    if let Some(index) = state.thinking_block_index {
+        return index;
+    }
+    stop_claude_text_block(state);
+    let index = alloc_claude_block_index(state);
+    let payload = serde_json::json!({
+        "type": "content_block_start",
+        "index": index,
+        "content_block": { "type": "thinking", "thinking": "" }
+    });
+    push_claude_sse(state, "content_block_start", &payload);
+    state.thinking_block_index = Some(index);
+    index
+}
+
+fn ensure_claude_text_block(state: &mut CodexToClaudeStreamState) -> i64 {
+    if let Some(index) = state.text_block_index {
+        return index;
+    }
+    stop_claude_thinking_block(state);
+    let index = alloc_claude_block_index(state);
+    let payload = serde_json::json!({
+        "type": "content_block_start",
+        "index": index,
+        "content_block": { "type": "text", "text": "" }
+    });
+    push_claude_sse(state, "content_block_start", &payload);
+    state.text_block_index = Some(index);
+    index
+}
+
+fn ensure_claude_tool_block(
+    state: &mut CodexToClaudeStreamState,
+    output_index: i64,
+    item: &Value,
+) -> Option<i64> {
+    if let Some(existing) = state.tool_block_indexes.get(&output_index).copied() {
+        return Some(existing);
+    }
+    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+    let raw_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if call_id.is_empty() || raw_name.is_empty() {
+        return None;
+    }
+    let mut name = raw_name.to_string();
+    if let Some(orig) = state.reverse_tool_map.get(&name) {
+        name = orig.clone();
+    }
+    stop_claude_thinking_block(state);
+    stop_claude_text_block(state);
+    let index = alloc_claude_block_index(state);
+    let payload = serde_json::json!({
+        "type": "content_block_start",
+        "index": index,
+        "content_block": {
+            "type": "tool_use",
+            "id": call_id,
+            "name": name,
+            "input": {}
+        }
+    });
+    push_claude_sse(state, "content_block_start", &payload);
+    state.tool_block_indexes.insert(output_index, index);
+    state.tool_names.insert(output_index, name);
+    Some(index)
+}
+
+fn finalize_claude_tool_block(state: &mut CodexToClaudeStreamState, output_index: i64) {
+    let Some(block_index) = state.tool_block_indexes.remove(&output_index) else {
+        return;
+    };
+    let arguments = state.tool_arguments.remove(&output_index).unwrap_or_default();
+    let tool_name = state.tool_names.remove(&output_index);
+    let partial_json = normalize_tool_arguments_for_tool(tool_name.as_deref(), &arguments)
+        .unwrap_or(arguments);
+    if !partial_json.is_empty() {
+        let payload = serde_json::json!({
+            "type": "content_block_delta",
+            "index": block_index,
+            "delta": { "type": "input_json_delta", "partial_json": partial_json }
+        });
+        push_claude_sse(state, "content_block_delta", &payload);
+    }
+    let payload = serde_json::json!({
+        "type": "content_block_stop",
+        "index": block_index
+    });
+    push_claude_sse(state, "content_block_stop", &payload);
+}
+
+fn emit_claude_message_delta_if_needed(state: &mut CodexToClaudeStreamState) {
+    if state.message_delta_sent {
+        return;
+    }
+    let stop_reason = map_codex_stop_reason_to_anthropic(
+        state.finish_reason.as_deref().unwrap_or(""),
+        state.has_tool_call,
+    );
+    let mut usage_payload = serde_json::json!({
+        "input_tokens": state.usage_input.unwrap_or(0),
+        "output_tokens": state.usage_output.unwrap_or(0)
+    });
+    if let Some(cached) = state.cached_tokens {
+        usage_payload["cache_read_input_tokens"] = serde_json::json!(cached);
+    }
+    let payload = serde_json::json!({
+        "type": "message_delta",
+        "delta": { "stop_reason": stop_reason, "stop_sequence": null },
+        "usage": usage_payload
+    });
+    push_claude_sse(state, "message_delta", &payload);
+    state.message_delta_sent = true;
+}
+
+fn emit_claude_message_stop_if_needed(state: &mut CodexToClaudeStreamState) {
+    if state.message_stop_sent {
+        return;
+    }
+    let stop_payload = serde_json::json!({ "type": "message_stop" });
+    push_claude_sse(state, "message_stop", &stop_payload);
+    state.message_stop_sent = true;
+}
+
 fn codex_event_to_claude(state: &mut CodexToClaudeStreamState, event: &Value) {
     let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match event_type {
         "response.created" => {
-            let message = serde_json::json!({
-                "type": "message_start",
-                "message": {
-                    "id": event.get("response").and_then(|v| v.get("id")).and_then(|v| v.as_str()).unwrap_or(""),
-                    "type": "message",
-                    "role": "assistant",
-                    "model": event.get("response").and_then(|v| v.get("model")).and_then(|v| v.as_str()).unwrap_or(""),
-                    "stop_sequence": null,
-                    "usage": { "input_tokens": 0, "output_tokens": 0 },
-                    "content": [],
-                    "stop_reason": null
-                }
-            });
-            push_claude_sse(state, "message_start", &message);
+            ensure_claude_message_started(state, event);
         }
         "response.reasoning_summary_part.added" => {
-            let payload = serde_json::json!({
-                "type": "content_block_start",
-                "index": state.block_index,
-                "content_block": { "type": "thinking", "thinking": "" }
-            });
-            push_claude_sse(state, "content_block_start", &payload);
+            ensure_claude_message_started(state, event);
+            ensure_claude_thinking_block(state);
         }
         "response.reasoning_summary_text.delta" => {
+            ensure_claude_message_started(state, event);
             let delta = event.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            let index = ensure_claude_thinking_block(state);
             let payload = serde_json::json!({
                 "type": "content_block_delta",
-                "index": state.block_index,
+                "index": index,
                 "delta": { "type": "thinking_delta", "thinking": delta }
             });
             push_claude_sse(state, "content_block_delta", &payload);
         }
         "response.reasoning_summary_part.done" => {
-            let payload = serde_json::json!({
-                "type": "content_block_stop",
-                "index": state.block_index
-            });
-            push_claude_sse(state, "content_block_stop", &payload);
-            state.block_index += 1;
+            stop_claude_thinking_block(state);
         }
         "response.content_part.added" => {
-            let payload = serde_json::json!({
-                "type": "content_block_start",
-                "index": state.block_index,
-                "content_block": { "type": "text", "text": "" }
-            });
-            push_claude_sse(state, "content_block_start", &payload);
+            ensure_claude_message_started(state, event);
+            ensure_claude_text_block(state);
         }
         "response.output_text.delta" => {
+            ensure_claude_message_started(state, event);
             let delta = event.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            let index = ensure_claude_text_block(state);
             let payload = serde_json::json!({
                 "type": "content_block_delta",
-                "index": state.block_index,
+                "index": index,
                 "delta": { "type": "text_delta", "text": delta }
             });
             push_claude_sse(state, "content_block_delta", &payload);
         }
         "response.content_part.done" => {
-            let payload = serde_json::json!({
-                "type": "content_block_stop",
-                "index": state.block_index
-            });
-            push_claude_sse(state, "content_block_stop", &payload);
-            state.block_index += 1;
+            stop_claude_text_block(state);
         }
         "response.output_item.added" => {
             if let Some(item) = event.get("item") {
                 if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
                     state.has_tool_call = true;
-                    let mut name = item
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if let Some(orig) = state.reverse_tool_map.get(&name) {
-                        name = orig.clone();
-                    }
-                    state.active_tool_block_index = Some(state.block_index);
-                    state.active_tool_arguments.clear();
-                    let payload = serde_json::json!({
-                        "type": "content_block_start",
-                        "index": state.block_index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": item.get("call_id").and_then(|v| v.as_str()).unwrap_or(""),
-                            "name": name,
-                            "input": {}
-                        }
-                    });
-                    push_claude_sse(state, "content_block_start", &payload);
+                    ensure_claude_message_started(state, event);
+                    let output_index =
+                        event.get("output_index").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let _ = ensure_claude_tool_block(state, output_index, item);
                 }
             }
         }
         "response.output_item.done" => {
             if let Some(item) = event.get("item") {
                 if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
-                    if let Some(active_index) = state.active_tool_block_index {
-                        let partial_json = repair_tool_arguments_json(&state.active_tool_arguments)
-                            .unwrap_or_else(|| state.active_tool_arguments.clone());
-                        let payload = serde_json::json!({
-                            "type": "content_block_delta",
-                            "index": active_index,
-                            "delta": { "type": "input_json_delta", "partial_json": partial_json }
-                        });
-                        push_claude_sse(state, "content_block_delta", &payload);
-                    }
-                    let payload = serde_json::json!({
-                        "type": "content_block_stop",
-                        "index": state.block_index
-                    });
-                    push_claude_sse(state, "content_block_stop", &payload);
-                    state.active_tool_block_index = None;
-                    state.active_tool_arguments.clear();
-                    state.block_index += 1;
+                    let output_index =
+                        event.get("output_index").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let _ = ensure_claude_tool_block(state, output_index, item);
+                    finalize_claude_tool_block(state, output_index);
                 }
             }
         }
         "response.function_call_arguments.delta" => {
             let delta = event.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-            state.active_tool_arguments.push_str(delta);
+            let output_index = event.get("output_index").and_then(|v| v.as_i64()).unwrap_or(0);
+            state.tool_arguments.entry(output_index).or_default().push_str(delta);
         }
         "response.completed" => {
-            let stop_reason = event
+            state.finish_reason = event
                 .get("response")
                 .and_then(|v| v.get("stop_reason"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let mapped_reason = if state.has_tool_call {
-                "tool_use".to_string()
-            } else if stop_reason == "max_tokens" || stop_reason == "stop" {
-                stop_reason.to_string()
-            } else {
-                "end_turn".to_string()
-            };
+                .map(|v| v.to_string());
             if let Some(usage) = event.get("response").and_then(|v| v.get("usage")) {
                 let (input, output, cached) = extract_responses_usage(usage);
                 state.usage_input = Some(input);
@@ -4810,21 +6098,14 @@ fn codex_event_to_claude(state: &mut CodexToClaudeStreamState, event: &Value) {
                     state.cached_tokens = Some(cached);
                 }
             }
-            let mut usage_payload = serde_json::json!({
-                "input_tokens": state.usage_input.unwrap_or(0),
-                "output_tokens": state.usage_output.unwrap_or(0)
-            });
-            if let Some(cached) = state.cached_tokens {
-                usage_payload["cache_read_input_tokens"] = serde_json::json!(cached);
+            stop_claude_thinking_block(state);
+            stop_claude_text_block(state);
+            let pending_tool_indexes: Vec<i64> = state.tool_block_indexes.keys().copied().collect();
+            for output_index in pending_tool_indexes {
+                finalize_claude_tool_block(state, output_index);
             }
-            let payload = serde_json::json!({
-                "type": "message_delta",
-                "delta": { "stop_reason": mapped_reason, "stop_sequence": null },
-                "usage": usage_payload
-            });
-            push_claude_sse(state, "message_delta", &payload);
-            let stop_payload = serde_json::json!({ "type": "message_stop" });
-            push_claude_sse(state, "message_stop", &stop_payload);
+            emit_claude_message_delta_if_needed(state);
+            emit_claude_message_stop_if_needed(state);
             state.done = true;
         }
         _ => {}
@@ -4853,6 +6134,16 @@ fn process_codex_sse_chunk(state: &mut CodexToClaudeStreamState, chunk: &str) {
             continue;
         }
         if payload == "[DONE]" {
+            stop_claude_thinking_block(state);
+            stop_claude_text_block(state);
+            let pending_tool_indexes: Vec<i64> = state.tool_block_indexes.keys().copied().collect();
+            for output_index in pending_tool_indexes {
+                finalize_claude_tool_block(state, output_index);
+            }
+            if state.finish_reason.is_some() || state.message_started {
+                emit_claude_message_delta_if_needed(state);
+                emit_claude_message_stop_if_needed(state);
+            }
             state.done = true;
             continue;
         }
@@ -4874,13 +6165,20 @@ async fn build_anthropic_stream_response(
         buffer: String::new(),
         pending: std::collections::VecDeque::new(),
         has_tool_call: false,
-        block_index: 0,
-        active_tool_block_index: None,
-        active_tool_arguments: String::new(),
+        next_block_index: 0,
+        text_block_index: None,
+        thinking_block_index: None,
+        tool_block_indexes: HashMap::new(),
+        tool_arguments: HashMap::new(),
+        tool_names: HashMap::new(),
         reverse_tool_map,
         usage_input: None,
         usage_output: None,
         cached_tokens: None,
+        finish_reason: None,
+        message_started: false,
+        message_delta_sent: false,
+        message_stop_sent: false,
         done: false,
         captured: String::new(),
         log_entry: Some(log_entry),
@@ -5242,7 +6540,13 @@ fn finalize_custom_tool_call(state: &mut CustomResponsesStreamState, output_inde
         .get(&output_index)
         .cloned()
         .filter(|v| !v.is_empty())
-        .and_then(|v| repair_tool_arguments_json(&v).or(Some(v)))
+        .and_then(|v| {
+            normalize_tool_arguments_for_tool(
+                state.tool_names.get(&output_index).map(String::as_str),
+                &v,
+            )
+            .or(Some(v))
+        })
         .unwrap_or_else(|| "{}".to_string());
     let name = state
         .tool_names
@@ -5274,7 +6578,11 @@ fn finalize_custom_tool_call(state: &mut CustomResponsesStreamState, output_inde
     state.tool_done.insert(output_index);
 }
 
-fn merge_custom_tool_arguments(existing: &str, incoming: &str) -> (String, Option<String>) {
+fn merge_custom_tool_arguments(
+    tool_name: Option<&str>,
+    existing: &str,
+    incoming: &str,
+) -> (String, Option<String>) {
     let incoming = incoming.trim();
     if incoming.is_empty() {
         return (existing.to_string(), None);
@@ -5288,8 +6596,8 @@ fn merge_custom_tool_arguments(existing: &str, incoming: &str) -> (String, Optio
         return (existing.to_string(), None);
     }
 
-    let repaired_existing = repair_tool_arguments_json(existing);
-    let repaired_incoming = repair_tool_arguments_json(incoming);
+    let repaired_existing = normalize_tool_arguments_for_tool(tool_name, existing);
+    let repaired_incoming = normalize_tool_arguments_for_tool(tool_name, incoming);
 
     if let Some(incoming_json) = repaired_incoming.as_ref() {
         if repaired_existing.as_ref() == Some(incoming_json) {
@@ -5382,7 +6690,13 @@ fn finalize_custom_responses_stream(state: &mut CustomResponsesStreamState) {
                     .get(&idx)
                     .cloned()
                     .filter(|v| !v.is_empty())
-                    .and_then(|v| repair_tool_arguments_json(&v).or(Some(v)))
+                    .and_then(|v| {
+                        normalize_tool_arguments_for_tool(
+                            state.tool_names.get(&idx).map(String::as_str),
+                            &v,
+                        )
+                        .or(Some(v))
+                    })
                     .unwrap_or_else(|| "{}".to_string()),
                 "call_id": call_id,
                 "name": state.tool_names.get(&idx).cloned().unwrap_or_default(),
@@ -5721,8 +7035,13 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                                 .get(&tool_output_index)
                                 .cloned()
                                 .unwrap_or_default();
-                            let (merged_arguments, emitted_delta) =
-                                merge_custom_tool_arguments(&existing_arguments, arguments_delta);
+                            let tool_name =
+                                state.tool_names.get(&tool_output_index).map(String::as_str);
+                            let (merged_arguments, emitted_delta) = merge_custom_tool_arguments(
+                                tool_name,
+                                &existing_arguments,
+                                arguments_delta,
+                            );
                             state.tool_args.insert(tool_output_index, merged_arguments);
                             if let Some(call_id) =
                                 state.tool_call_ids.get(&tool_output_index).cloned()
@@ -5740,7 +7059,12 @@ fn process_custom_openai_sse_chunk(state: &mut CustomResponsesStreamState, chunk
                                         "response.function_call_arguments.delta",
                                         &payload,
                                     );
-                                } else if repair_tool_arguments_json(arguments_delta).is_some() {
+                                } else if normalize_tool_arguments_for_tool(
+                                    tool_name,
+                                    arguments_delta,
+                                )
+                                .is_some()
+                                {
                                     log_proxy(&format!(
                                         "custom_responses: replaced tool arguments with full JSON output_index={} call_id={}",
                                         tool_output_index, call_id
@@ -5968,7 +7292,9 @@ fn finalize_openai_claude_stream(
             .get(&tool_index)
             .filter(|v| !v.is_empty())
         {
-            let partial_json = repair_tool_arguments_json(args).unwrap_or_else(|| args.clone());
+            let tool_name = state.tool_names.get(&tool_index).map(String::as_str);
+            let partial_json = normalize_tool_arguments_for_tool(tool_name, args)
+                .unwrap_or_else(|| args.clone());
             let payload = serde_json::json!({
                 "type": "content_block_delta",
                 "index": state.tool_block_indexes.get(&tool_index).copied().unwrap_or(0),
@@ -8881,6 +10207,43 @@ async fn start_api_proxy(port: Option<u16>) -> Result<Value, String> {
         if upstream_stream && upstream_status == reqwest::StatusCode::BAD_REQUEST {
             let headers = upstream_resp.headers().clone();
             let bytes = upstream_resp.bytes().await.unwrap_or_default();
+            let error_message = extract_upstream_error_message(&bytes);
+            let response_body_text = if bytes.is_empty() {
+                None
+            } else {
+                Some(truncate_body(&bytes))
+            };
+            let entry = ProxyLogEntry {
+                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                method: method_label.clone(),
+                path: path.to_string(),
+                request_url: request_url.clone(),
+                status: upstream_status.as_u16(),
+                duration_ms: started_at.elapsed().as_millis() as u64,
+                proxy_account_id: chosen_id.clone(),
+                account_id: chosen_account_id.clone(),
+                error: Some(error_message.clone()),
+                model: request_model.clone(),
+                request_headers: request_headers_json.clone(),
+                response_headers: headers_to_json_string(sanitize_reqwest_headers(&headers)),
+                request_body: request_body_text.clone(),
+                response_body: response_body_text.clone(),
+                input_tokens: estimated_input_tokens,
+                output_tokens: None,
+                ..ProxyLogEntry::default()
+            };
+            let _ = insert_proxy_log(&entry);
+            log_proxy_error_detail(
+                request_id,
+                upstream_status.as_u16(),
+                &method_label,
+                &path,
+                &request_url,
+                &request_headers_json,
+                &request_body_text,
+                &response_body_text,
+                &Some(error_message),
+            );
             if let Some((resets_at, resets_in_seconds)) = parse_usage_limit_error(&bytes) {
                 let until = usage_limit_cooldown_until(resets_at, resets_in_seconds);
                 apply_usage_limit_policy(&state, chosen_idx, &chosen_id, until);
